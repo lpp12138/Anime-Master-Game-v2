@@ -25,9 +25,23 @@ import {
   R2_IMAGE_UPLOAD_MAX_BYTES,
   R2_IMAGE_UPLOAD_TOO_LARGE_MESSAGE,
 } from "../src/lib/r2UploadPolicy";
+import {
+  COMMUNITY_SCREENSHOT_MAX_QUESTIONS,
+  isCommunityScreenshotWithin1080p,
+} from "../src/lib/communityScreenshotPolicy";
+import { InvalidImageError, validateRasterImage } from "./imageValidation";
+import { normalizeBangumiQuestionTags } from "../src/lib/bangumiTags";
+import {
+  BangumiApiError,
+  getBangumiAnimeSubject,
+  getBangumiSubjectCharacters,
+  searchBangumiAnime,
+} from "./bangumiApi";
 
 import type {
   Answer,
+  BangumiAnimeTag,
+  BangumiCharacterTag,
   BuzzerAnswer,
   GameBootstrapSnapshot,
   GameResultSnapshot,
@@ -55,6 +69,7 @@ export interface Env {
   R2_PUBLIC_BASE_URL?: string;
   R2_EXISTING_IMAGE_LIMIT?: string;
   REMOTE_IMAGE_PROXY_CANDIDATES?: string;
+  COMMUNITY_UPLOAD_SECRET?: string;
 }
 
 type RpcBody = {
@@ -242,6 +257,9 @@ const BUSINESS_ALARM_RECOVERY_RETRY_DELAY_MS = 30_000;
 const BUSINESS_ALARM_MIN_SCHEDULE_DELAY_MS = 1000;
 const REMOTE_IMAGE_FETCH_MAX_BYTES = 20 * 1024 * 1024;
 const R2_IMAGE_ROUTE_PREFIX = "/api/r2-images/";
+const COMMUNITY_QUESTION_SET_BODY_MAX_BYTES = 512 * 1024;
+const COMMUNITY_UPLOAD_KEY_HEADER = "x-community-upload-key";
+const COMMUNITY_UPLOAD_SECRET_MIN_LENGTH = 24;
 const ROOM_CLEANUP_IDLE_MS = 48 * 60 * 60 * 1000;
 const ROOM_CLEANUP_MAX_ROOMS_PER_RUN = 50;
 const ROOM_CLEANUP_MAX_ORPHAN_QUESTION_SETS_PER_RUN = 100;
@@ -368,6 +386,7 @@ type CallableGameServiceName = {
 type InternalGameServiceName =
   | "dissolveRoomOnPageExit"
   | "createQuestionSetFromUrlText"
+  | "createHomepageCommunityQuestionSet"
   | "getDeadlineStateForRoomId"
   | "getRoomIdForGameSession"
   | "parseImageUrlsText"
@@ -496,17 +515,21 @@ const AUTHORITY_PERSIST_RESULT_NAMES = new Set([
 ]);
 
 function corsHeaders(request: Request, env: Env) {
-  const origin = request.headers.get("origin") ?? "";
+  const requestOrigin = request.headers.get("origin") ?? "";
   const allowedOrigins = (env.ALLOWED_ORIGIN ?? "*")
     .split(",")
     .map((item) => item.trim())
     .filter(Boolean);
-  const allowOrigin = allowedOrigins.includes("*") || allowedOrigins.includes(origin) ? origin || "*" : allowedOrigins[0] ?? "*";
+  const allowOrigin = allowedOrigins.includes("*")
+    ? requestOrigin || "*"
+    : allowedOrigins.includes(requestOrigin)
+      ? requestOrigin
+      : allowedOrigins[0] ?? "*";
 
   return {
     "Access-Control-Allow-Origin": allowOrigin,
     "Access-Control-Allow-Methods": "GET,HEAD,POST,OPTIONS",
-    "Access-Control-Allow-Headers": "content-type",
+    "Access-Control-Allow-Headers": `content-type,${COMMUNITY_UPLOAD_KEY_HEADER}`,
     "Access-Control-Max-Age": "86400",
     "Vary": "Origin",
   };
@@ -1656,14 +1679,15 @@ function getR2PublicUrl(request: Request, env: Env, key: string) {
   return `${origin}${R2_IMAGE_ROUTE_PREFIX}${encodeR2Key(key)}`;
 }
 
-function buildR2ImageKey(request: Request, env: Env, fileNameOverride?: string) {
+function buildR2ImageKey(request: Request, env: Env, fileNameOverride?: string, category?: string) {
   const url = new URL(request.url);
   const fileName = sanitizeFileName(fileNameOverride ?? url.searchParams.get("filename") ?? "image");
   const now = new Date();
   const datePath = now.toISOString().slice(0, 10).replace(/-/g, "/");
   const prefix = getR2ImagePrefix(env);
+  const normalizedCategory = category?.replace(/[^a-z0-9_-]/gi, "").slice(0, 40) || "";
   const id = crypto.randomUUID();
-  return `${prefix}/${datePath}/${id}-${fileName}`;
+  return [prefix, normalizedCategory, datePath, `${id}-${fileName}`].filter(Boolean).join("/");
 }
 
 function getRequestContentLength(request: Request) {
@@ -1683,6 +1707,7 @@ async function putR2Image(
   contentType: string,
   fileName: string,
   customMetadata: Record<string, string> = {},
+  category?: string,
 ) {
   if (isR2ImageUploadTooLarge(body.byteLength)) {
     return {
@@ -1692,7 +1717,7 @@ async function putR2Image(
     };
   }
 
-  const key = buildR2ImageKey(request, env, fileName);
+  const key = buildR2ImageKey(request, env, fileName, category);
   const checksum = await crypto.subtle.digest("SHA-256", body);
   const object = await env.IMAGE_BUCKET.put(key, body, {
     httpMetadata: {
@@ -1899,6 +1924,417 @@ async function handleRemoteImageSource(request: Request, env: Env) {
   return new Response(remote.body, { status: 200, headers });
 }
 
+async function hasValidCommunityUploadKey(request: Request, env: Env) {
+  const configuredSecret = (env.COMMUNITY_UPLOAD_SECRET ?? "").trim();
+  if (configuredSecret.length < COMMUNITY_UPLOAD_SECRET_MIN_LENGTH) return false;
+
+  const suppliedHeader = (request.headers.get(COMMUNITY_UPLOAD_KEY_HEADER) ?? "").trim();
+  const suppliedSecret = suppliedHeader.length <= 512 ? suppliedHeader : "__invalid_oversized_key__";
+  const encoder = new TextEncoder();
+  const [configuredDigest, suppliedDigest] = await Promise.all([
+    crypto.subtle.digest("SHA-256", encoder.encode(configuredSecret)),
+    crypto.subtle.digest("SHA-256", encoder.encode(suppliedSecret)),
+  ]);
+  const configuredBytes = new Uint8Array(configuredDigest);
+  const suppliedBytes = new Uint8Array(suppliedDigest);
+  let difference = 0;
+  for (let index = 0; index < configuredBytes.length; index += 1) {
+    difference |= configuredBytes[index] ^ suppliedBytes[index];
+  }
+  return difference === 0;
+}
+
+async function sha256Hex(value: string) {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value));
+  return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+async function authorizeCommunityUpload(request: Request, env: Env) {
+  if ((env.COMMUNITY_UPLOAD_SECRET ?? "").trim().length < COMMUNITY_UPLOAD_SECRET_MIN_LENGTH) {
+    return json({ error: "截图上传功能尚未配置。" }, { status: 503 }, request, env);
+  }
+  if (!await hasValidCommunityUploadKey(request, env)) {
+    return json({ error: "上传密钥无效。" }, { status: 401 }, request, env);
+  }
+  return null;
+}
+
+async function handleCommunityScreenshotUpload(request: Request, env: Env) {
+  const authError = await authorizeCommunityUpload(request, env);
+  if (authError) return authError;
+  if (!env.IMAGE_BUCKET) {
+    return json({ error: "服务器图片存储尚未配置。" }, { status: 500 }, request, env);
+  }
+  if (!(request.headers.get("content-type") ?? "").toLowerCase().startsWith("image/")) {
+    return json({ error: "只能上传图片文件。" }, { status: 415 }, request, env);
+  }
+
+  const contentLength = getRequestContentLength(request);
+  if (contentLength != null && contentLength > R2_IMAGE_UPLOAD_MAX_BYTES) {
+    return json({ error: R2_IMAGE_UPLOAD_TOO_LARGE_MESSAGE }, { status: 413 }, request, env);
+  }
+
+  let body: ArrayBuffer;
+  try {
+    body = await readBodyWithLimit(request.body, R2_IMAGE_UPLOAD_MAX_BYTES, R2_IMAGE_UPLOAD_TOO_LARGE_MESSAGE);
+  } catch (error) {
+    if (error instanceof ImageBodyTooLargeError) {
+      return json({ error: error.message }, { status: 413 }, request, env);
+    }
+    throw error;
+  }
+  if (body.byteLength === 0) return json({ error: "上传内容为空。" }, { status: 400 }, request, env);
+
+  let image;
+  try {
+    image = validateRasterImage(body);
+  } catch (error) {
+    const message = error instanceof InvalidImageError ? error.message : "图片内容校验失败。";
+    return json({ error: message }, { status: 415 }, request, env);
+  }
+  if (!isCommunityScreenshotWithin1080p(image.width, image.height)) {
+    return json(
+      { error: "图片尺寸超过 1080p，请刷新页面后让浏览器重新压缩。", width: image.width, height: image.height },
+      { status: 422 },
+      request,
+      env,
+    );
+  }
+
+  const uploaded = await putR2Image(
+    request,
+    env,
+    body,
+    image.contentType,
+    `screenshot${image.extension}`,
+    {
+      uploadSource: "homepage-community",
+      validatedWidth: String(image.width),
+      validatedHeight: String(image.height),
+    },
+    "community",
+  );
+  if (!uploaded.ok) return uploaded.response;
+
+  return json({
+    key: uploaded.key,
+    url: uploaded.url,
+    width: image.width,
+    height: image.height,
+    size: uploaded.size,
+  }, {}, request, env);
+}
+
+async function handleBangumiAnimeSearch(request: Request, env: Env, cache: Cache) {
+  const authError = await authorizeCommunityUpload(request, env);
+  if (authError) return authError;
+  const query = new URL(request.url).searchParams.get("query") ?? "";
+  try {
+    const results = await searchBangumiAnime(cache, query);
+    return json({ results }, { headers: { "cache-control": "no-store" } }, request, env);
+  } catch (error) {
+    if (error instanceof BangumiApiError) {
+      return json({ error: error.message }, { status: error.status }, request, env);
+    }
+    throw error;
+  }
+}
+
+async function handleBangumiSubjectCharacters(request: Request, env: Env, cache: Cache, subjectId: number) {
+  const authError = await authorizeCommunityUpload(request, env);
+  if (authError) return authError;
+  try {
+    const characters = await getBangumiSubjectCharacters(cache, subjectId);
+    return json({ characters }, { headers: { "cache-control": "no-store" } }, request, env);
+  } catch (error) {
+    if (error instanceof BangumiApiError) {
+      return json({ error: error.message }, { status: error.status }, request, env);
+    }
+    throw error;
+  }
+}
+
+type CommunityImageIndexRow = {
+  question_id: string;
+  question_set_id: string;
+  image_url: string;
+  order_index: number;
+  anime_subject_id: number | null;
+  anime_tags_json: string;
+  character_tags_json: string;
+  created_at: string;
+};
+
+async function handleCommunityImageIndexSearch(request: Request, env: Env) {
+  const authError = await authorizeCommunityUpload(request, env);
+  if (authError) return authError;
+  if (!env.DB) return json({ error: "服务器题库索引尚未配置。" }, { status: 500 }, request, env);
+
+  const url = new URL(request.url);
+  const animeSubjectId = Number(url.searchParams.get("animeSubjectId"));
+  const characterIdValue = url.searchParams.get("characterId");
+  const characterId = characterIdValue == null || characterIdValue === "" ? null : Number(characterIdValue);
+  if (!Number.isInteger(animeSubjectId) || animeSubjectId < 1 || animeSubjectId > 2_147_483_647) {
+    return json({ error: "必须提供有效的番剧 ID。" }, { status: 400 }, request, env);
+  }
+  if (characterId != null && (!Number.isInteger(characterId) || characterId < 1 || characterId > 2_147_483_647)) {
+    return json({ error: "角色 ID 无效。" }, { status: 400 }, request, env);
+  }
+  const requestedLimit = Number(url.searchParams.get("limit") ?? 20);
+  const limit = Number.isInteger(requestedLimit) ? Math.max(1, Math.min(50, requestedLimit)) : 20;
+  const characterClause = characterId == null ? "" : `
+    AND EXISTS (
+      SELECT 1
+      FROM json_each(image_index.character_tags_json) AS character_tag
+      WHERE CAST(json_extract(character_tag.value, '$.id') AS INTEGER) = ?
+    )`;
+  const bindings: unknown[] = [animeSubjectId];
+  if (characterId != null) bindings.push(characterId);
+  bindings.push(limit);
+  try {
+    const result = await env.DB.prepare(`
+    SELECT
+      image_index.question_id,
+      image_index.question_set_id,
+      image_index.image_url,
+      image_index.order_index,
+      image_index.anime_subject_id,
+      image_index.anime_tags_json,
+      image_index.character_tags_json,
+      image_index.created_at
+    FROM question_image_index AS image_index
+    INNER JOIN question_sets AS question_set ON question_set.id = image_index.question_set_id
+    WHERE question_set.is_public = 1
+      AND image_index.anime_subject_id = ?${characterClause}
+    ORDER BY image_index.created_at DESC, image_index.question_id DESC
+    LIMIT ?
+  `).bind(...bindings).all<CommunityImageIndexRow>();
+
+  const images = (result.results ?? []).map((row) => {
+    let animeTags: BangumiAnimeTag[] = [];
+    let characterTags: BangumiCharacterTag[] = [];
+    try {
+      const normalized = normalizeBangumiQuestionTags(
+        JSON.parse(row.anime_tags_json),
+        JSON.parse(row.character_tags_json),
+      );
+      if (normalized.animeTags[0]?.id === row.anime_subject_id) {
+        animeTags = normalized.animeTags;
+        characterTags = normalized.characterTags;
+      }
+    } catch {
+      // Keep a corrupt row non-fatal without forwarding malformed metadata.
+    }
+    return {
+      questionId: row.question_id,
+      questionSetId: row.question_set_id,
+      imageUrl: row.image_url,
+      orderIndex: row.order_index,
+      animeSubjectId: row.anime_subject_id,
+      animeTags,
+      characterTags,
+      createdAt: row.created_at,
+    };
+  });
+    return json({ images }, { headers: { "cache-control": "no-store" } }, request, env);
+  } catch (error) {
+    console.error("Community image index query failed", error);
+    return json({ error: "图片标签索引查询失败，请稍后重试。" }, { status: 500 }, request, env);
+  }
+}
+
+type SubmittedCommunityQuestion = {
+  r2Key: string;
+  labelText: string;
+  animeTags: BangumiAnimeTag[];
+  characterTags: BangumiCharacterTag[];
+};
+
+async function canonicalizeSubmittedBangumiTags(
+  cache: Cache,
+  questions: SubmittedCommunityQuestion[],
+): Promise<SubmittedCommunityQuestion[]> {
+  const subjectIds = [...new Set(questions.flatMap((question) => question.animeTags.map((tag) => tag.id)))];
+  if (subjectIds.length === 0) return questions;
+
+  const subjects = new Map(await mapWithConcurrency(subjectIds, 4, async (subjectId) => {
+    const subject = await getBangumiAnimeSubject(cache, subjectId);
+    return [subjectId, subject] as const;
+  }));
+  const castSubjectIds = [...new Set(questions
+    .filter((question) => question.characterTags.length > 0)
+    .flatMap((question) => question.animeTags.map((tag) => tag.id)))];
+  const casts = new Map(await mapWithConcurrency(castSubjectIds, 4, async (subjectId) => {
+    const characters = await getBangumiSubjectCharacters(cache, subjectId);
+    return [subjectId, new Map(characters.map((character) => [character.id, character]))] as const;
+  }));
+
+  return questions.map((question) => {
+    const submittedAnime = question.animeTags[0];
+    if (!submittedAnime) return question;
+    const anime = subjects.get(submittedAnime.id);
+    if (!anime) throw new BangumiApiError("所选 Bangumi 番剧不存在。", 400);
+    const cast = casts.get(anime.id);
+    const characterTags = question.characterTags.map((submittedCharacter) => {
+      const character = cast?.get(submittedCharacter.id);
+      if (!character) {
+        throw new BangumiApiError(`角色“${submittedCharacter.name}”不属于所选 Bangumi 番剧。`, 400);
+      }
+      return {
+        id: character.id,
+        subjectId: anime.id,
+        name: character.name,
+        nameCn: null,
+        relation: character.relation,
+      } satisfies BangumiCharacterTag;
+    });
+    return {
+      ...question,
+      animeTags: [{ id: anime.id, name: anime.name, nameCn: anime.nameCn }],
+      characterTags,
+    };
+  });
+}
+
+async function handleCommunityQuestionSetCreate(request: Request, env: Env, cache: Cache) {
+  const authError = await authorizeCommunityUpload(request, env);
+  if (authError) return authError;
+  if (!env.IMAGE_BUCKET || !env.DB) {
+    return json({ error: "服务器题库存储尚未配置。" }, { status: 500 }, request, env);
+  }
+
+  let payload: unknown;
+  try {
+    const text = await readLimitedRequestText(request, COMMUNITY_QUESTION_SET_BODY_MAX_BYTES);
+    payload = JSON.parse(text);
+  } catch (error) {
+    if (error instanceof Error && error.message === "请求内容过大，请缩小后重试。") {
+      return json({ error: "题库请求内容过大（上限 512 KiB）。" }, { status: 413 }, request, env);
+    }
+    return json({ error: "题库请求内容无效。" }, { status: 400 }, request, env);
+  }
+  if (!isRecord(payload) || !Array.isArray(payload.questions)) {
+    return json({ error: "题库请求参数无效。" }, { status: 400 }, request, env);
+  }
+  if (payload.questions.length === 0 || payload.questions.length > COMMUNITY_SCREENSHOT_MAX_QUESTIONS) {
+    return json({ error: `每个题库必须包含 1 到 ${COMMUNITY_SCREENSHOT_MAX_QUESTIONS} 张截图。` }, { status: 400 }, request, env);
+  }
+  const submissionId = typeof payload.submissionId === "string" ? payload.submissionId.trim() : "";
+  if (!/^[a-zA-Z0-9_-]{16,160}$/.test(submissionId)) {
+    return json({ error: "投稿标识无效，请刷新页面后重试。" }, { status: 400 }, request, env);
+  }
+
+  const prefix = getR2ImagePrefix(env);
+  const requiredKeyPrefix = [prefix, "community"].filter(Boolean).join("/") + "/";
+  const seenKeys = new Set<string>();
+  const submittedQuestions: SubmittedCommunityQuestion[] = [];
+  for (const item of payload.questions) {
+    if (!isRecord(item) || typeof item.r2Key !== "string") {
+      return json({ error: "题库图片参数无效。" }, { status: 400 }, request, env);
+    }
+    const r2Key = item.r2Key.trim();
+    if (!r2Key.startsWith(requiredKeyPrefix) || r2Key.includes("..") || seenKeys.has(r2Key)) {
+      return json({ error: "题库包含无效或重复的服务器图片。" }, { status: 400 }, request, env);
+    }
+    if (typeof item.labelText !== "string" || !item.labelText.trim()) {
+      return json({ error: "每张截图都必须填写正确答案。" }, { status: 400 }, request, env);
+    }
+    let tags;
+    try {
+      tags = normalizeBangumiQuestionTags(item.animeTags, item.characterTags);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Bangumi 标签格式无效。";
+      return json({ error: message }, { status: 400 }, request, env);
+    }
+    seenKeys.add(r2Key);
+    submittedQuestions.push({
+      r2Key,
+      labelText: item.labelText.trim(),
+      animeTags: tags.animeTags,
+      characterTags: tags.characterTags,
+    });
+  }
+
+  const title = typeof payload.title === "string" ? payload.title : "";
+  const description = typeof payload.description === "string" ? payload.description : undefined;
+  const playerId = typeof payload.playerId === "string" ? payload.playerId : "";
+  const nickname = typeof payload.nickname === "string" ? payload.nickname : "";
+  const submissionFingerprint = await sha256Hex(JSON.stringify({
+    version: 1,
+    title: title.replace(/[\r\n]+/g, " ").trim(),
+    description: description?.trim() || null,
+    playerId: playerId.trim(),
+    nickname: nickname.replace(/[\r\n]+/g, " ").trim(),
+    questions: submittedQuestions.map((question) => ({
+      r2Key: question.r2Key,
+      labelText: question.labelText,
+      animeSubjectId: question.animeTags[0]?.id ?? null,
+      characterIds: question.characterTags.map((tag) => tag.id),
+    })),
+  }));
+
+  try {
+    const existing = await runWithGameDatabase(env, () => gameService.getHomepageCommunityQuestionSetBySubmissionId(submissionId));
+    if (existing) {
+      if (existing.submissionFingerprint !== submissionFingerprint) {
+        return json({ error: "投稿内容已发生变化，请作为一次新投稿重试。" }, { status: 409 }, request, env);
+      }
+      const questionSet = existing.questionSet;
+      return json({ id: questionSet.id, title: questionSet.title, imageCount: questionSet.imageCount }, {}, request, env);
+    }
+  } catch (error) {
+    if (error instanceof gameService.HomepageCommunityQuestionSetPersistenceError) {
+      console.error("Homepage community idempotency lookup failed", error.cause);
+      return json({ error: error.message }, { status: 500 }, request, env);
+    }
+    throw error;
+  }
+
+  const storedObjects = await Promise.all(submittedQuestions.map((question) => env.IMAGE_BUCKET.head(question.r2Key)));
+  if (storedObjects.some((object) => !object || object.customMetadata?.uploadSource !== "homepage-community")) {
+    return json({ error: "部分服务器图片不存在或未通过校验，请重新上传。" }, { status: 400 }, request, env);
+  }
+
+  let canonicalQuestions: SubmittedCommunityQuestion[];
+  try {
+    canonicalQuestions = await canonicalizeSubmittedBangumiTags(cache, submittedQuestions);
+  } catch (error) {
+    if (error instanceof BangumiApiError) {
+      return json({ error: error.message }, { status: error.status }, request, env);
+    }
+    throw error;
+  }
+
+  let questionSet;
+  try {
+    questionSet = await runWithGameDatabase(env, () => gameService.createHomepageCommunityQuestionSet({
+      submissionId,
+      submissionFingerprint,
+      playerId,
+      nickname,
+      title,
+      description,
+      questions: canonicalQuestions.map((question) => ({
+        imageUrl: getR2PublicUrl(request, env, question.r2Key),
+        labelText: question.labelText,
+        animeTags: question.animeTags,
+        characterTags: question.characterTags,
+      })),
+    }));
+  } catch (error) {
+    if (error instanceof gameService.HomepageCommunityQuestionSetConflictError) {
+      return json({ error: error.message }, { status: 409 }, request, env);
+    }
+    if (error instanceof gameService.HomepageCommunityQuestionSetPersistenceError) {
+      console.error("Homepage community question set persistence failed", error.cause);
+      return json({ error: error.message }, { status: 500 }, request, env);
+    }
+    throw error;
+  }
+
+  return json({ id: questionSet.id, title: questionSet.title, imageCount: questionSet.imageCount }, {}, request, env);
+}
+
 async function handleR2Upload(request: Request, env: Env) {
   if (!env.IMAGE_BUCKET) {
     return json({ error: "缺少 R2 存储绑定：请在 wrangler.toml 配置 IMAGE_BUCKET。" }, { status: 500 }, request, env);
@@ -2003,11 +2439,11 @@ async function handleR2ImagesList(request: Request, env: Env) {
   const listed = await env.IMAGE_BUCKET.list({
     prefix: prefix ? `${prefix}/` : undefined,
     limit,
-    include: ["httpMetadata"],
+    include: ["httpMetadata", "customMetadata"],
   });
 
   const images = listed.objects
-    .slice()
+    .filter((object) => object.customMetadata?.uploadSource !== "homepage-community")
     .sort((a, b) => b.uploaded.getTime() - a.uploaded.getTime())
     .map((object) => ({
       publicId: object.key,
@@ -5410,6 +5846,27 @@ export default {
 
       if (url.pathname === "/api/r2-upload" && request.method === "POST") {
         return await handleR2Upload(request, env);
+      }
+
+      if (url.pathname === "/api/community-screenshot-upload" && request.method === "POST") {
+        return await handleCommunityScreenshotUpload(request, env);
+      }
+
+      if (url.pathname === "/api/community-question-set" && request.method === "POST") {
+        return await handleCommunityQuestionSetCreate(request, env, caches.default);
+      }
+
+      if (url.pathname === "/api/bangumi/subjects" && request.method === "GET") {
+        return await handleBangumiAnimeSearch(request, env, caches.default);
+      }
+
+      const bangumiSubjectCharactersMatch = url.pathname.match(/^\/api\/bangumi\/subjects\/(\d+)\/characters$/);
+      if (bangumiSubjectCharactersMatch && request.method === "GET") {
+        return await handleBangumiSubjectCharacters(request, env, caches.default, Number(bangumiSubjectCharactersMatch[1]));
+      }
+
+      if (url.pathname === "/api/community-image-index" && request.method === "GET") {
+        return await handleCommunityImageIndexSearch(request, env);
       }
 
       if (url.pathname === "/api/remote-image-source" && request.method === "POST") {

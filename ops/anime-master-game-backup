@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+exec 9>/run/lock/anime-master-game-backup.lock
+flock -n 9 || exit 0
+
+STATE=/var/lib/anime-master-game/wrangler
+BACKUP_ROOT=/var/backups/anime-master-game/daily
+STAMP=$(date -u +%Y%m%dT%H%M%SZ)
+TARGET="$BACKUP_ROOT/$STAMP"
+LATEST_LINK="$BACKUP_ROOT/latest"
+WAS_ACTIVE=0
+
+install -d -m 0700 "$BACKUP_ROOT" "$TARGET"
+if systemctl is-active --quiet anime-master-game.service; then
+  WAS_ACTIVE=1
+  systemctl stop anime-master-game.service
+fi
+restart_worker() {
+  if [ "$WAS_ACTIVE" -ne 1 ]; then return 0; fi
+  if ! systemctl is-active --quiet anime-master-game.service; then
+    systemctl start anime-master-game.service
+  fi
+  for _ in $(seq 1 120); do
+    if curl --fail --silent --max-time 2 http://127.0.0.1:8787/api/public-rooms >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 0.25
+  done
+  return 1
+}
+trap restart_worker EXIT
+
+PREVIOUS=""
+if [ -L "$LATEST_LINK" ]; then
+  PREVIOUS=$(readlink -f "$LATEST_LINK" || true)
+fi
+if [ -n "$PREVIOUS" ] && [ -d "$PREVIOUS/wrangler" ]; then
+  rsync -a --delete --link-dest="$PREVIOUS/wrangler" "$STATE/" "$TARGET/wrangler/"
+else
+  rsync -a --delete "$STATE/" "$TARGET/wrangler/"
+fi
+
+install -d -m 0700 "$TARGET/config"
+cp -a /etc/anime-master-game/worker.env "$TARGET/config/worker.env"
+cp -a /srv/anime-master-game/release-info "$TARGET/config/release-info" 2>/dev/null || true
+cp -a /etc/nginx/sites-available/caicai.lpp.moe "$TARGET/config/nginx-site"
+cp -a /etc/nginx/conf.d/30-anime-master-game.conf "$TARGET/config/nginx-global"
+cp -a /etc/nginx/snippets/anime-worker-proxy.conf "$TARGET/config/nginx-worker-proxy"
+cp -a /etc/nginx/snippets/anime-security-headers.conf "$TARGET/config/nginx-security-headers"
+cp -a /etc/systemd/system/anime-master-game.service "$TARGET/config/worker.service"
+cp -a /etc/systemd/system/anime-master-game-maintenance.service "$TARGET/config/maintenance.service"
+cp -a /etc/systemd/system/anime-master-game-maintenance.timer "$TARGET/config/maintenance.timer"
+cp -a /usr/local/sbin/anime-master-game-backup "$TARGET/config/backup-script"
+cp -a /etc/systemd/system/anime-master-game-backup.service "$TARGET/config/backup.service"
+cp -a /etc/systemd/system/anime-master-game-backup.timer "$TARGET/config/backup.timer"
+printf 'created_at=%s\nsource=%s\n' "$STAMP" "$STATE" >"$TARGET/manifest"
+
+ln -sfn "$STAMP" "$LATEST_LINK"
+find "$BACKUP_ROOT" -mindepth 1 -maxdepth 1 -type d -name '20??????T??????Z' -mtime +14 -exec rm -rf -- {} +
+
+restart_worker
+trap - EXIT

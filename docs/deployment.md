@@ -40,6 +40,13 @@ npm install
 cp .env.example .env.local
 ```
 
+首页密钥上传还需要只供本地 Worker 读取的 `.dev.vars`（至少 24 个字符，不能使用 `NEXT_PUBLIC_` 前缀）：
+
+```bash
+printf 'COMMUNITY_UPLOAD_SECRET=%s\n' "$(openssl rand -base64 32 | tr -d '\n')" > .dev.vars
+chmod 600 .dev.vars
+```
+
 本地前端至少需要：
 
 ```env
@@ -156,6 +163,18 @@ URL/JSONL 导入统一由 Worker 在校验当前房间出题人身份后有界�
 ```bash
 npm run d1:migrate:remote
 ```
+
+给首页截图上传入口配置 Worker secret：
+
+```bash
+npx wrangler secret put COMMUNITY_UPLOAD_SECRET
+```
+
+该值只应存在于 Worker secret 或服务器权限受限的环境文件中；不要写进 `wrangler.toml`、Git、Pages 环境变量或任何 `NEXT_PUBLIC_*` 变量。
+
+首页上传器通过 Worker 访问官方 `https://api.bgm.tv/v0`，自动建立 Bangumi 番剧和角色标签。上游请求使用项目专属 User-Agent；无需 Bangumi token。Worker Cache API 分别缓存番剧搜索 12 小时、finalize 使用的番剧详情 30 天和整份番剧角色列表 7 天；选角色直接复用列表结果，不产生逐角色 N+1 请求。finalize 会按官方 ID 重写名称并校验角色归属，避免信任客户端标签、浏览器直连和重复打到 Bangumi。finalize JSON 请求体上限为 512 KiB；浏览器在相同内容的重试期间保留已上传的 R2 key 和一个稳定投稿 ID；Worker 把该 ID 与服务端计算的内容指纹绑定，通过唯一索引幂等返回既有题库，并拒绝同 ID 下被修改的内容，同时使用单个 D1 `batch()` 原子写入 manifest 与逐图索引。D1 migration `0026_question_image_bangumi_tags.sql` 保存逐图片答案和规范标签，因此部署新版 Worker 前必须先执行上述迁移。
+
+受同一上传密钥保护的 `GET /api/community-image-index?animeSubjectId=<id>&characterId=<optional>&limit=<1-50>` 只查询公开题库，返回图片标识和规范标签，不返回 `answer_text`。它是可信预览/整理工具的后端读模型，不应改成匿名答案接口。部署在 Nginx 或其他反向代理后时，必须分别限制图片上传、finalize、Bangumi helper 和图片索引的速率；不要仅依赖共享密钥承担配额控制。
 
 ### 3. 部署 Worker
 

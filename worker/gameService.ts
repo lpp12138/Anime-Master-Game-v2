@@ -1,6 +1,7 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { createRoomCode } from "../src/lib/id";
 import { CURRENT_ROOM_RUNTIME_GENERATION } from "../src/lib/roomRuntime";
+import { normalizeBangumiQuestionTags } from "../src/lib/bangumiTags";
 import {
   DEFAULT_TEAM_BATTLE_GUESS_VOTE_SECONDS,
   DEFAULT_TEAM_BATTLE_REVEAL_VOTE_SECONDS,
@@ -21,6 +22,8 @@ import {
 } from "./roomStateManifest";
 import type {
   Answer,
+  BangumiAnimeTag,
+  BangumiCharacterTag,
   BuzzerAnswer,
   CommunityQuestionSetPage,
   CommunityQuestionSetSort,
@@ -98,12 +101,18 @@ const unboundD1 = createD1QueryClient(null);
 const DEFAULT_ROUND_SECONDS = 45;
 const DEFAULT_ROUND_SCORES = [5, 3, 1];
 const MAX_QUESTION_SET_QUESTIONS = 30;
+const MAX_HOMEPAGE_QUESTION_SET_TITLE_LENGTH = 80;
+const MAX_HOMEPAGE_QUESTION_SET_DESCRIPTION_LENGTH = 300;
+const MAX_HOMEPAGE_QUESTION_LABEL_LENGTH = 100;
 const d1: D1QueryClient = {
   hasDatabase() {
     return getD1().hasDatabase();
   },
   from(table: string) {
     return getD1().from(table);
+  },
+  insertAtomically(operations) {
+    return getD1().insertAtomically(operations);
   },
 };
 
@@ -1743,6 +1752,8 @@ function getSelectableTeamBattleBlocks(session: Pick<GameSession, "revealedBlock
 export type QuestionImportItem = {
   imageUrl: string;
   labelText?: string | null;
+  animeTags?: BangumiAnimeTag[];
+  characterTags?: BangumiCharacterTag[];
 };
 
 function isHttpImageUrl(value: string) {
@@ -1776,10 +1787,13 @@ function normalizeQuestionImportItems(items: QuestionImportItem[]) {
       continue;
     }
 
+    const tags = normalizeBangumiQuestionTags(item.animeTags, item.characterTags);
     seenUrls.add(imageUrl);
     normalizedItems.push({
       imageUrl,
       labelText: item.labelText?.trim() || null,
+      animeTags: tags.animeTags,
+      characterTags: tags.characterTags,
     });
   }
 
@@ -2543,6 +2557,147 @@ export async function createUploadedQuestionSet(params: {
   if (questionSetError) {
     throw new Error(questionSetError.message);
   }
+  return toQuestionSet(questionSet, questions);
+}
+
+export class HomepageCommunityQuestionSetPersistenceError extends Error {
+  constructor(public readonly cause: unknown) {
+    super("题库保存失败，请稍后重试。");
+    this.name = "HomepageCommunityQuestionSetPersistenceError";
+  }
+}
+
+export class HomepageCommunityQuestionSetConflictError extends Error {
+  constructor() {
+    super("投稿内容已发生变化，请作为一次新投稿重试。");
+    this.name = "HomepageCommunityQuestionSetConflictError";
+  }
+}
+
+export async function getHomepageCommunityQuestionSetBySubmissionId(submissionId: string) {
+  assertD1Env();
+  const { data, error } = await d1
+    .from("question_sets")
+    .select("*")
+    .eq("community_submission_id", submissionId)
+    .maybeSingle<DbQuestionSet>();
+  if (error) throw new HomepageCommunityQuestionSetPersistenceError(error.message);
+  return data ? {
+    questionSet: toQuestionSet(data),
+    submissionFingerprint: data.community_submission_fingerprint ?? null,
+  } : null;
+}
+
+export async function createHomepageCommunityQuestionSet(params: {
+  submissionId: string;
+  submissionFingerprint: string;
+  playerId: string;
+  nickname: string;
+  title: string;
+  description?: string;
+  questions: QuestionImportItem[];
+}) {
+  assertD1Env();
+
+  const submissionId = params.submissionId.trim();
+  const submissionFingerprint = params.submissionFingerprint.trim();
+  const playerId = params.playerId.trim();
+  const nickname = params.nickname.replace(/[\r\n]+/g, " ").trim();
+  const title = params.title.replace(/[\r\n]+/g, " ").trim();
+  const description = params.description?.trim() || null;
+  if (!/^[a-zA-Z0-9_-]{16,160}$/.test(submissionId)) throw new Error("投稿标识无效，请刷新页面后重试。");
+  if (!/^[0-9a-f]{64}$/.test(submissionFingerprint)) throw new Error("投稿内容指纹无效，请刷新页面后重试。");
+  if (!/^[a-zA-Z0-9_-]{1,160}$/.test(playerId)) throw new Error("上传者标识无效，请刷新页面后重试。");
+  if (!nickname) throw new Error("请输入上传者昵称。");
+  if (nickname.length > 20) throw new Error("上传者昵称最多 20 个字符。");
+  if (!title) throw new Error("请输入题库标题。");
+  if (title.length > MAX_HOMEPAGE_QUESTION_SET_TITLE_LENGTH) {
+    throw new Error(`题库标题最多 ${MAX_HOMEPAGE_QUESTION_SET_TITLE_LENGTH} 个字符。`);
+  }
+  if (description && description.length > MAX_HOMEPAGE_QUESTION_SET_DESCRIPTION_LENGTH) {
+    throw new Error(`题库说明最多 ${MAX_HOMEPAGE_QUESTION_SET_DESCRIPTION_LENGTH} 个字符。`);
+  }
+  if (!Array.isArray(params.questions) || params.questions.length === 0) throw new Error("请至少上传一张截图。");
+  if (params.questions.length > MAX_QUESTION_SET_QUESTIONS) {
+    throw new Error(`单个题库最多包含 ${MAX_QUESTION_SET_QUESTIONS} 道题。`);
+  }
+  if (params.questions.some((question) => !question.labelText?.trim())) {
+    throw new Error("每张截图都必须填写正确答案。");
+  }
+  if (params.questions.some((question) => (question.labelText?.trim().length ?? 0) > MAX_HOMEPAGE_QUESTION_LABEL_LENGTH)) {
+    throw new Error(`单题答案最多 ${MAX_HOMEPAGE_QUESTION_LABEL_LENGTH} 个字符。`);
+  }
+
+  const questionItems = normalizeQuestionImportItems(params.questions);
+  if (questionItems.length !== params.questions.length) throw new Error("题库中包含无效或重复的图片。");
+  if (questionItems.some((question) => !question.labelText)) throw new Error("每张截图都必须填写正确答案。");
+
+  const questionSetId = crypto.randomUUID();
+  const createdAt = new Date().toISOString();
+  const questions: DbQuestion[] = questionItems.map((item, index) => {
+    const labelText = item.labelText?.trim() || null;
+    return {
+      id: crypto.randomUUID(),
+      question_set_id: questionSetId,
+      image_url: item.imageUrl,
+      order_index: index,
+      label_text: labelText,
+      label_source: labelText ? "manual" : null,
+      label_source_answer_id: null,
+      label_updated_by_player_id: labelText ? playerId : null,
+      label_updated_at: labelText ? createdAt : null,
+      created_at: createdAt,
+    };
+  });
+
+  const questionSetRecord = {
+    id: questionSetId,
+    title,
+    description,
+    created_by_player_id: playerId,
+    created_by_nickname: nickname,
+    source: "uploaded",
+    creation_method: "player_manual",
+    is_public: true,
+    image_count: questions.length,
+    image_urls_text: null,
+    manifest_version: QUESTION_SET_MANIFEST_VERSION,
+    manifest_revision: 0,
+    manifest_json: encodeQuestionSetManifest(questions.map(toQuestion)),
+    community_submission_id: submissionId,
+    community_submission_fingerprint: submissionFingerprint,
+    created_at: createdAt,
+    updated_at: createdAt,
+  };
+
+  const imageIndexRows = questions.map((question, index) => ({
+    question_id: question.id,
+    question_set_id: questionSetId,
+    image_url: question.image_url,
+    answer_text: question.label_text!,
+    order_index: question.order_index,
+    anime_subject_id: questionItems[index].animeTags?.[0]?.id ?? null,
+    anime_tags_json: questionItems[index].animeTags ?? [],
+    character_tags_json: questionItems[index].characterTags ?? [],
+    created_at: createdAt,
+  }));
+
+  const { data: insertedRows, error } = await d1.insertAtomically([
+    { table: "question_sets", records: [questionSetRecord] },
+    { table: "question_image_index", records: imageIndexRows },
+  ]);
+  const questionSet = insertedRows?.[0]?.[0] as DbQuestionSet | undefined;
+  if (error?.code === "23505") {
+    const existing = await getHomepageCommunityQuestionSetBySubmissionId(submissionId);
+    if (existing?.submissionFingerprint !== submissionFingerprint) {
+      throw new HomepageCommunityQuestionSetConflictError();
+    }
+    if (existing) return existing.questionSet;
+  }
+  if (error || !questionSet) {
+    throw new HomepageCommunityQuestionSetPersistenceError(error?.message ?? "题库原子写入没有返回题库记录。");
+  }
+
   return toQuestionSet(questionSet, questions);
 }
 

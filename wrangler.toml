@@ -33,9 +33,9 @@ bucket_name = "anime-master-game-images"
 crons = ["0 23 * * *"]
 
 [vars]
-ALLOWED_ORIGIN = "https://anipeek.animaster.dpdns.org,http://localhost:3000"
+ALLOWED_ORIGIN = "https://caicai.lpp.moe,http://localhost:3000"
 R2_IMAGE_PREFIX = "question-images"
-R2_PUBLIC_BASE_URL = "https://assets.animaster.dpdns.org"
+R2_PUBLIC_BASE_URL = "https://caicai.lpp.moe/api/r2-images"
 R2_EXISTING_IMAGE_LIMIT = "50"
 REMOTE_IMAGE_PROXY_CANDIDATES = "https://corsproxy.io/?url=,https://api.allorigins.win/raw?url=,https://api.codetabs.com/v1/proxy?quest="
 

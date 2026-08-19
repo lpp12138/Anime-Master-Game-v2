@@ -24,6 +24,8 @@
     "test:question-set-creation-analysis": "tsx --test tests/question-set-creation-method-analysis.test.ts",
     "test:local-image-upload": "tsx --test tests/local-image-upload.test.ts",
     "test:r2-upload": "tsx --test tests/r2-upload.test.ts",
+    "test:community-screenshot-upload": "tsx --test tests/community-screenshot-upload.test.ts",
+    "test:bangumi-api": "tsx --test tests/bangumi-api.test.ts",
     "test:game-rpc-response": "tsx --test tests/game-rpc-response.test.ts",
     "promo:prepare": "node scripts/prepare-promo-assets.mjs",
     "analyze:question-set-creation-method": "node scripts/analyze-question-set-creation-method.mjs",
@@ -38,19 +40,18 @@
     "react-dom": "18.2.0"
   },
   "devDependencies": {
-    "@cloudflare/workers-types": "^4.20260612.1",
+    "@cloudflare/workers-types": "^5.20260819.1",
     "@types/node": "^20",
     "@types/react": "^18",
     "@types/react-dom": "^18",
     "@vitejs/plugin-react": "^6.0.2",
     "autoprefixer": "^10",
-    "eslint": "^8",
     "fake-indexeddb": "^6.2.5",
-    "postcss": "^8",
+    "postcss": "^8.5.26",
     "tailwindcss": "^3.4.17",
     "tsx": "^4.23.1",
     "typescript": "^5",
     "vite": "^8.0.16",
-    "wrangler": "^4.100.0"
+    "wrangler": "^4.124.0"
   }
 }

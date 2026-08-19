@@ -19,12 +19,20 @@ type OrderBy = {
 };
 
 const D1_MAX_BOUND_PARAMETERS_PER_QUERY = 100;
-const JSON_COLUMNS = new Set(["revealed_blocks", "round_scores", "team_battle_state", "lobby_round_scores"]);
+const JSON_COLUMNS = new Set([
+  "revealed_blocks",
+  "round_scores",
+  "team_battle_state",
+  "lobby_round_scores",
+  "anime_tags_json",
+  "character_tags_json",
+]);
 const BOOLEAN_COLUMNS = new Set(["is_host", "is_public"]);
 const UPDATED_AT_TABLES = new Set(["rooms", "question_sets", "question_set_ratings"]);
 const CREATED_AT_TABLES = new Set([
   "rooms",
   "question_sets",
+  "question_image_index",
   "questions",
   "game_sessions",
   "question_set_ratings",
@@ -187,6 +195,70 @@ export type GameDatabaseMutationTracker = {
   successfulWrites: number;
   markValidated?: () => void;
 };
+
+type AtomicInsertOperation = {
+  table: string;
+  records: Record<string, unknown>[];
+};
+
+async function executeAtomicInserts(
+  db: GameDatabase | null,
+  operations: AtomicInsertOperation[],
+  mutationTracker?: GameDatabaseMutationTracker,
+): Promise<QueryResult<Record<string, unknown>[][]>> {
+  if (!db) {
+    return { data: null, error: { message: "游戏数据库绑定不可用，请检查本地开发服务配置。" } };
+  }
+
+  try {
+    const rowsByOperation: Record<string, unknown>[][] = operations.map(() => []);
+    const statements: GamePreparedStatement[] = [];
+    const statementOperationIndexes: number[] = [];
+
+    operations.forEach((operation, operationIndex) => {
+      const records = operation.records.map((record) => cleanRecord(operation.table, record));
+      if (records.length === 0) return;
+      const columns = Object.keys(records[0]);
+      if (columns.length === 0 || columns.length > D1_MAX_BOUND_PARAMETERS_PER_QUERY) {
+        throw new Error(`${operation.table} 原子写入字段数量无效。`);
+      }
+      if (records.some((record) => {
+        const recordColumns = Object.keys(record);
+        return recordColumns.length !== columns.length
+          || columns.some((column) => !Object.prototype.hasOwnProperty.call(record, column));
+      })) {
+        throw new Error(`${operation.table} 原子写入要求每行字段一致。`);
+      }
+
+      const rowsPerStatement = Math.max(1, Math.floor(D1_MAX_BOUND_PARAMETERS_PER_QUERY / columns.length));
+      const rowPlaceholder = `(${columns.map(() => "?").join(", ")})`;
+      for (let start = 0; start < records.length; start += rowsPerStatement) {
+        const chunk = records.slice(start, start + rowsPerStatement);
+        const values = chunk.flatMap((record) => columns.map((column) => record[column]));
+        const placeholders = chunk.map(() => rowPlaceholder).join(", ");
+        const sql = `INSERT INTO ${sqlIdentifier(operation.table)} (${columns
+          .map(sqlIdentifier)
+          .join(", ")}) VALUES ${placeholders} RETURNING *`;
+        statements.push(db.prepare(sql).bind(...values));
+        statementOperationIndexes.push(operationIndex);
+      }
+    });
+
+    const results = statements.length > 0
+      ? await db.batch<Record<string, unknown>>(statements)
+      : [];
+    results.forEach((result, statementIndex) => {
+      const operationIndex = statementOperationIndexes[statementIndex];
+      rowsByOperation[operationIndex].push(...(result.results ?? []).map((row) => denormalizeRow(row)));
+    });
+    if (mutationTracker) {
+      mutationTracker.successfulWrites += rowsByOperation.reduce((total, rows) => total + rows.length, 0);
+    }
+    return { data: rowsByOperation, error: null };
+  } catch (error) {
+    return { data: null, error: uniqueError(error) };
+  }
+}
 
 class D1QueryBuilder<T = unknown> implements PromiseLike<QueryResult<T>> {
   private operation: "select" | "insert" | "update" | "delete" = "select";
@@ -544,6 +616,9 @@ export function createD1QueryClient(db: GameDatabase | null, mutationTracker?: G
     },
     from(table: string) {
       return new D1QueryBuilder(db, table, mutationTracker);
+    },
+    insertAtomically(operations: AtomicInsertOperation[]) {
+      return executeAtomicInserts(db, operations, mutationTracker);
     },
   };
 }

@@ -1,0 +1,11 @@
+[Unit]
+Description=Back up Anime Master Game local state every day
+
+[Timer]
+OnCalendar=*-*-* 02:15:00 UTC
+Persistent=true
+RandomizedDelaySec=10m
+Unit=anime-master-game-backup.service
+
+[Install]
+WantedBy=timers.target

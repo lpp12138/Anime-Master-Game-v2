@@ -220,6 +220,20 @@ export type QuestionSet = {
   questions?: Question[];
 };
 
+export type BangumiAnimeTag = {
+  id: number;
+  name: string;
+  nameCn: string | null;
+};
+
+export type BangumiCharacterTag = {
+  id: number;
+  subjectId: number;
+  name: string;
+  nameCn: string | null;
+  relation: string | null;
+};
+
 export type Question = {
   id: string;
   questionSetId: string;
@@ -463,6 +477,8 @@ export type DbQuestionSet = {
   manifest_version?: number | null;
   manifest_revision?: number;
   manifest_json?: string | null;
+  community_submission_id?: string | null;
+  community_submission_fingerprint?: string | null;
   created_at: string;
   updated_at?: string | null;
 };

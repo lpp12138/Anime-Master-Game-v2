@@ -4,6 +4,7 @@ import { useEffect, useRef, useState } from "react";
 import { useRouter } from "@/lib/router";
 import { AppShell } from "@/components/AppShell";
 import { Button } from "@/components/Button";
+import { CommunityScreenshotUploader } from "@/components/CommunityScreenshotUploader";
 import { FormField } from "@/components/FormField";
 import { Panel } from "@/components/Panel";
 import { QuestionGuideButton } from "@/components/QuestionGuideButton";
@@ -13,7 +14,7 @@ import { isRoomNicknameTaken } from "@/lib/roomNickname";
 import { getInviteNicknameNotice, ROOM_REMOVAL_NOTICE } from "@/lib/roomEntryNotice";
 import type { RoomVisibility } from "@/types/game";
 
-const GITHUB_REPO_URL = "https://github.com/Davy-Chendy/Anime-Master-Game-v2";
+const GITHUB_REPO_URL = "https://github.com/lpp12138/Anime-Master-Game-v2";
 const INTRO_VIDEO_URL = "https://www.bilibili.com/video/BV1ZQug6SEKP/?share_source=copy_web&vd_source=adcd58a56c0c896937ee4c3fe22de339";
 const FEEDBACK_QQ_GROUP_URL = "https://qm.qq.com/q/bHJQIRplmg";
 const OTHER_GAME_URL = "https://decrypto.monight.dpdns.org/";
@@ -444,8 +445,9 @@ export default function HomePage() {
             <p className="mt-5 max-w-xl text-base leading-7 text-[var(--muted)]">
               和朋友一起开格子猜动画
             </p>
-            <div className="mt-6">
+            <div className="mt-6 flex flex-col gap-3 sm:flex-row">
               <QuestionGuideButton className="w-full sm:w-auto" />
+              <CommunityScreenshotUploader className="w-full sm:w-auto" nickname={nickname} />
             </div>
             <div className="mt-8 grid max-w-xl gap-3 sm:grid-cols-3">
               <div className="rounded-lg border border-white bg-white/70 p-4 shadow-sm">
