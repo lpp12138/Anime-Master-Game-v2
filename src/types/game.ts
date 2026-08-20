@@ -106,6 +106,8 @@ export type Room = {
   spectatorPlayerAnswersEnabled?: boolean;
   teamAssignmentMode?: TeamAssignmentMode;
   teamAssignments?: Partial<Record<string, TeamBattleTeam>>;
+  /** 房间级“包含 R18 题目”开关；默认 false，关闭时服务端抽题必须排除 R18 题目。 */
+  includeR18?: boolean;
   createdAt: number | string;
   updatedAt?: string;
 };
@@ -140,6 +142,8 @@ export type DbRoom = {
   lobby_spectator_player_answers_enabled?: number | boolean | null;
   lobby_team_assignment_mode?: TeamAssignmentMode | null;
   lobby_team_assignments?: unknown;
+  /** 房间级“包含 R18 题目”开关的持久列；0/1 或布尔，旧房间默认 false。 */
+  lobby_include_r18?: number | boolean | null;
   runtime_generation?: number | null;
   room_state_version?: number | null;
   room_state_revision?: number | null;

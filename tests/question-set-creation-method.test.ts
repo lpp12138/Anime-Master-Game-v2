@@ -84,7 +84,7 @@ function migrationFiles() {
   return readdirSync(migrationsDirectory).filter((name) => /^\d{4}_.+\.sql$/.test(name)).sort();
 }
 
-function applyMigrations(db: DatabaseSync, through = "0028") {
+function applyMigrations(db: DatabaseSync, through = "0033") {
   for (const name of migrationFiles()) {
     if (name.slice(0, 4) > through) break;
     db.exec(readFileSync(join(migrationsDirectory, name), "utf8"));
@@ -1087,6 +1087,11 @@ test("new question sets default by creation path, publishing can confirm the met
 test("custom room TEAM_BATTLE vote durations flow into the initial game state", async () => {
   const db = new DatabaseAdapter();
   applyMigrations(db.sqlite);
+  // 0029 起 rooms.prepared_question_set_id 有引用完整性 trigger，先建题库。
+  db.sqlite.prepare("INSERT INTO question_sets(id,title,created_by_player_id,image_count) VALUES(?,?,?,?)")
+    .run("set-team", "Team Set", "host", 1);
+  db.sqlite.prepare("INSERT INTO questions(id,question_set_id,image_url,order_index) VALUES(?,?,?,?)")
+    .run("question-team", "set-team", "https://example.com/team.webp", 0);
   db.sqlite.prepare(`INSERT INTO rooms(id,room_code,host_player_id,game_status,current_presenter_player_id,prepared_question_set_id)
     VALUES(?,?,?,?,?,?)`).run("room-team", "TEAM01", "host", "QUESTION_SETUP", "host", "set-team");
   for (const [id, nickname, isHost] of [["host", "Host", 1], ["p1", "P1", 0], ["p2", "P2", 0]] as const) {
@@ -1094,10 +1099,6 @@ test("custom room TEAM_BATTLE vote durations flow into the initial game state", 
       .run(id, "room-team", nickname, isHost, "PLAYER");
   }
   upgradeRoomFixtureToAggregate(db.sqlite, "room-team");
-  db.sqlite.prepare("INSERT INTO question_sets(id,title,created_by_player_id,image_count) VALUES(?,?,?,?)")
-    .run("set-team", "Team Set", "host", 1);
-  db.sqlite.prepare("INSERT INTO questions(id,question_set_id,image_url,order_index) VALUES(?,?,?,?)")
-    .run("question-team", "set-team", "https://example.com/team.webp", 0);
 
   await runWithGameDatabase(db, async () => {
     const room = await updateRoomGameSettings({
@@ -1141,6 +1142,8 @@ test("custom room TEAM_BATTLE vote durations flow into the initial game state", 
 test("TEAM_BATTLE roster rejection is typed and performs no D1 start writes", async () => {
   const db = new DatabaseAdapter();
   applyMigrations(db.sqlite);
+  db.sqlite.prepare("INSERT INTO question_sets(id,title,created_by_player_id,image_count) VALUES(?,?,?,?)")
+    .run("set-team-small", "Small Team Set", "host", 1);
   db.sqlite.prepare(`INSERT INTO rooms(id,room_code,host_player_id,game_status,current_presenter_player_id,prepared_question_set_id)
     VALUES(?,?,?,?,?,?)`).run("room-team-small", "TEAM02", "host", "QUESTION_SETUP", "host", "set-team-small");
   for (const [id, nickname, isHost] of [["host", "Host", 1], ["p1", "P1", 0]] as const) {
@@ -1148,8 +1151,6 @@ test("TEAM_BATTLE roster rejection is typed and performs no D1 start writes", as
       .run(id, "room-team-small", nickname, isHost, "PLAYER");
   }
   upgradeRoomFixtureToAggregate(db.sqlite, "room-team-small");
-  db.sqlite.prepare("INSERT INTO question_sets(id,title,created_by_player_id,image_count) VALUES(?,?,?,?)")
-    .run("set-team-small", "Small Team Set", "host", 1);
 
   await runWithGameDatabase(db, async () => {
     await assert.rejects(
@@ -1176,6 +1177,10 @@ test("TEAM_BATTLE roster rejection is typed and performs no D1 start writes", as
 test("manual team setup blocks incomplete rosters, allows uneven teams, and switching to AUTO clears assignments", async () => {
   const db = new DatabaseAdapter();
   applyMigrations(db.sqlite);
+  db.sqlite.prepare("INSERT INTO question_sets(id,title,created_by_player_id,image_count) VALUES(?,?,?,?)")
+    .run("set-manual-team", "Manual Team Set", "host", 1);
+  db.sqlite.prepare("INSERT INTO questions(id,question_set_id,image_url,order_index) VALUES(?,?,?,?)")
+    .run("question-manual-team", "set-manual-team", "https://example.com/manual-team.webp", 0);
   db.sqlite.prepare(`INSERT INTO rooms(id,room_code,host_player_id,game_status,current_presenter_player_id,prepared_question_set_id)
     VALUES(?,?,?,?,?,?)`).run("room-manual-team", "MTEAM1", "host", "QUESTION_SETUP", "host", "set-manual-team");
   for (const [id, nickname, isHost] of [["host", "Host", 1], ["p1", "P1", 0], ["p2", "P2", 0], ["p3", "P3", 0], ["watch", "Watch", 0]] as const) {
@@ -1183,10 +1188,6 @@ test("manual team setup blocks incomplete rosters, allows uneven teams, and swit
       .run(id, "room-manual-team", nickname, isHost, id === "watch" ? "SPECTATOR" : "PLAYER");
   }
   upgradeRoomFixtureToAggregate(db.sqlite, "room-manual-team");
-  db.sqlite.prepare("INSERT INTO question_sets(id,title,created_by_player_id,image_count) VALUES(?,?,?,?)")
-    .run("set-manual-team", "Manual Team Set", "host", 1);
-  db.sqlite.prepare("INSERT INTO questions(id,question_set_id,image_url,order_index) VALUES(?,?,?,?)")
-    .run("question-manual-team", "set-manual-team", "https://example.com/manual-team.webp", 0);
 
   await runWithGameDatabase(db, async () => {
     let room = await updateRoomGameSettings({
@@ -1278,6 +1279,8 @@ test("manual team setup removes presenter and spectator assignments and remains 
     assert.equal(room.status, "QUESTION_SETUP");
     assert.deepEqual(room.teamAssignments, { host: "red", p2: "red" });
 
+    db.sqlite.prepare("INSERT INTO question_sets(id,title,created_by_player_id,image_count) VALUES(?,?,?,?)")
+      .run("prepared-set", "Prepared Set", "host", 1);
     db.sqlite.prepare("UPDATE rooms SET prepared_question_set_id=? WHERE id=?")
       .run("prepared-set", "room-manual-lifecycle");
     room = await selectTeamForPlayer({ roomId: "room-manual-lifecycle", playerId: "p2", team: "blue" });
@@ -1298,6 +1301,8 @@ test("manual team setup removes presenter and spectator assignments and remains 
 test("returning a completed room to the lobby clears all per-game identities", async () => {
   const db = new DatabaseAdapter();
   applyMigrations(db.sqlite);
+  db.sqlite.prepare("INSERT INTO question_sets(id,title,created_by_player_id,image_count) VALUES(?,?,?,?)")
+    .run("stale-set", "Stale Set", "host", 1);
   db.sqlite.prepare(`INSERT INTO rooms(
     id,room_code,host_player_id,game_status,current_presenter_player_id,current_game_id,prepared_question_set_id,lobby_team_assignments
   ) VALUES(?,?,?,?,?,?,?,?)`).run(
@@ -1378,5 +1383,357 @@ test("direct questions payload rejects non-boolean or null isR18 and conflicting
     // 冲突被拒绝后题库不应被创建。
     const remaining = db.sqlite.prepare("SELECT COUNT(*) AS count FROM question_sets WHERE title LIKE 'R18 %题库'").get() as { count: number };
     assert.equal(remaining.count, 0);
+  });
+});
+
+test("D1 0033 adds rooms lobby_include_r18 transactionally and defaults historical rooms to 0", () => {
+  const db = new DatabaseSync(":memory:");
+  applyMigrations(db, "0032");
+  db.prepare("INSERT INTO rooms(id,room_code,host_player_id,game_status) VALUES(?,?,?,?)")
+    .run("legacy-room", "R18033", "host", "LOBBY");
+
+  const migration = readFileSync(join(migrationsDirectory, "0033_room_lobby_include_r18.sql"), "utf8");
+  // 事务回滚：迁移中途失败后列不得残留，也不能推进到半新状态。
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    db.exec(migration);
+    throw new Error("injected migration failure");
+  } catch {
+    db.exec("ROLLBACK");
+  }
+  assert.equal(db.prepare("SELECT COUNT(*) count FROM pragma_table_info('rooms') WHERE name='lobby_include_r18'").get().count, 0);
+
+  db.exec(migration);
+  const legacy = db.prepare("SELECT lobby_include_r18 FROM rooms WHERE id='legacy-room'").get() as { lobby_include_r18: number };
+  assert.equal(legacy.lobby_include_r18, 0, "历史房间默认不包含 R18 题目");
+  // CHECK 只接受 0/1：2 与非整数值都被拒绝。
+  assert.throws(() => db.prepare("UPDATE rooms SET lobby_include_r18=2 WHERE id='legacy-room'").run(), /CHECK constraint failed/);
+  assert.throws(() => db.prepare("UPDATE rooms SET lobby_include_r18=0.5 WHERE id='legacy-room'").run(), /CHECK constraint failed/);
+  db.prepare("UPDATE rooms SET lobby_include_r18=1 WHERE id='legacy-room'").run();
+  assert.equal(db.prepare("SELECT lobby_include_r18 FROM rooms WHERE id='legacy-room'").get().lobby_include_r18, 1);
+  assert.equal(db.prepare("SELECT room_code FROM rooms WHERE id='legacy-room'").get().room_code, "R18033");
+});
+
+test("updateRoomGameSettings rejects non-boolean includeR18 without partial writes", async () => {
+  const db = new DatabaseAdapter();
+  applyMigrations(db.sqlite);
+  await runWithGameDatabase(db, async () => {
+    const room = await createRoom("r18-bool-host", "R18 Bool Host");
+    // includeR18 是不可信 RPC 输入：提供了但非 boolean（含 null/数字/字符串）必须明确拒绝，
+    // 不能静默当成 false。
+    for (const bad of [null, 1, 0, "true", "yes", {}, []]) {
+      await assert.rejects(
+        updateRoomGameSettings({
+          roomId: room.id!,
+          hostPlayerId: "r18-bool-host",
+          gameMode: "ROUND_REVEAL",
+          includeR18: bad as unknown as boolean,
+        }),
+        /必须是布尔值/,
+      );
+    }
+    // 拒绝发生在任何写入之前：列保持默认 0，房间仍在。
+    const row = db.sqlite.prepare("SELECT lobby_include_r18 FROM rooms WHERE id=?").get(room.id!) as { lobby_include_r18: number };
+    assert.equal(row.lobby_include_r18, 0, "非法开关值被拒绝后保持默认 0");
+    assert.equal(db.sqlite.prepare("SELECT COUNT(*) count FROM rooms WHERE id=?").get(room.id!).count, 1);
+    // 合法布尔值仍然可用。
+    const toggled = await updateRoomGameSettings({
+      roomId: room.id!,
+      hostPlayerId: "r18-bool-host",
+      gameMode: "ROUND_REVEAL",
+      includeR18: true,
+    });
+    assert.equal(toggled.includeR18, true);
+  });
+});
+
+test("room includeR18 defaults off, filters prepared counts, and freezes start sampling", async () => {
+  const db = new DatabaseAdapter();
+  applyMigrations(db.sqlite);
+  await runWithGameDatabase(db, async () => {
+    const room = await createRoom("r18-room-host", "R18 Room Host");
+    await selectPresenterForRound(room.id!, "r18-room-host", "r18-room-host");
+    // 旧题缺 isR18 默认 false；混入 2 道 R18。
+    const questionSet = await createUploadedQuestionSet({
+      roomId: room.id!,
+      presenterPlayerId: "r18-room-host",
+      title: "Mixed R18 Set",
+      questions: [
+        { imageUrl: "https://example.com/1.webp", labelText: "A1", isR18: false },
+        { imageUrl: "https://example.com/2.webp", labelText: "A2", isR18: true },
+        { imageUrl: "https://example.com/3.webp", labelText: "A3", isR18: false },
+        { imageUrl: "https://example.com/4.webp", labelText: "A4", isR18: true },
+        { imageUrl: "https://example.com/5.webp", labelText: "A5" },
+      ],
+    });
+    // D1 migration 0033 默认 0；Room 映射为 includeR18=false。
+    const row = db.sqlite.prepare("SELECT lobby_include_r18 FROM rooms WHERE id=?").get(room.id!) as { lobby_include_r18: number };
+    assert.equal(row.lobby_include_r18, 0);
+
+    // 默认关闭：准备题库时服务端已按开关排除 R18，可用题数 = 3（5 题中 2 题 R18）。
+    let prepared = await prepareQuestionSetForStart({
+      roomId: room.id!,
+      presenterPlayerId: "r18-room-host",
+      questionSetId: questionSet.id,
+    });
+    assert.equal(prepared.includeR18, false);
+    assert.equal(prepared.preparedQuestionCount, 3);
+
+    // 开启后可用题数恢复为全部 5 题；不传 includeR18 时保持当前值。
+    prepared = await updateRoomGameSettings({
+      roomId: room.id!,
+      hostPlayerId: "r18-room-host",
+      gameMode: "ROUND_REVEAL",
+      includeR18: true,
+    });
+    assert.equal(prepared.includeR18, true);
+    assert.equal(prepared.preparedQuestionCount, 5);
+    const preserved = await updateRoomGameSettings({
+      roomId: room.id!,
+      hostPlayerId: "r18-room-host",
+      gameMode: "ROUND_REVEAL",
+      questionCount: 2,
+    });
+    assert.equal(preserved.includeR18, true);
+
+    // 再次关闭：重新计算可用题数并收紧当前随机题数（5 → 3，等于上限时映射为 null）。
+    prepared = await updateRoomGameSettings({
+      roomId: room.id!,
+      hostPlayerId: "r18-room-host",
+      gameMode: "ROUND_REVEAL",
+      questionCount: 5,
+      includeR18: false,
+    });
+    assert.equal(prepared.includeR18, false);
+    assert.equal(prepared.preparedQuestionCount, 3);
+    assert.equal(prepared.questionCount, null);
+
+    // 关闭状态下开局只从非 R18 候选题无放回抽取，抽中顺序写入快照。
+    const startParams = {
+      startRequestId: "r18-off-start-request",
+      roomId: room.id!,
+      hostPlayerId: "r18-room-host",
+      presenterPlayerId: "r18-room-host",
+      questionSetId: questionSet.id,
+      questionCount: 2,
+      authorityVersion: 2 as const,
+    };
+    const started = await startGameWithQuestionSet(startParams);
+    const firstQuestions = started.__authorityVNextBootstrap.questions;
+    assert.equal(started.gameSession.questionCount, 2);
+    assert.equal(firstQuestions.length, 2);
+    assert.equal(new Set(firstQuestions.map((question) => question.id)).size, 2, "抽样无重复");
+    assert.equal(firstQuestions.every((question) => question.isR18 === false), true, "关闭 R18 时不得抽中 R18 题目");
+    const storedIds = JSON.parse(String(
+      db.sqlite.prepare("SELECT selected_question_ids FROM game_sessions WHERE id=?").get(startParams.startRequestId).selected_question_ids,
+    )) as string[];
+    assert.deepEqual(storedIds, firstQuestions.map((question) => question.id));
+
+    // 重复 startRequestId 保持同一冻结顺序，不重新抽取。
+    const retried = await startGameWithQuestionSet(startParams);
+    assert.deepEqual(
+      retried.__authorityVNextBootstrap.questions.map((question) => question.id),
+      firstQuestions.map((question) => question.id),
+    );
+    assert.equal(
+      db.sqlite.prepare("SELECT COUNT(*) count FROM game_sessions WHERE id=?").get(startParams.startRequestId).count,
+      1,
+    );
+  });
+});
+
+test("all-R18 prepared set stays selectable with zero eligible questions until R18 is enabled", async () => {
+  const db = new DatabaseAdapter();
+  applyMigrations(db.sqlite);
+  await runWithGameDatabase(db, async () => {
+    const room = await createRoom("r18-all-host", "R18 All Host");
+    await selectPresenterForRound(room.id!, "r18-all-host", "r18-all-host");
+    const questionSet = await createUploadedQuestionSet({
+      roomId: room.id!,
+      presenterPlayerId: "r18-all-host",
+      title: "All R18 Set",
+      questions: [
+        { imageUrl: "https://example.com/1.webp", labelText: "A1", isR18: true },
+        { imageUrl: "https://example.com/2.webp", labelText: "A2", isR18: true },
+      ],
+    });
+
+    // 默认关闭时选择全 R18 题库：不拒绝选择，仍记录题库，但可用题数为 0
+    // （prepared_question_count 置 NULL），开局由服务端 0 候选权威拒绝。
+    let prepared = await prepareQuestionSetForStart({
+      roomId: room.id!,
+      presenterPlayerId: "r18-all-host",
+      questionSetId: questionSet.id,
+    });
+    assert.equal(prepared.includeR18, false);
+    assert.equal(prepared.preparedQuestionSetId, questionSet.id);
+    assert.equal(prepared.preparedQuestionCount, null, "筛选后 0 可用：prepared_question_count 置 NULL");
+    assert.equal(prepared.questionCount, null);
+    await assert.rejects(
+      startGameWithQuestionSet({
+        startRequestId: "r18-all-start-request-0",
+        roomId: room.id!,
+        hostPlayerId: "r18-all-host",
+        presenterPlayerId: "r18-all-host",
+        questionSetId: questionSet.id,
+        authorityVersion: 2 as const,
+      }),
+      /没有可用/,
+    );
+
+    // 开启 R18：开关切换后重算，可用题数恢复为全部 2 题。
+    prepared = await updateRoomGameSettings({
+      roomId: room.id!,
+      hostPlayerId: "r18-all-host",
+      gameMode: "ROUND_REVEAL",
+      includeR18: true,
+    });
+    assert.equal(prepared.includeR18, true);
+    assert.equal(prepared.preparedQuestionCount, 2);
+
+    // 已准备全 R18 题库时再关闭开关：切换成功（不拒绝），持久化 false、
+    // 可用题数 NULL、随机题数清空；开局由服务端 0 候选权威拒绝。
+    prepared = await updateRoomGameSettings({
+      roomId: room.id!,
+      hostPlayerId: "r18-all-host",
+      gameMode: "ROUND_REVEAL",
+      includeR18: false,
+    });
+    assert.equal(prepared.includeR18, false);
+    assert.equal(prepared.preparedQuestionCount, null);
+    assert.equal(prepared.questionCount, null);
+    const roomRow = db.sqlite
+      .prepare("SELECT lobby_include_r18, prepared_question_count, lobby_question_count FROM rooms WHERE id=?")
+      .get(room.id!) as { lobby_include_r18: number; prepared_question_count: number | null; lobby_question_count: number | null };
+    assert.equal(roomRow.lobby_include_r18, 0, "关闭开关持久化为 false");
+    assert.equal(roomRow.prepared_question_count, null, "0 可用时 prepared_question_count 持久化为 NULL");
+    assert.equal(roomRow.lobby_question_count, null, "0 可用时随机题数清空");
+    await assert.rejects(
+      startGameWithQuestionSet({
+        startRequestId: "r18-all-start-request-1",
+        roomId: room.id!,
+        hostPlayerId: "r18-all-host",
+        presenterPlayerId: "r18-all-host",
+        questionSetId: questionSet.id,
+        authorityVersion: 2 as const,
+      }),
+      /没有可用/,
+    );
+
+    // 再次开启后重算可用并开局正常，抽中全部为 R18 题目。
+    prepared = await updateRoomGameSettings({
+      roomId: room.id!,
+      hostPlayerId: "r18-all-host",
+      gameMode: "ROUND_REVEAL",
+      includeR18: true,
+    });
+    assert.equal(prepared.preparedQuestionCount, 2);
+    const started = await startGameWithQuestionSet({
+      startRequestId: "r18-all-start-request",
+      roomId: room.id!,
+      hostPlayerId: "r18-all-host",
+      presenterPlayerId: "r18-all-host",
+      questionSetId: questionSet.id,
+      authorityVersion: 2 as const,
+    });
+    assert.equal(started.gameSession.questionCount, 2);
+    assert.equal(started.__authorityVNextBootstrap.questions.every((question) => question.isR18 === true), true);
+  });
+});
+
+test("includeR18 caps a mixed over-30 community set to the per-game 30 limit", async () => {
+  const db = new DatabaseAdapter();
+  applyMigrations(db.sqlite);
+  await runWithGameDatabase(db, async () => {
+    const room = await createRoom("r18-large-host", "R18 Large Host");
+    await selectPresenterForRound(room.id!, "r18-large-host", "r18-large-host");
+    const questions = Array.from({ length: 40 }, (_, index) => ({
+      id: `large-r18-question-${index}`,
+      questionSetId: "large-r18-set",
+      imageUrl: `https://example.com/large-r18-${index}.webp`,
+      orderIndex: index,
+      labelText: `Answer ${index + 1}`,
+      labelSource: "manual" as const,
+      isR18: index < 10,
+      createdAt: "2026-02-01T00:00:00.000Z",
+    }));
+    db.sqlite.prepare(`INSERT INTO question_sets
+      (id,title,created_by_player_id,is_public,image_count,manifest_version,manifest_revision,manifest_json,
+       community_submission_id,community_collection_title,created_at,updated_at)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`)
+      .run(
+        "large-r18-set",
+        "大型混合题库",
+        "r18-large-host",
+        1,
+        40,
+        1,
+        0,
+        encodeQuestionSetManifest(questions),
+        "large-r18-submission-0000000000",
+        "大型混合题库",
+        "2026-02-01T00:00:00.000Z",
+        "2026-02-01T00:00:00.000Z",
+      );
+
+    // 关闭 R18：30 道非 R18 恰好等于每局上限，prepared 按 30 记录。
+    const prepared = await prepareQuestionSetForStart({
+      roomId: room.id!,
+      presenterPlayerId: "r18-large-host",
+      questionSetId: "large-r18-set",
+    });
+    assert.equal(prepared.preparedQuestionCount, 30);
+
+    // 滑到最大（null = 全部可用）时仍每局最多随机抽 30 道，且不含 R18。
+    const started = await startGameWithQuestionSet({
+      startRequestId: "large-r18-start-request",
+      roomId: room.id!,
+      hostPlayerId: "r18-large-host",
+      presenterPlayerId: "r18-large-host",
+      questionSetId: "large-r18-set",
+      authorityVersion: 2 as const,
+    });
+    assert.equal(started.gameSession.questionCount, 30);
+    const firstQuestions = started.__authorityVNextBootstrap.questions;
+    assert.equal(firstQuestions.length, 30);
+    assert.equal(new Set(firstQuestions.map((question) => question.id)).size, 30);
+    assert.equal(firstQuestions.every((question) => question.isR18 === false), true);
+
+    // 开启后 40 题全部可抽，仍按每局上限 30 随机抽取（可能包含 R18）。
+    // 先开局（关闭态）会进入 PLAYING，因此换一个房间验证开启态。
+    const roomOn = await createRoom("r18-large-host-on", "R18 Large Host On");
+    await selectPresenterForRound(roomOn.id!, "r18-large-host-on", "r18-large-host-on");
+    const withR18 = await updateRoomGameSettings({
+      roomId: roomOn.id!,
+      hostPlayerId: "r18-large-host-on",
+      gameMode: "ROUND_REVEAL",
+      includeR18: true,
+    });
+    assert.equal(withR18.includeR18, true);
+    await prepareQuestionSetForStart({
+      roomId: roomOn.id!,
+      presenterPlayerId: "r18-large-host-on",
+      questionSetId: "large-r18-set",
+    });
+    const preparedOn = await updateRoomGameSettings({
+      roomId: roomOn.id!,
+      hostPlayerId: "r18-large-host-on",
+      gameMode: "ROUND_REVEAL",
+    });
+    assert.equal(preparedOn.preparedQuestionCount, 30);
+    const startedWithR18 = await startGameWithQuestionSet({
+      startRequestId: "large-r18-start-request-2",
+      roomId: roomOn.id!,
+      hostPlayerId: "r18-large-host-on",
+      presenterPlayerId: "r18-large-host-on",
+      questionSetId: "large-r18-set",
+      authorityVersion: 2 as const,
+    });
+    assert.equal(startedWithR18.gameSession.questionCount, 30);
+    const withR18Questions = startedWithR18.__authorityVNextBootstrap.questions;
+    assert.equal(withR18Questions.length, 30);
+    assert.equal(new Set(withR18Questions.map((question) => question.id)).size, 30);
+    // 开启后“会包含 R18”由上面的全 R18 题库测试确定性证明；40 题随机抽 30 道
+    // 理论上可能恰好不含 R18 题，这里不做概率性断言。
   });
 });

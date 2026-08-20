@@ -107,7 +107,9 @@ Generation 4 不再为新房间写 `players` 表。玩家名单以版本化、�
 
 少于整套题数时，服务端在单次开局处理中对最多 30 个内存题目执行无重复洗牌，把最多 30 个题目 ID 作为不超过 4,096 字符的 JSON 写入既有 `game_sessions` 行；不新增数据行、索引或后续 checkpoint。重复开局请求、刷新、重连、Hibernation 和结算回退只读取该快照，不重新抽取或写入。选全部题目时仍保留原顺序；抽取较少题目会缩小 active-game questions、广播快照和后续每题操作数量，因此 50 人 × 30 题的现有极端预算不增加。
 
-按每天 60 局且每局由房主修改一次题数估算，最多增加 60 条低频设置消息、60 行 D1 房间读取/更新和 60 行 DO runtime version 更新，分别占 100,000 行日写入硬额度的 0.06%；人数不会把入站操作乘以 50。D1 migration `0028_game_question_sampling.sql` 和 DO schema v14 只增加三个有界、无索引列，历史 game session 默认空数组并按全题库旧行为读取；DO schema v15 仅给本地 `questions` 投影增加与 D1 `0032` 对齐的 `is_r18` 布尔列。单局 mutation、checkpoint、Alarm、最终投影语句数和索引计量模型不变，因此无需修改 `scripts/authority-write-budget.mjs`。
+按每天 60 局且每局由房主修改一次题数估算，最多增加 60 条低频设置消息、60 行 D1 房间读取/更新和 60 行 DO runtime version 更新，分别占 100,000 行日写入硬额度的 0.06%；人数不会把入站操作乘以 50。D1 migration `0028_game_question_sampling.sql` 和 DO schema v14 只增加三个有界、无索引列，历史 game session 默认空数组并按全题库旧行为读取；DO schema v15 仅给本地 `questions` 投影增加与 D1 `0032` 对齐的 `is_r18` 布尔列。
+
+房间级“包含 R18 题目”开关（D1 `0033_room_lobby_include_r18.sql` 与 DO schema v16，带 CHECK 的 0/1 列）默认关闭，只由房主低频切换。关闭时准备题库与开局抽题按该开关在内存过滤候选（manifest 仍只读 1 行；旧题库最多再读 30 行 `questions`，与 authority vNext bootstrap 既有的读取同量级）；房主切换开关时最多增加 1 行题集读取 + 1 行 manifest（或旧题库 30 行题目）读取以重算可用题数，并把收紧后的题数写回既有房间行，不新增请求、Alarm、广播放大或逐玩家放大。按每天 60 局、每局切换一次估算，额外最多 60 行题集读取与最多 60 行房间更新，仍低于日写入硬额度的 0.1%。单局 mutation、checkpoint、Alarm、最终投影语句数和索引计量模型不变，因此无需修改 `scripts/authority-write-budget.mjs`。
 
 ## Question Set Manifest V2 预算（2026-07-31）
 

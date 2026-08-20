@@ -246,6 +246,24 @@ function normalizeQuestionCount(value: unknown) {
     : null;
 }
 
+// 房间级“包含 R18 题目”开关的权威过滤：关闭时排除 is_r18=true 的候选题。
+// 旧题缺 is_r18 视为 false，因此默认关闭时旧题库不受影响。
+function filterQuestionsByR18(questions: readonly DbQuestion[], includeR18: boolean) {
+  return includeR18 ? [...questions] : questions.filter((question) => !isDbTruthy(question.is_r18));
+}
+
+async function getEligibleQuestionCountForPreparedSet(questionSetId: string, includeR18: boolean) {
+  const { data: questionSet, error } = await d1
+    .from("question_sets")
+    .select("*")
+    .eq("id", questionSetId)
+    .maybeSingle<DbQuestionSet>();
+  if (error) throw new Error(error.message);
+  if (!questionSet) return 0;
+  const questions = await getDbQuestionsForQuestionSet(questionSet);
+  return filterQuestionsByR18(questions, includeR18).length;
+}
+
 function requireQuestionCount(value: unknown) {
   if (value === null) return null;
   if (typeof value !== "number" || !Number.isInteger(value) || value < 1 || value > MAX_QUESTION_SET_QUESTIONS) {
@@ -338,6 +356,7 @@ function toRoom(room: DbRoom, players: DbPlayer[] = getRoomStatePlayers(room)): 
       room.lobby_spectator_player_answers_enabled !== 0 && room.lobby_spectator_player_answers_enabled !== false,
     teamAssignmentMode: normalizeTeamAssignmentMode(room.lobby_team_assignment_mode),
     teamAssignments: sanitizeTeamAssignments(room, players),
+    includeR18: isDbTruthy(room.lobby_include_r18),
     createdAt: room.created_at,
     updatedAt: room.updated_at,
   };
@@ -3331,12 +3350,37 @@ export async function prepareQuestionSetForStart(params: {
       ? "CREATION_TOOL"
       : "MANUAL";
 
-  const { data: room, error } = await d1
+  const { data: room, error: roomError } = await d1
+    .from("rooms")
+    .select("*")
+    .eq("id", params.roomId)
+    .maybeSingle<DbRoom>();
+
+  if (roomError) {
+    throw new Error(roomError.message);
+  }
+
+  if (!room || room.current_presenter_player_id !== params.presenterPlayerId || room.game_status !== "QUESTION_SETUP") {
+    throw new Error("准备题库失败：当前房间不在出题阶段，或你不是本轮出题人。");
+  }
+
+  // 房间级“包含 R18 题目”开关默认关闭：准备时就按开关权威计算本局可用题数，
+  // 而不是等开局才由 startGameWithQuestionSet 拒绝。
+  // 筛选后 0 题不拒绝选择：仍记录题库，prepared_question_count 置 NULL 表示
+  // 当前筛选 0 可用；UI 会显示警告并禁用开始按钮，房主打开 R18 开关后重算即可开始。
+  const includeR18 = isDbTruthy(room.lobby_include_r18);
+  const questions = await getDbQuestionsForQuestionSet(questionSet);
+  const eligibleQuestions = filterQuestionsByR18(questions, includeR18);
+
+  const { data: updatedRoom, error } = await d1
     .from("rooms")
     .update({
       prepared_question_set_id: params.questionSetId,
       // 社区题库可累计超过 30 题；每局仍最多 30 题，这里只记录本局上限。
-      prepared_question_count: Math.min(questionSet.image_count, MAX_QUESTION_SET_QUESTIONS),
+      // 关闭 R18 时按过滤后的可用题数计算；筛选后 0 题时置 NULL（表示 0 可用）。
+      prepared_question_count: eligibleQuestions.length === 0
+        ? null
+        : Math.min(eligibleQuestions.length, MAX_QUESTION_SET_QUESTIONS),
       lobby_question_count: null,
       prepared_question_source: preparedQuestionSource,
       public_activity_at: new Date().toISOString(),
@@ -3351,11 +3395,11 @@ export async function prepareQuestionSetForStart(params: {
     throw new Error(error.message);
   }
 
-  if (!room) {
+  if (!updatedRoom) {
     throw new Error("准备题库失败：当前房间不在出题阶段，或你不是本轮出题人。");
   }
 
-  return toRoom(room);
+  return toRoom(updatedRoom);
 }
 
 export async function updateRoomNotice(params: {
@@ -3428,6 +3472,8 @@ export async function updateRoomGameSettings(params: {
   spectatorCapacity?: number;
   teamAssignmentMode?: TeamAssignmentMode;
   questionCount?: number | null;
+  /** 房间级“包含 R18 题目”开关；省略时保持当前值。关闭时服务端按它排除候选题。 */
+  includeR18?: boolean;
 }) {
   assertD1Env();
 
@@ -3478,11 +3524,49 @@ export async function updateRoomGameSettings(params: {
   let questionCount = params.questionCount === undefined
     ? normalizeQuestionCount(currentRoom.lobby_question_count)
     : requireQuestionCount(params.questionCount);
-  const preparedQuestionCount = normalizeQuestionCount(currentRoom.prepared_question_count);
-  if (questionCount != null && preparedQuestionCount != null && questionCount > preparedQuestionCount) {
+  // includeR18 来自不可信 RPC 输入：提供了但非 boolean（含 null/数字/字符串）必须明确拒绝，
+  // 不能静默当成 false，避免客户端误传时悄悄改变开关语义。
+  let includeR18 = isDbTruthy(currentRoom.lobby_include_r18);
+  if (params.includeR18 !== undefined) {
+    if (typeof params.includeR18 !== "boolean") {
+      throw new Error("“包含 R18 题目”开关必须是布尔值（true 或 false）。");
+    }
+    includeR18 = params.includeR18;
+  }
+  const includeR18Changed = includeR18 !== isDbTruthy(currentRoom.lobby_include_r18);
+  let preparedQuestionCount = normalizeQuestionCount(currentRoom.prepared_question_count);
+  // 已准备题库时按最新开关重新计算本局可用题数（每局仍最多 30），并在开关
+  // 切换导致可用题数减少时收紧当前随机题数，避免开局时用过期设置被拒绝。
+  let nextPreparedQuestionCount: number | null = null;
+  if (typeof currentRoom.prepared_question_set_id === "string") {
+    const eligibleQuestionCount = await getEligibleQuestionCountForPreparedSet(
+      currentRoom.prepared_question_set_id,
+      includeR18,
+    );
+    if (eligibleQuestionCount === 0) {
+      // 当前筛选下题库 0 可用：开关切换不拒绝（房主可再打开 R18 恢复），
+      // prepared_question_count 置 NULL 表示 0 可用，同时清空随机题数；
+      // 开局由 startGameWithQuestionSet 的 0 候选权威拒绝兜底。
+      nextPreparedQuestionCount = null;
+      questionCount = null;
+    } else {
+      nextPreparedQuestionCount = Math.min(eligibleQuestionCount, MAX_QUESTION_SET_QUESTIONS);
+    }
+  }
+  if (nextPreparedQuestionCount != null) {
+    preparedQuestionCount = nextPreparedQuestionCount;
+    if (questionCount != null && questionCount > preparedQuestionCount) {
+      if (includeR18Changed) {
+        // 开关切换导致的题数收紧：直接修到当前可用上限，等价的“全部题目”映射为 null。
+        questionCount = preparedQuestionCount;
+      } else {
+        throw new Error(`本局抽取题数不能超过当前题库的 ${preparedQuestionCount} 道题。`);
+      }
+    }
+  } else if (questionCount != null && preparedQuestionCount != null && questionCount > preparedQuestionCount) {
     throw new Error(`本局抽取题数不能超过当前题库的 ${preparedQuestionCount} 道题。`);
   }
-  if (questionCount != null && questionCount === preparedQuestionCount) questionCount = null;
+  if (questionCount != null && preparedQuestionCount != null && questionCount === preparedQuestionCount) questionCount = null;
   const currentPlayers = getRoomStatePlayers(currentRoom);
   const playerCount = countGamePlayers(currentPlayers);
   const spectatorCount = countSpectators(currentPlayers);
@@ -3507,6 +3591,12 @@ export async function updateRoomGameSettings(params: {
     lobby_spectator_capacity: spectatorCapacity,
     lobby_question_count: questionCount,
     lobby_team_assignment_mode: teamAssignmentMode,
+    lobby_include_r18: includeR18 ? 1 : 0,
+    // 已准备题库时始终按最新开关重写可用题数（0 可用时写 NULL），
+    // 未准备题库时保持原样，避免覆盖其他阶段的清理语义。
+    ...(typeof currentRoom.prepared_question_set_id === "string"
+      ? { prepared_question_count: nextPreparedQuestionCount }
+      : {}),
     ...(params.gameMode !== "TEAM_BATTLE" || teamAssignmentMode === "AUTO"
       ? { lobby_team_assignments: "{}" }
       : {}),
@@ -3751,11 +3841,20 @@ export async function startGameWithQuestionSet(params: {
   if (availableQuestions.length !== questionSet.image_count) {
     rejectStartGame("开始游戏失败：题库题目数量不一致，请重新准备题库。");
   }
+  // 房间级“包含 R18 题目”开关是开局抽题的权威依据（读取房间持久列，不信任
+  // 客户端参数）：关闭时候选池排除 is_r18=true，开启时包含全部。
+  const includeR18 = isDbTruthy(room.lobby_include_r18);
+  const eligibleQuestions = filterQuestionsByR18(availableQuestions, includeR18);
+  if (eligibleQuestions.length === 0) {
+    rejectStartGame("开始游戏失败：当前题库没有可用的非 R18 题目，请开启“包含 R18 题目”或更换题库。");
+  }
   const configuredQuestionCount = params.questionCount === undefined
     ? room.lobby_question_count
     : params.questionCount;
-  const questionCount = requireStartQuestionCount(configuredQuestionCount, availableQuestions.length);
-  const selectedQuestions = selectQuestionsForGame(availableQuestions, questionCount);
+  const questionCount = requireStartQuestionCount(configuredQuestionCount, eligibleQuestions.length);
+  // 抽中顺序在此冻结进 selected_question_ids：重复 startRequestId、刷新、重连、
+  // Room DO 恢复和结算回退都只读取该快照，不重新抽取。
+  const selectedQuestions = selectQuestionsForGame(eligibleQuestions, questionCount);
   const selectedQuestionIds = selectedQuestions.map((question) => question.id);
 
   const initialGameSessionValues = {
@@ -3898,7 +3997,7 @@ export async function startGameWithQuestionSet(params: {
       current_game_id: gameSession.id,
       prepared_question_set_id: null,
       prepared_question_count: null,
-      lobby_question_count: questionCount === availableQuestions.length ? null : questionCount,
+      lobby_question_count: questionCount === eligibleQuestions.length ? null : questionCount,
       game_status: "PLAYING",
       public_activity_at: new Date().toISOString(),
     })

@@ -84,6 +84,8 @@ type GameSettings = {
   spectatorCapacity: number;
   teamAssignmentMode: TeamAssignmentMode;
   questionCount: number | null;
+  /** 房间级“包含 R18 题目”开关；默认关闭。 */
+  includeR18: boolean;
 };
 
 const defaultGameSettings: GameSettings = {
@@ -100,6 +102,7 @@ const defaultGameSettings: GameSettings = {
   spectatorCapacity: 50,
   teamAssignmentMode: "MANUAL",
   questionCount: null,
+  includeR18: false,
 };
 
 function createStartRequestId() {
@@ -198,6 +201,7 @@ function normalizeGameSettings(settings: Partial<GameSettings>): GameSettings {
       settings.questionCount <= MAX_GAME_QUESTION_COUNT
         ? settings.questionCount
         : null,
+    includeR18: settings.includeR18 === true,
   };
 }
 
@@ -216,6 +220,7 @@ function getRoomGameSettings(room: Room | null | undefined): GameSettings {
     spectatorCapacity: room?.spectatorCapacity,
     teamAssignmentMode: room?.teamAssignmentMode,
     questionCount: room?.questionCount,
+    includeR18: room?.includeR18 === true,
   });
 }
 
@@ -234,7 +239,8 @@ function areGameSettingsEqual(left: GameSettings, right: GameSettings) {
     left.playerCapacity === right.playerCapacity &&
     left.spectatorCapacity === right.spectatorCapacity &&
     left.teamAssignmentMode === right.teamAssignmentMode &&
-    left.questionCount === right.questionCount
+    left.questionCount === right.questionCount &&
+    left.includeR18 === right.includeR18
   );
 }
 
@@ -957,11 +963,14 @@ function CancelRoundConfirmModal({
 function GameSettingsPanel({
   settings,
   canEdit,
+  hasQuestionSet,
   preparedQuestionCount,
   onChange,
 }: {
   settings: GameSettings;
   canEdit: boolean;
+  /** 是否已选择题库；未选择时不展示 R18 开关与题数滑条，只提示选择题库后可设置。 */
+  hasQuestionSet: boolean;
   preparedQuestionCount?: number | null;
   onChange: (settings: GameSettings) => void;
 }) {
@@ -972,10 +981,39 @@ function GameSettingsPanel({
     typeof preparedQuestionCount === "number" && preparedQuestionCount >= 1
       ? Math.min(MAX_GAME_QUESTION_COUNT, Math.floor(preparedQuestionCount))
       : 0;
-  const selectedQuestionCount =
+  const sliderQuestionCount =
     settings.questionCount != null && settings.questionCount < availableQuestionCount
-      ? String(settings.questionCount)
-      : "all";
+      ? settings.questionCount
+      : availableQuestionCount;
+  // 拖动/键盘调整期间只更新本地草稿，pointer 释放（Pointer Events 已覆盖触摸）、
+  // 键盘操作结束或 blur 时才提交，避免 range 每个 onChange 都发 RPC 造成并发写与服务端乱序。
+  const [sliderDraft, setSliderDraft] = useState<number | null>(null);
+  const displayedSliderCount = Math.min(sliderDraft ?? sliderQuestionCount, availableQuestionCount || 1) || 1;
+  const sliderAtMax = displayedSliderCount >= availableQuestionCount;
+  const questionCountLabel =
+    availableQuestionCount === 0
+      ? "当前筛选没有可用题目，请开启包含 R18 或更换题库"
+      : sliderAtMax
+        ? availableQuestionCount >= MAX_GAME_QUESTION_COUNT
+          // 上限 30 时无法区分题库正好 30 题还是超过 30 题，不承诺“全部保持顺序”。
+          ? `本局最多 ${MAX_GAME_QUESTION_COUNT} 道（大题库会随机抽取）`
+          : `全部 ${availableQuestionCount} 道（保持题库顺序）`
+        : `随机抽取 ${displayedSliderCount} 道（无重复）`;
+
+  function commitSliderDraft() {
+    if (sliderDraft == null) return;
+    // 滑到最大映射为 null（全部可用题目）；少于最大时随机无放回抽取。
+    const nextCount = sliderDraft >= availableQuestionCount ? null : sliderDraft;
+    setSliderDraft(null);
+    // 避免重复提交相同值：与已生效设置一致时不再发 RPC。
+    if (nextCount === settings.questionCount) return;
+    onChange({ ...settings, questionCount: nextCount });
+  }
+
+  // 失去编辑权或题库不可用（如开关切换后可用题数为 0）时丢弃未提交草稿，避免恢复后滑条跳变。
+  useEffect(() => {
+    if (!canEdit || availableQuestionCount === 0) setSliderDraft(null);
+  }, [canEdit, availableQuestionCount]);
 
   function updateRounds(nextRounds: number) {
     onChange({
@@ -1041,31 +1079,73 @@ function GameSettingsPanel({
       </div>
 
       <div className="border-t border-[var(--line)] bg-amber-50/60 px-4 py-4">
-        <label className="block max-w-md">
-          <span className="mb-2 block text-sm font-semibold text-slate-900">本局题目</span>
-          <select
-            aria-label="本局抽取题数"
-            className="h-12 w-full rounded-md border border-amber-200 bg-white px-3 text-base outline-none transition disabled:bg-slate-100 focus:border-[var(--primary)] focus:ring-4 focus:ring-rose-100"
-            disabled={!canEdit || availableQuestionCount === 0}
-            value={selectedQuestionCount}
-            onChange={(event) =>
-              onChange({
-                ...settings,
-                questionCount: event.target.value === "all" ? null : Number(event.target.value),
-              })
-            }
-          >
-            <option value="all">
-              {availableQuestionCount > 0 ? `全部 ${availableQuestionCount} 道（保持题库顺序）` : "准备题库后可选择抽取题数"}
-            </option>
-            {Array.from({ length: Math.max(0, availableQuestionCount - 1) }, (_, index) => index + 1).map((count) => (
-              <option key={count} value={count}>随机抽取 {count} 道</option>
-            ))}
-          </select>
-        </label>
-        <p className="mt-2 text-xs leading-5 text-[var(--muted)]">
-          少于整套题数时由服务端随机、无重复抽取并打乱顺序；开局后结果固定，刷新或重连不会重新抽题。
-        </p>
+        {!hasQuestionSet ? (
+          <p className="text-sm leading-6 text-[var(--muted)]">选择题库后可设置 R18 与随机题数</p>
+        ) : (
+          <>
+            <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-2">
+              <label className="flex min-w-0 cursor-pointer items-center gap-2">
+                <input
+                  aria-label="包含 R18 题目"
+                  checked={settings.includeR18}
+                  className="h-4 w-4 shrink-0 accent-rose-600"
+                  disabled={!canEdit}
+                  type="checkbox"
+                  onChange={(event) =>
+                    onChange({ ...settings, includeR18: event.target.checked })
+                  }
+                />
+                <span className="text-sm font-semibold text-slate-900">包含 R18 题目</span>
+              </label>
+              <p className="min-w-0 text-xs leading-5 text-[var(--muted)]">
+                默认关闭；关闭时本局不抽取标记为 R18 的题目，由服务端按开关过滤，可用题数会相应减少。
+              </p>
+            </div>
+
+            <div className="mt-4">
+              <div className="mb-2 flex min-w-0 flex-wrap items-center justify-between gap-x-4 gap-y-1">
+                <span className="text-sm font-semibold text-slate-900">本局抽取题数</span>
+                <span className="min-w-0 rounded bg-amber-100 px-2 py-1 text-xs font-bold text-amber-900">
+                  {availableQuestionCount > 0 ? questionCountLabel : "当前筛选没有可用题目，请开启包含 R18 或更换题库"}
+                </span>
+              </div>
+              <div className="w-full max-w-md">
+                <input
+                  aria-label="本局抽取题数"
+                  aria-valuetext={questionCountLabel}
+                  className="h-8 w-full accent-amber-600 disabled:cursor-not-allowed disabled:opacity-50"
+                  disabled={!canEdit || availableQuestionCount === 0}
+                  max={availableQuestionCount || 1}
+                  min={1}
+                  step={1}
+                  type="range"
+                  value={displayedSliderCount}
+                  onChange={(event) => {
+                    const nextCount = Number(event.target.value);
+                    if (!Number.isInteger(nextCount) || nextCount < 1) return;
+                    // 拖动过程中只更新本地显示，提交交给 onPointerUp/onKeyUp/onBlur。
+                    setSliderDraft(Math.min(nextCount, availableQuestionCount || 1));
+                  }}
+                  onPointerUp={commitSliderDraft}
+                  onKeyUp={(event) => {
+                    // 键盘每步调整（方向键/Home/End/PageUp/PageDown）松开即提交最终值。
+                    if (["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", "Home", "End", "PageUp", "PageDown"].includes(event.key)) {
+                      commitSliderDraft();
+                    }
+                  }}
+                  onBlur={commitSliderDraft}
+                />
+                <div className="flex justify-between px-0.5 text-[11px] font-medium text-amber-800" aria-hidden="true">
+                  <span>1</span>
+                  <span>{availableQuestionCount || 1}</span>
+                </div>
+              </div>
+            </div>
+            <p className="mt-2 text-xs leading-5 text-[var(--muted)]">
+              滑到最大时：不超过 30 道按题库顺序全部使用，超过 30 道由服务端随机抽满 30 道；少于最大时随机、无重复抽取并打乱顺序。开局后结果固定，刷新或重连不会重新抽题。
+            </p>
+          </>
+        )}
       </div>
 
       <details className="border-t border-[var(--line)] px-4 py-3">
@@ -1308,6 +1388,9 @@ function LobbyMainPanel({
 }) {
   const actionText = getLobbyActionText(room, isHost, false);
   const hasQuestionSet = Boolean(room.preparedQuestionSetId);
+  const preparedQuestionCount = room.preparedQuestionCount;
+  const hasUsableQuestionSet =
+    hasQuestionSet && typeof preparedQuestionCount === "number" && preparedQuestionCount >= 1;
   const canEditSettings = isHost && (room.status === "LOBBY" || room.status === "QUESTION_SETUP");
   const gamePlayerCount = getGamePlayers(room.players).length;
   const manualTeamStartIssue = (() => {
@@ -1347,7 +1430,7 @@ function LobbyMainPanel({
             ) : null}
             {isHost && room.status === "QUESTION_SETUP" ? (
               <>
-                <Button type="button" onClick={onStartGame} disabled={isStartingGame || isUpdatingSettings || !hasQuestionSet || Boolean(manualTeamStartIssue)}>
+                <Button type="button" onClick={onStartGame} disabled={isStartingGame || isUpdatingSettings || !hasUsableQuestionSet || Boolean(manualTeamStartIssue)}>
                   {isStartingGame ? "启动中…" : "开始游戏"}
                 </Button>
                 <Button type="button" variant="secondary" onClick={onCancelRound} disabled={isCancelingRound}>
@@ -1359,6 +1442,12 @@ function LobbyMainPanel({
         </div>
       </div>
 
+      {hasQuestionSet && !hasUsableQuestionSet ? (
+        <p className="mt-4 rounded-md border border-amber-200 bg-amber-50 px-4 py-3 text-sm font-medium text-amber-800">
+          当前筛选没有可用题目，请开启“包含 R18 题目”或更换题库
+        </p>
+      ) : null}
+
       {hasQuestionSet && manualTeamStartIssue ? (
         <p className="mt-4 rounded-md border border-amber-200 bg-amber-50 px-4 py-3 text-sm font-medium text-amber-800">
           暂时不能开始：{manualTeamStartIssue}
@@ -1369,6 +1458,7 @@ function LobbyMainPanel({
         <GameSettingsPanel
           settings={settings}
           canEdit={canEditSettings}
+          hasQuestionSet={hasQuestionSet}
           preparedQuestionCount={room.preparedQuestionCount}
           onChange={onSettingsChange}
         />
@@ -2755,6 +2845,7 @@ export default function RoomPage({ initialRoomCode = "" }: { initialRoomCode?: s
         spectatorCapacity: normalizedSettings.spectatorCapacity,
         teamAssignmentMode: normalizedSettings.teamAssignmentMode,
         questionCount: normalizedSettings.questionCount,
+        includeR18: normalizedSettings.includeR18,
       });
 
       if (settingsUpdateSeqRef.current === updateSeq) {
@@ -2796,6 +2887,7 @@ export default function RoomPage({ initialRoomCode = "" }: { initialRoomCode?: s
         presenterPlayerId,
         questionSetId,
         gameSettings.questionCount,
+        gameSettings.includeR18,
       ]);
       if (!startGameAttemptRef.current) {
         startGameAttemptRef.current = getStoredStartGameAttempt(roomId);

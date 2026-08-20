@@ -238,6 +238,8 @@ export const updateRoomGameSettings = (params: {
   spectatorCapacity?: number;
   teamAssignmentMode?: TeamAssignmentMode;
   questionCount?: number | null;
+  /** 房间级“包含 R18 题目”开关；默认关闭，关闭时服务端抽题排除 R18 题目。 */
+  includeR18?: boolean;
 }) => rpc<Room>("updateRoomGameSettings", params);
 
 export const updateRoomNotice = (params: { roomId: string; hostPlayerId: string; notice: string }) =>

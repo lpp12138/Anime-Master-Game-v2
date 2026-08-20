@@ -26,6 +26,7 @@ npm run build
 | WebSocket 协议、delta、snapshot、加入/退出、判定反馈 | `npm run test:authority-vnext`、`npm run test:authority-full-game` |
 | 四种游戏模式、计分、阶段转换、deadline | `npm run test:authority-full-game`、`npm run test:authority-state-machine`、`npm run test:authority-vnext` |
 | 本局随机抽题、题数设置、开局幂等或抽题快照恢复 | `npm run test:question-set-creation-method`、`npm run test:authority-vnext`、`npm run test:authority-full-game`、`npm run test:game-result-archive` |
+| 房间“包含 R18 题目”开关（迁移默认关闭、关闭排除/开启包含、全 R18 默认关闭 0 可用但可选、开启后可开始、再关闭 0 可用且开局拒绝、切换后可用题数重算与题数收紧、抽样无重复与重试顺序、UI 状态映射）或 `0033_room_lobby_include_r18.sql`/DO schema v16 | `npm run test:question-set-creation-method`、`npm run test:authority-vnext`，并按下方 D1 migration 规则覆盖升级与失败不推进 |
 | DO checkpoint、Hibernation、Attachment、Alarm、恢复 | `npm run test:authority-vnext`、`npm run test:authority-budget` |
 | D1 最终投影、历史结算、roster handoff | `npm run test:authority-vnext`、`npm run test:game-result-archive`、`npm run test:authority-budget` |
 | D1 migration 或 DO schema migration | 对应升级测试、重复初始化测试、失败不推进版本测试，以及 `worker:typecheck` |

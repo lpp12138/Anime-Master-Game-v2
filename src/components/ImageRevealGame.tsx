@@ -4389,9 +4389,6 @@ export function ImageRevealGame({
           maxWidth: isPortraitImage ? `min(1280px, calc(78vh * ${imageAspectRatio}))` : "1280px",
         }}
       >
-        {currentQuestion?.isR18 ? (
-          <span className="absolute left-3 top-3 z-20 rounded bg-rose-600 px-2 py-1 text-xs font-black tracking-widest text-white shadow-lg">R18</span>
-        ) : null}
         {isPresenter ? (
           <img
             alt=""
@@ -5392,9 +5389,6 @@ export function ImageRevealGame({
 
                 <div className="min-h-0 overflow-y-auto px-5 py-5">
                   <div className="relative grid min-h-48 place-items-center overflow-hidden rounded-md bg-slate-950">
-                    {reviewedQuestion.isR18 ? (
-                      <span className="absolute left-3 top-3 z-10 rounded bg-rose-600 px-2 py-1 text-xs font-black tracking-widest text-white shadow-lg">R18</span>
-                    ) : null}
                     {reviewImageLoadFailed ? (
                       <div className="px-4 py-16 text-center text-white">
                         <p className="font-semibold">图片加载失败</p>
