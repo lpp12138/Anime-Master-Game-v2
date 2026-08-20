@@ -728,7 +728,7 @@ export default function QuestionSetAdminPage() {
                                 <p className="mt-1 break-words text-base font-bold text-rose-700">{question.answerText || "（未填写）"}</p>
                                 {question.animeTags.length > 0 && (
                                   <div className="mt-3">
-                                    <p className="text-xs font-semibold text-slate-500">BGM 作品（动画/游戏）</p>
+                                    <p className="text-xs font-semibold text-slate-500">Bangumi 作品（动画/游戏）</p>
                                     <div className="mt-1 flex flex-wrap gap-1.5">{question.animeTags.map((tag) => <span className="rounded-full bg-sky-50 px-2 py-1 text-xs text-sky-800" key={tag.id}>{bangumiTagDisplayName(tag)}</span>)}</div>
                                   </div>
                                 )}

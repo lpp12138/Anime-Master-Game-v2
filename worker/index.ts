@@ -2515,7 +2515,7 @@ async function handleCommunityImageIndexSearch(request: Request, env: Env) {
   const characterIdValue = url.searchParams.get("characterId");
   const characterId = characterIdValue == null || characterIdValue === "" ? null : Number(characterIdValue);
   if (!Number.isInteger(animeSubjectId) || animeSubjectId < 1 || animeSubjectId > 2_147_483_647) {
-    return json({ error: "必须提供有效的 BGM 作品 ID。" }, { status: 400 }, request, env);
+    return json({ error: "必须提供有效的 Bangumi 作品 ID。" }, { status: 400 }, request, env);
   }
   if (characterId != null && (!Number.isInteger(characterId) || characterId < 1 || characterId > 2_147_483_647)) {
     return json({ error: "角色 ID 无效。" }, { status: 400 }, request, env);

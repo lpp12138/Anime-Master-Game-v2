@@ -99,7 +99,7 @@ export function BangumiQuestionTagEditor({
         if (active) setCharacters(next);
       })
       .catch((error) => {
-        if (active) setCharacterError(error instanceof Error ? error.message : "BGM 角色列表加载失败。");
+        if (active) setCharacterError(error instanceof Error ? error.message : "Bangumi 角色列表加载失败。");
       })
       .finally(() => {
         if (active) setCharactersLoading(false);
@@ -137,7 +137,7 @@ export function BangumiQuestionTagEditor({
     setAnimeResultsOpen(false);
     setActiveAnimeIndex(-1);
     if (query.length < 2) {
-      setAnimeError("请先输入至少 2 个字符作为正确答案或 BGM 搜索词。");
+      setAnimeError("请先输入至少 2 个字符作为正确答案或 Bangumi 搜索词。");
       return;
     }
     if (!normalizedUploadKey) {
@@ -156,10 +156,10 @@ export function BangumiQuestionTagEditor({
       setAnimeResults(results);
       setActiveAnimeIndex(results.length > 0 ? 0 : -1);
       setAnimeResultsOpen(results.length > 0);
-      if (results.length === 0) setAnimeError("BGM 中没有找到匹配的条目，请尝试中文名、日文原名或作品名。");
+      if (results.length === 0) setAnimeError("Bangumi 中没有找到匹配的条目，请尝试中文名、日文原名或作品名。");
     } catch (error) {
       if (searchSequence === animeSearchSequenceRef.current && !controller.signal.aborted) {
-        setAnimeError(error instanceof Error ? error.message : "BGM 作品搜索失败。");
+        setAnimeError(error instanceof Error ? error.message : "Bangumi 作品搜索失败。");
       }
     } finally {
       if (animeSearchAbortRef.current === controller) animeSearchAbortRef.current = null;
@@ -216,7 +216,7 @@ export function BangumiQuestionTagEditor({
       <div className="space-y-2">
         <div className="flex flex-wrap items-center justify-between gap-2">
           <label className="text-sm font-semibold text-slate-900" htmlFor={`${animeListId}-answer`}>
-            正确答案 / BGM 作品搜索（动画/游戏） <span className="text-rose-600">*</span>
+            正确答案 / Bangumi 作品搜索（动画/游戏） <span className="text-rose-600">*</span>
           </label>
           <a
             className="text-xs text-sky-700 underline decoration-dotted"
@@ -224,68 +224,66 @@ export function BangumiQuestionTagEditor({
             target="_blank"
             rel="noreferrer"
           >
-            BGM 即 Bangumi
+            Bangumi API 文档
           </a>
         </div>
-        <div className="flex flex-wrap items-center gap-2">
-          <div className="flex shrink-0 items-center gap-1 rounded-md border border-slate-200 bg-slate-50 p-0.5" role="group" aria-label="BGM 搜索范围">
-            {SUBJECT_SCOPE_OPTIONS.map((option) => (
-              <button
-                key={option.value}
-                type="button"
-                aria-pressed={subjectScope === option.value}
-                disabled={disabled}
-                className={`rounded px-2 py-1 text-xs font-semibold transition disabled:opacity-50 ${subjectScope === option.value ? "bg-sky-700 text-white" : "text-slate-600 hover:bg-slate-100"}`}
-                onClick={() => setSubjectScope(option.value)}
-              >
-                {option.label}
-              </button>
-            ))}
-          </div>
-          <input
-            id={`${animeListId}-answer`}
-            aria-activedescendant={animeResultsOpen && animeResults[activeAnimeIndex]
-              ? `${animeListId}-${animeResults[activeAnimeIndex].id}`
-              : undefined}
-            aria-autocomplete="list"
-            aria-controls={animeListId}
-            aria-expanded={animeResultsOpen}
-            aria-haspopup="listbox"
-            role="combobox"
-            className="min-w-0 flex-1 rounded-md border border-[var(--line)] bg-white px-3 py-2.5 text-sm outline-none transition focus:border-sky-500 focus:ring-4 focus:ring-sky-100 disabled:bg-slate-100"
-            value={answer}
-            disabled={disabled}
-            maxLength={100}
-            placeholder="输入正确答案，再搜索并关联 BGM 作品（动画/游戏）"
-            onChange={(event) => onAnswerChange(event.target.value)}
-            onKeyDown={(event) => {
-              if (event.key === "ArrowDown" && animeResults.length > 0) {
-                event.preventDefault();
-                setAnimeResultsOpen(true);
-                setActiveAnimeIndex((current) => (current + 1) % animeResults.length);
-              } else if (event.key === "ArrowUp" && animeResults.length > 0) {
-                event.preventDefault();
-                setAnimeResultsOpen(true);
-                setActiveAnimeIndex((current) => current <= 0 ? animeResults.length - 1 : current - 1);
-              } else if (event.key === "Enter") {
-                event.preventDefault();
-                if (animeResultsOpen && animeResults[activeAnimeIndex]) selectAnime(animeResults[activeAnimeIndex]);
-                else void runAnimeSearch();
-              } else if (event.key === "Escape" && animeResultsOpen) {
-                event.preventDefault();
-                setAnimeResultsOpen(false);
-              }
-            }}
-          />
-          <button
-            type="button"
-            className="shrink-0 rounded-md bg-sky-700 px-3.5 text-sm font-semibold text-white hover:bg-sky-800 disabled:opacity-50"
-            disabled={disabled || animeSearching}
-            onClick={() => void runAnimeSearch()}
-          >
-            {animeSearching ? "搜索中…" : "搜索 BGM"}
-          </button>
+        <div className="flex w-full items-center gap-1 rounded-md border border-slate-200 bg-slate-50 p-0.5" role="group" aria-label="Bangumi 搜索范围">
+          {SUBJECT_SCOPE_OPTIONS.map((option) => (
+            <button
+              key={option.value}
+              type="button"
+              aria-pressed={subjectScope === option.value}
+              disabled={disabled}
+              className={`flex-1 rounded px-2 py-1.5 text-xs font-semibold transition disabled:opacity-50 ${subjectScope === option.value ? "bg-sky-700 text-white" : "text-slate-600 hover:bg-slate-100"}`}
+              onClick={() => setSubjectScope(option.value)}
+            >
+              {option.label}
+            </button>
+          ))}
         </div>
+        <input
+          id={`${animeListId}-answer`}
+          aria-activedescendant={animeResultsOpen && animeResults[activeAnimeIndex]
+            ? `${animeListId}-${animeResults[activeAnimeIndex].id}`
+            : undefined}
+          aria-autocomplete="list"
+          aria-controls={animeListId}
+          aria-expanded={animeResultsOpen}
+          aria-haspopup="listbox"
+          role="combobox"
+          className="w-full rounded-md border border-[var(--line)] bg-white px-3 py-2.5 text-sm outline-none transition focus:border-sky-500 focus:ring-4 focus:ring-sky-100 disabled:bg-slate-100"
+          value={answer}
+          disabled={disabled}
+          maxLength={100}
+          placeholder="输入正确答案，再搜索并关联 Bangumi 作品（动画/游戏）"
+          onChange={(event) => onAnswerChange(event.target.value)}
+          onKeyDown={(event) => {
+            if (event.key === "ArrowDown" && animeResults.length > 0) {
+              event.preventDefault();
+              setAnimeResultsOpen(true);
+              setActiveAnimeIndex((current) => (current + 1) % animeResults.length);
+            } else if (event.key === "ArrowUp" && animeResults.length > 0) {
+              event.preventDefault();
+              setAnimeResultsOpen(true);
+              setActiveAnimeIndex((current) => current <= 0 ? animeResults.length - 1 : current - 1);
+            } else if (event.key === "Enter") {
+              event.preventDefault();
+              if (animeResultsOpen && animeResults[activeAnimeIndex]) selectAnime(animeResults[activeAnimeIndex]);
+              else void runAnimeSearch();
+            } else if (event.key === "Escape" && animeResultsOpen) {
+              event.preventDefault();
+              setAnimeResultsOpen(false);
+            }
+          }}
+        />
+        <button
+          type="button"
+          className="w-full rounded-md bg-sky-700 px-3.5 py-2 text-sm font-semibold text-white hover:bg-sky-800 disabled:opacity-50"
+          disabled={disabled || animeSearching}
+          onClick={() => void runAnimeSearch()}
+        >
+          {animeSearching ? "搜索中…" : "搜索 Bangumi"}
+        </button>
 
         {animeTag ? (
           <div className="flex flex-wrap items-center gap-2">
@@ -296,7 +294,7 @@ export function BangumiQuestionTagEditor({
               rel="noreferrer"
               title={animeTag.name}
             >
-              BGM · {subjectTypeLabel(animeTag.subjectType)} · {bangumiTagDisplayName(animeTag)} · #{animeTag.id}
+              Bangumi · {subjectTypeLabel(animeTag.subjectType)} · {bangumiTagDisplayName(animeTag)} · #{animeTag.id}
             </a>
             <button
               type="button"
@@ -308,11 +306,11 @@ export function BangumiQuestionTagEditor({
             </button>
           </div>
         ) : (
-          <p className="text-xs text-slate-500">答案可以单独保存；选择搜索结果后会同时加入规范 BGM 作品（动画/游戏）标签。</p>
+          <p className="text-xs text-slate-500">答案可以单独保存；选择搜索结果后会同时加入规范 Bangumi 作品（动画/游戏）标签。</p>
         )}
 
         {animeResultsOpen && animeResults.length > 0 ? (
-          <div id={animeListId} role="listbox" aria-label="BGM 作品搜索结果" className="max-h-64 space-y-1 overflow-y-auto rounded-md border border-sky-200 bg-white p-1 shadow-lg">
+          <div id={animeListId} role="listbox" aria-label="Bangumi 作品搜索结果" className="max-h-64 space-y-1 overflow-y-auto rounded-md border border-sky-200 bg-white p-1 shadow-lg">
             {animeResults.map((result, index) => (
               <button
                 id={`${animeListId}-${result.id}`}
@@ -346,7 +344,7 @@ export function BangumiQuestionTagEditor({
           角色名（可选）
         </label>
         <p className="text-xs leading-5 text-slate-500">
-          先选择作品，再从该作品的官方 BGM 角色列表搜索并添加画面中实际出现的角色。
+          先选择作品，再从该作品的官方 Bangumi 角色列表搜索并添加画面中实际出现的角色。
         </p>
 
         <div className="flex flex-wrap gap-1.5">
@@ -382,10 +380,10 @@ export function BangumiQuestionTagEditor({
               value={characterQuery}
               disabled={disabled || !animeTag || !normalizedUploadKey}
               placeholder={!animeTag
-                ? "请先通过上方搜索选择 BGM 作品"
+                ? "请先通过上方搜索选择 Bangumi 作品"
                 : !normalizedUploadKey
                   ? "请先填写上传密钥"
-                  : charactersLoading ? "正在加载 BGM 角色列表…" : "输入角色名搜索并添加"}
+                  : charactersLoading ? "正在加载 Bangumi 角色列表…" : "输入角色名搜索并添加"}
               onFocus={() => setCharacterPickerOpen(true)}
               onChange={(event) => {
                 setCharacterQuery(event.target.value);
@@ -412,7 +410,7 @@ export function BangumiQuestionTagEditor({
               }}
             />
             {characterPickerOpen && !charactersLoading ? (
-              <div id={characterListId} role="listbox" aria-label="BGM 角色搜索结果" className="absolute z-40 mt-1 max-h-64 w-full overflow-y-auto rounded-md border border-fuchsia-200 bg-white p-1 shadow-xl">
+              <div id={characterListId} role="listbox" aria-label="Bangumi 角色搜索结果" className="absolute z-40 mt-1 max-h-64 w-full overflow-y-auto rounded-md border border-fuchsia-200 bg-white p-1 shadow-xl">
                 {filteredCharacters.length > 0 ? filteredCharacters.map((character, index) => (
                   <button
                     id={`${characterListId}-${character.id}`}

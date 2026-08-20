@@ -12,6 +12,12 @@ import {
   uploadCommunityScreenshot,
 } from "@/lib/communityScreenshotUpload";
 import {
+  findAppendableQuestionSetByTitle,
+  toAppendableQuestionSetOptions,
+  type AppendableQuestionSetOption,
+} from "@/lib/communityUploadTitleOptions";
+import { listAdminQuestionSets } from "@/lib/questionSetAdmin";
+import {
   CREATION_TOOL_QUESTION_LIST_MAX_BYTES,
   isSupportedCreationToolImageUrl,
   parseCreationToolQuestionList,
@@ -66,7 +72,11 @@ function revokeDraftPreview(draft: ScreenshotDraft) {
 export default function CommunityUploadPage() {
   const router = useRouter();
   const [uploadKey, setUploadKey] = useState("");
-  const [title, setTitle] = useState(DEFAULT_QUESTION_SET_TITLE);
+  const [newTitle, setNewTitle] = useState(DEFAULT_QUESTION_SET_TITLE);
+  const [selectedExistingSetId, setSelectedExistingSetId] = useState("");
+  const [existingSetOptions, setExistingSetOptions] = useState<AppendableQuestionSetOption[]>([]);
+  const [existingSetsStatus, setExistingSetsStatus] = useState<"idle" | "loading" | "ready" | "error">("idle");
+  const [existingSetsError, setExistingSetsError] = useState("");
   const [description, setDescription] = useState("");
   const [uploaderNickname, setUploaderNickname] = useState("");
   const [questionListText, setQuestionListText] = useState("");
@@ -90,7 +100,11 @@ export default function CommunityUploadPage() {
   const submissionRef = useRef<{ id: string; signature: string } | null>(null);
   const uploadedKeysRef = useRef(new Map<string, string>());
   const operationAbortRef = useRef<AbortController | null>(null);
+  const existingSetsAbortRef = useRef<AbortController | null>(null);
+  const existingSetsLoadedKeyRef = useRef("");
   const selectedDraft = drafts.find((draft) => draft.id === selectedDraftId) ?? drafts[0] ?? null;
+  const selectedExistingSet = existingSetOptions.find((option) => option.id === selectedExistingSetId) ?? null;
+  const matchedExistingSet = findAppendableQuestionSetByTitle(existingSetOptions, newTitle);
   const selectedIndex = selectedDraft ? drafts.findIndex((draft) => draft.id === selectedDraft.id) : -1;
   const completedCount = drafts.filter((draft) => draft.labelText.trim()).length;
   const taggedCount = drafts.filter((draft) => draft.animeTags.length > 0).length;
@@ -112,6 +126,40 @@ export default function CommunityUploadPage() {
   useEffect(() => {
     draftsRef.current = drafts;
   }, [drafts]);
+
+  // 密钥变化后（防抖）自动加载可继续追加的现有社区题库；密钥为空时回到空闲态。
+  useEffect(() => {
+    const key = uploadKey.trim();
+    if (!key) {
+      existingSetsAbortRef.current?.abort();
+      existingSetsLoadedKeyRef.current = "";
+      setExistingSetOptions([]);
+      setSelectedExistingSetId("");
+      setExistingSetsStatus("idle");
+      setExistingSetsError("");
+      return;
+    }
+    if (key === existingSetsLoadedKeyRef.current) return;
+    // 密钥已变化：立即中止仍在进行的旧密钥请求，并重置选项/状态，
+    // 避免旧密钥的结果在防抖期间或快速改回原密钥后覆盖当前状态。
+    existingSetsAbortRef.current?.abort();
+    existingSetsLoadedKeyRef.current = "";
+    setExistingSetOptions([]);
+    setSelectedExistingSetId("");
+    setExistingSetsStatus("idle");
+    setExistingSetsError("");
+    const timer = window.setTimeout(() => {
+      void loadAppendableQuestionSets(key);
+    }, 400);
+    return () => window.clearTimeout(timer);
+  }, [uploadKey]);
+
+  // 刷新后所选题库若已不可追加（被删除、改结构或已满 30 题），自动回到新建模式，保留自定义标题。
+  useEffect(() => {
+    if (selectedExistingSetId && !existingSetOptions.some((option) => option.id === selectedExistingSetId)) {
+      setSelectedExistingSetId("");
+    }
+  }, [existingSetOptions, selectedExistingSetId]);
 
   useEffect(() => {
     const handleClipboardPaste = (event: ClipboardEvent) => {
@@ -147,6 +195,7 @@ export default function CommunityUploadPage() {
 
   useEffect(() => () => {
     operationAbortRef.current?.abort();
+    existingSetsAbortRef.current?.abort();
     draftsRef.current.forEach(revokeDraftPreview);
   }, []);
 
@@ -183,6 +232,41 @@ export default function CommunityUploadPage() {
 
   function cancelCurrentOperation() {
     operationAbortRef.current?.abort();
+  }
+
+  // 通过受保护的管理列表接口加载可继续追加的现有社区题库；只使用公开摘要字段，
+  // 不读取题目/答案。服务端按“规范集合、公开、未被人工改动、manifest 当前版本”
+  // 追加（见 worker/gameService.ts），这里过滤后再按精确标题去重。
+  async function loadAppendableQuestionSets(key: string) {
+    const normalizedKey = key.trim();
+    if (!normalizedKey) {
+      setExistingSetsStatus("idle");
+      setExistingSetsError("");
+      return;
+    }
+    existingSetsAbortRef.current?.abort();
+    const controller = new AbortController();
+    existingSetsAbortRef.current = controller;
+    setExistingSetsStatus("loading");
+    setExistingSetsError("");
+    try {
+      const page = await listAdminQuestionSets(
+        { search: "", visibility: "public", source: "all", limit: 50, offset: 0 },
+        normalizedKey,
+        controller.signal,
+      );
+      if (controller.signal.aborted) return;
+      existingSetsLoadedKeyRef.current = normalizedKey;
+      setExistingSetOptions(toAppendableQuestionSetOptions(page.items));
+      setExistingSetsStatus("ready");
+    } catch (loadError) {
+      if (controller.signal.aborted) return;
+      existingSetsLoadedKeyRef.current = "";
+      setExistingSetsError(loadError instanceof Error ? loadError.message : "现有题库加载失败。");
+      setExistingSetsStatus("error");
+    } finally {
+      if (existingSetsAbortRef.current === controller) existingSetsAbortRef.current = null;
+    }
   }
 
   function focusEditorForDraft(id: string) {
@@ -401,7 +485,7 @@ export default function CommunityUploadPage() {
       } else {
         completedWithoutFailures = true;
         if (options.clearQuestionList !== false) setQuestionListText("");
-        setStatus(`已从${sourceName}导入 ${orderedAdditions.length} 张图片，可继续编辑答案和 BGM 标签。`);
+        setStatus(`已从${sourceName}导入 ${orderedAdditions.length} 张图片，可继续编辑答案和 Bangumi 标签。`);
       }
     } finally {
       if (operationAbortRef.current === controller) operationAbortRef.current = null;
@@ -493,7 +577,7 @@ export default function CommunityUploadPage() {
     setError("");
     setSuccess(null);
     const normalizedKey = uploadKey.trim();
-    if (!normalizedKey) return setError("请先填写上传密钥，再自动匹配 BGM 标签。");
+    if (!normalizedKey) return setError("请先填写上传密钥，再自动匹配 Bangumi 标签。");
     const candidates = Array.from(new Map(
       drafts
         .filter((draft) => !draft.animeTags.length && draft.labelText.trim())
@@ -507,7 +591,7 @@ export default function CommunityUploadPage() {
     const controller = new AbortController();
     operationAbortRef.current = controller;
     setIsAutoTagging(true);
-    setStatus(`正在通过 BGM 匹配 ${candidates.length} 个不同答案（最多 3 个并发）……`);
+    setStatus(`正在通过 Bangumi 匹配 ${candidates.length} 个不同答案（最多 3 个并发）……`);
     const matches = new Map<string, BangumiAnimeTag>();
     const failures: string[] = [];
     let nextIndex = 0;
@@ -537,7 +621,7 @@ export default function CommunityUploadPage() {
       await Promise.all(workers);
       if (controller.signal.aborted) {
         setStatus("");
-        setError("已取消 BGM 自动匹配；已完成的查询仍会保留在浏览器缓存中。");
+        setError("已取消 Bangumi 自动匹配；已完成的查询仍会保留在浏览器缓存中。");
         return;
       }
       updateDrafts((current) => current.map((draft) => {
@@ -546,8 +630,8 @@ export default function CommunityUploadPage() {
         return match ? { ...draft, animeTags: [match], characterTags: [] } : draft;
       }));
       const unresolved = candidates.length - matches.size;
-      setStatus(`BGM 自动匹配完成：命中 ${matches.size} 个答案${unresolved ? `，${unresolved} 个需点击图片后手动选择` : ""}。`);
-      if (failures.length > 0) setError(`部分 BGM 请求失败：${failures[0]}`);
+      setStatus(`Bangumi 自动匹配完成：命中 ${matches.size} 个答案${unresolved ? `，${unresolved} 个需点击图片后手动选择` : ""}。`);
+      if (failures.length > 0) setError(`部分 Bangumi 请求失败：${failures[0]}`);
     } finally {
       if (operationAbortRef.current === controller) operationAbortRef.current = null;
       setIsAutoTagging(false);
@@ -560,13 +644,18 @@ export default function CommunityUploadPage() {
     setError("");
     setSuccess(null);
 
-    const normalizedTitle = title.trim();
+    const normalizedTitle = selectedExistingSetId
+      ? selectedExistingSet?.title ?? ""
+      : newTitle.trim();
     const normalizedNickname = uploaderNickname.trim();
     const normalizedUploadKey = uploadKey.trim();
     if (!normalizedUploadKey) return setError("请输入上传密钥。");
     if (!normalizedNickname) return setError("请输入上传者昵称。");
     if (normalizedNickname.length > 20) return setError("上传者昵称最多 20 个字符。");
-    if (!normalizedTitle) return setError("请输入题库标题。");
+    if (selectedExistingSetId && !selectedExistingSet) {
+      return setError("所选的现有题库已不可追加，请重新选择或改为新建题库。");
+    }
+    if (!normalizedTitle) return setError(selectedExistingSetId ? "请选择要追加的现有题库。" : "请输入题库标题。");
     if (normalizedTitle.length > 80) return setError("题库标题最多 80 个字符。");
     if (description.trim().length > 300) return setError("题库说明最多 300 个字符。");
     if (drafts.length === 0) return setError("请选择至少一张截图。");
@@ -639,7 +728,9 @@ export default function CommunityUploadPage() {
       setSuccess(result);
       setStatus("");
       setUploadKey("");
-      setTitle(DEFAULT_QUESTION_SET_TITLE);
+      setNewTitle(DEFAULT_QUESTION_SET_TITLE);
+      setSelectedExistingSetId("");
+      existingSetsLoadedKeyRef.current = "";
       setDescription("");
       setQuestionListText("");
       setImageUrlText("");
@@ -677,7 +768,7 @@ export default function CommunityUploadPage() {
             </button>
             <h1 className="text-3xl font-bold text-slate-950 sm:text-4xl">密钥上传截图</h1>
             <p className="mt-2 max-w-3xl text-sm leading-6 text-slate-600 sm:text-base">
-              可拖放、粘贴或选择本地截图，也可粘贴 FanCaps / Bangumi 截图直链，或上传/粘贴动画截图工具的 JSON 题单。图片会进入自适应网格，点击任意缩略图即可填写答案并搜索 BGM（Bangumi）作品（动画/游戏）与角色标签。
+              可拖放、粘贴或选择本地截图，也可粘贴 FanCaps / Bangumi 截图直链，或上传/粘贴动画截图工具的 JSON 题单。图片会进入自适应网格，点击任意缩略图即可填写答案并搜索 Bangumi 作品（动画/游戏）与角色标签。
             </p>
           </div>
           <div className="flex flex-wrap items-center gap-2">
@@ -730,17 +821,72 @@ export default function CommunityUploadPage() {
                   onChange={(event) => setUploadKey(event.target.value)}
                 />
               </label>
-              <label className="block">
+              <div className="space-y-2">
                 <span className="mb-1 block text-sm font-semibold text-slate-900">题库标题</span>
-                <input
-                  className="h-11 w-full rounded-md border border-[var(--line)] px-3 outline-none transition focus:border-[var(--primary)] focus:ring-4 focus:ring-rose-100 disabled:bg-slate-100"
-                  disabled={isBusy}
-                  maxLength={80}
-                  value={title}
-                  onChange={(event) => setTitle(event.target.value)}
-                />
-                <span className="mt-1 block text-xs leading-5 text-slate-500">若存在标题完全相同的社区截图题库，本次图片会按顺序追加；整套题库仍最多 30 题。</span>
-              </label>
+                <div className="flex items-stretch gap-2">
+                  <select
+                    aria-label="题库标题：新建或选择现有题库"
+                    className="h-11 min-w-0 flex-1 rounded-md border border-[var(--line)] bg-white px-3 text-sm outline-none transition focus:border-[var(--primary)] focus:ring-4 focus:ring-rose-100 disabled:bg-slate-100"
+                    disabled={isBusy}
+                    value={selectedExistingSetId}
+                    onChange={(event) => setSelectedExistingSetId(event.target.value)}
+                  >
+                    <option value="">＋ 新建题库（自定义标题）</option>
+                    {existingSetOptions.length > 0 ? (
+                      <optgroup label="追加到现有题库（精确标题）">
+                        {existingSetOptions.map((option) => (
+                          <option key={option.id} value={option.id}>
+                            {option.title}（{option.imageCount}/{COMMUNITY_SCREENSHOT_MAX_QUESTIONS} 题）
+                          </option>
+                        ))}
+                      </optgroup>
+                    ) : null}
+                  </select>
+                  <button
+                    className="shrink-0 rounded-md border border-slate-300 bg-white px-2.5 text-xs font-semibold text-slate-600 transition hover:border-slate-400 hover:text-slate-950 disabled:opacity-50"
+                    disabled={isBusy || !uploadKey.trim() || existingSetsStatus === "loading"}
+                    type="button"
+                    onClick={() => void loadAppendableQuestionSets(uploadKey)}
+                  >
+                    {existingSetsStatus === "loading" ? "加载中…" : "刷新"}
+                  </button>
+                </div>
+                {selectedExistingSetId === "" ? (
+                  <>
+                    <input
+                      className="h-11 w-full rounded-md border border-[var(--line)] px-3 outline-none transition focus:border-[var(--primary)] focus:ring-4 focus:ring-rose-100 disabled:bg-slate-100"
+                      disabled={isBusy}
+                      maxLength={80}
+                      placeholder="输入新题库的标题"
+                      value={newTitle}
+                      onChange={(event) => setNewTitle(event.target.value)}
+                    />
+                    {existingSetsStatus === "ready" && matchedExistingSet ? (
+                      <p className="text-xs leading-5 text-amber-700">
+                        标题与现有题库「{matchedExistingSet.title}」完全相同，本次提交会按顺序追加到该题库（当前 {matchedExistingSet.imageCount}/{COMMUNITY_SCREENSHOT_MAX_QUESTIONS} 题）；如需独立新题库，请更换标题。
+                      </p>
+                    ) : (
+                      <p className="text-xs leading-5 text-slate-500">新建独立题库；若标题与现有社区截图题库完全相同，本次图片会按顺序追加。整套题库仍最多 {COMMUNITY_SCREENSHOT_MAX_QUESTIONS} 题。</p>
+                    )}
+                  </>
+                ) : selectedExistingSet ? (
+                  <p className="rounded-md bg-sky-50 px-3 py-2 text-xs leading-5 text-slate-700">
+                    已选择「{selectedExistingSet.title}」：本次提交的截图会按顺序追加到该公开社区题库（当前 {selectedExistingSet.imageCount}/{COMMUNITY_SCREENSHOT_MAX_QUESTIONS} 题），提交标题使用题库的精确标题。
+                  </p>
+                ) : null}
+                {existingSetsStatus === "loading" ? (
+                  <p className="text-xs text-slate-500">正在加载可继续追加的现有题库…</p>
+                ) : existingSetsStatus === "error" ? (
+                  <p className="flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-rose-700" role="alert">
+                    <span>现有题库加载失败：{existingSetsError}</span>
+                    <button className="underline disabled:opacity-50" disabled={isBusy} type="button" onClick={() => void loadAppendableQuestionSets(uploadKey)}>重试</button>
+                  </p>
+                ) : existingSetsStatus === "ready" && existingSetOptions.length === 0 ? (
+                  <p className="text-xs text-slate-500">当前没有可继续追加的现有社区题库（需公开、未满 {COMMUNITY_SCREENSHOT_MAX_QUESTIONS} 题且未被人工改动）。</p>
+                ) : uploadKey.trim() === "" && existingSetsStatus === "idle" ? (
+                  <p className="text-xs text-slate-500">填写上传密钥后，可加载并选择可继续追加的现有社区题库。</p>
+                ) : null}
+              </div>
               <label className="block">
                 <span className="mb-1 block text-sm font-semibold text-slate-900">上传者昵称</span>
                 <input
@@ -901,7 +1047,7 @@ export default function CommunityUploadPage() {
                   <div>
                     <h2 className="text-lg font-bold text-slate-950" id="screenshot-grid-title">截图网格</h2>
                     <p className="mt-1 text-xs text-slate-500">
-                      已选 {drafts.length} 张 · 已填答案 {completedCount}/{drafts.length} · BGM 标签 {taggedCount}/{drafts.length}
+                      已选 {drafts.length} 张 · 已填答案 {completedCount}/{drafts.length} · Bangumi 标签 {taggedCount}/{drafts.length}
                     </p>
                   </div>
                   <button
@@ -910,7 +1056,7 @@ export default function CommunityUploadPage() {
                     type="button"
                     onClick={() => void autoMatchAnimeTags()}
                   >
-                    {isAutoTagging ? "BGM 匹配中…" : "按答案批量匹配 BGM"}
+                    {isAutoTagging ? "Bangumi 匹配中…" : "按答案批量匹配 Bangumi"}
                   </button>
                 </div>
 
@@ -944,7 +1090,7 @@ export default function CommunityUploadPage() {
                             <span className="mt-1 flex flex-wrap gap-1">
                               {animeTag ? (
                                 <span className="max-w-full truncate rounded bg-sky-500/90 px-1.5 py-0.5 text-[10px] font-semibold">
-                                  BGM · {bangumiTagDisplayName(animeTag)}
+                                  Bangumi · {bangumiTagDisplayName(animeTag)}
                                 </span>
                               ) : null}
                               {draft.characterTags.slice(0, 2).map((tag) => (
@@ -1002,7 +1148,7 @@ export default function CommunityUploadPage() {
                       onChange={(animeTag, characterTags) => updateTags(selectedDraft.id, animeTag, characterTags)}
                     />
                     <p className="mt-4 rounded-md bg-slate-50 px-3 py-2 text-xs leading-5 text-slate-600">
-                      输入或选择后，正确答案、BGM 作品（动画/游戏）及角色标签会立即显示在对应缩略图上；最终仍由服务器重新规范化并校验角色归属。
+                      输入或选择后，正确答案、Bangumi 作品（动画/游戏）及角色标签会立即显示在对应缩略图上；最终仍由服务器重新规范化并校验角色归属。
                     </p>
                   </>
                 ) : null}
@@ -1024,7 +1170,7 @@ export default function CommunityUploadPage() {
 
           <div className="z-30 flex flex-col gap-3 rounded-xl border border-slate-200 bg-white/95 p-3 shadow-xl backdrop-blur sm:sticky sm:bottom-3 sm:flex-row sm:items-center sm:justify-between sm:p-4">
             <p className="text-xs text-slate-600">
-              {drafts.length > 0 ? `${completedCount}/${drafts.length} 张已填写必填答案；BGM 与角色标签为可选规范索引。` : "请先选择截图。"}
+              {drafts.length > 0 ? `${completedCount}/${drafts.length} 张已填写必填答案；Bangumi 与角色标签为可选规范索引。` : "请先选择截图。"}
             </p>
             <div className="flex flex-col-reverse gap-2 sm:flex-row">
               {isBusy ? (
@@ -1034,7 +1180,7 @@ export default function CommunityUploadPage() {
                 {isUploading
                   ? "正在上传…"
                   : isAutoTagging
-                    ? "正在匹配 BGM…"
+                    ? "正在匹配 Bangumi…"
                     : isImportingQuestionList
                       ? "正在导入题单…"
                       : `上传并保存题库${drafts.length ? `（${drafts.length} 张）` : ""}`}

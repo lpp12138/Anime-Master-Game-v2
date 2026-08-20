@@ -25,6 +25,7 @@
     "test:local-image-upload": "tsx --test tests/local-image-upload.test.ts",
     "test:r2-upload": "tsx --test tests/r2-upload.test.ts",
     "test:community-screenshot-upload": "tsx --test tests/community-screenshot-upload.test.ts tests/community-question-list.test.ts",
+    "test:community-upload-title": "tsx --test tests/community-upload-title-options.test.ts",
     "test:bangumi-api": "tsx --test tests/bangumi-api.test.ts",
     "test:game-rpc-response": "tsx --test tests/game-rpc-response.test.ts",
     "promo:prepare": "node scripts/prepare-promo-assets.mjs",

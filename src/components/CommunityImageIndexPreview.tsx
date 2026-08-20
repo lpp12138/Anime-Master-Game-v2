@@ -67,7 +67,7 @@ export function CommunityImageIndexPreview({
       return;
     }
     if (!effectiveAnimeId) {
-      setError("请先为至少一张截图选择 BGM 作品标签。");
+      setError("请先为至少一张截图选择 Bangumi 作品标签。");
       return;
     }
 
@@ -110,7 +110,7 @@ export function CommunityImageIndexPreview({
         </p>
         <div className="grid gap-2 sm:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_auto]">
           <label className="space-y-1 text-xs font-medium text-slate-700">
-            <span>BGM 作品（动画/游戏）</span>
+            <span>Bangumi 作品（动画/游戏）</span>
             <select
               className="w-full rounded-md border border-violet-200 bg-white px-2 py-2 outline-none focus:border-violet-500 disabled:bg-slate-100"
               value={effectiveAnimeId}
