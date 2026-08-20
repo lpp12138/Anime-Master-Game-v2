@@ -51,6 +51,7 @@ import type {
 import {
   DEFAULT_TEAM_BATTLE_GUESS_VOTE_SECONDS,
   DEFAULT_TEAM_BATTLE_REVEAL_VOTE_SECONDS,
+  MAX_GAME_QUESTION_COUNT,
   MAX_ROOM_NOTICE_LENGTH,
 } from "@/types/game";
 
@@ -82,6 +83,7 @@ type GameSettings = {
   playerCapacity: number;
   spectatorCapacity: number;
   teamAssignmentMode: TeamAssignmentMode;
+  questionCount: number | null;
 };
 
 const defaultGameSettings: GameSettings = {
@@ -97,6 +99,7 @@ const defaultGameSettings: GameSettings = {
   playerCapacity: 50,
   spectatorCapacity: 50,
   teamAssignmentMode: "MANUAL",
+  questionCount: null,
 };
 
 function createStartRequestId() {
@@ -188,6 +191,13 @@ function normalizeGameSettings(settings: Partial<GameSettings>): GameSettings {
     playerCapacity: Math.max(1, Math.min(50, Math.floor(settings.playerCapacity ?? 50))),
     spectatorCapacity: Math.max(0, Math.min(50, Math.floor(settings.spectatorCapacity ?? 50))),
     teamAssignmentMode: settings.teamAssignmentMode === "AUTO" ? "AUTO" : "MANUAL",
+    questionCount:
+      typeof settings.questionCount === "number" &&
+      Number.isInteger(settings.questionCount) &&
+      settings.questionCount >= 1 &&
+      settings.questionCount <= MAX_GAME_QUESTION_COUNT
+        ? settings.questionCount
+        : null,
   };
 }
 
@@ -205,6 +215,7 @@ function getRoomGameSettings(room: Room | null | undefined): GameSettings {
     playerCapacity: room?.playerCapacity,
     spectatorCapacity: room?.spectatorCapacity,
     teamAssignmentMode: room?.teamAssignmentMode,
+    questionCount: room?.questionCount,
   });
 }
 
@@ -222,7 +233,8 @@ function areGameSettingsEqual(left: GameSettings, right: GameSettings) {
     left.spectatorPlayerAnswersEnabled === right.spectatorPlayerAnswersEnabled &&
     left.playerCapacity === right.playerCapacity &&
     left.spectatorCapacity === right.spectatorCapacity &&
-    left.teamAssignmentMode === right.teamAssignmentMode
+    left.teamAssignmentMode === right.teamAssignmentMode &&
+    left.questionCount === right.questionCount
   );
 }
 
@@ -945,15 +957,25 @@ function CancelRoundConfirmModal({
 function GameSettingsPanel({
   settings,
   canEdit,
+  preparedQuestionCount,
   onChange,
 }: {
   settings: GameSettings;
   canEdit: boolean;
+  preparedQuestionCount?: number | null;
   onChange: (settings: GameSettings) => void;
 }) {
   const isRoundRevealMode = settings.gameMode === "ROUND_REVEAL";
   const isTeamBattleMode = settings.gameMode === "TEAM_BATTLE";
   const copy = gameModeCopy[settings.gameMode];
+  const availableQuestionCount =
+    typeof preparedQuestionCount === "number" && preparedQuestionCount >= 1
+      ? Math.min(MAX_GAME_QUESTION_COUNT, Math.floor(preparedQuestionCount))
+      : 0;
+  const selectedQuestionCount =
+    settings.questionCount != null && settings.questionCount < availableQuestionCount
+      ? String(settings.questionCount)
+      : "all";
 
   function updateRounds(nextRounds: number) {
     onChange({
@@ -1016,6 +1038,34 @@ function GameSettingsPanel({
             ))}
           </ol>
         </div>
+      </div>
+
+      <div className="border-t border-[var(--line)] bg-amber-50/60 px-4 py-4">
+        <label className="block max-w-md">
+          <span className="mb-2 block text-sm font-semibold text-slate-900">本局题目</span>
+          <select
+            aria-label="本局抽取题数"
+            className="h-12 w-full rounded-md border border-amber-200 bg-white px-3 text-base outline-none transition disabled:bg-slate-100 focus:border-[var(--primary)] focus:ring-4 focus:ring-rose-100"
+            disabled={!canEdit || availableQuestionCount === 0}
+            value={selectedQuestionCount}
+            onChange={(event) =>
+              onChange({
+                ...settings,
+                questionCount: event.target.value === "all" ? null : Number(event.target.value),
+              })
+            }
+          >
+            <option value="all">
+              {availableQuestionCount > 0 ? `全部 ${availableQuestionCount} 道（保持题库顺序）` : "准备题库后可选择抽取题数"}
+            </option>
+            {Array.from({ length: Math.max(0, availableQuestionCount - 1) }, (_, index) => index + 1).map((count) => (
+              <option key={count} value={count}>随机抽取 {count} 道</option>
+            ))}
+          </select>
+        </label>
+        <p className="mt-2 text-xs leading-5 text-[var(--muted)]">
+          少于整套题数时由服务端随机、无重复抽取并打乱顺序；开局后结果固定，刷新或重连不会重新抽题。
+        </p>
       </div>
 
       <details className="border-t border-[var(--line)] px-4 py-3">
@@ -1316,7 +1366,12 @@ function LobbyMainPanel({
       ) : null}
 
       <div className="mt-5">
-        <GameSettingsPanel settings={settings} canEdit={canEditSettings} onChange={onSettingsChange} />
+        <GameSettingsPanel
+          settings={settings}
+          canEdit={canEditSettings}
+          preparedQuestionCount={room.preparedQuestionCount}
+          onChange={onSettingsChange}
+        />
       </div>
 
       {roomChat ? <div className="relative z-20 mt-5 border-t border-[var(--line)] pt-5">{roomChat}</div> : null}
@@ -1596,7 +1651,7 @@ function GameResultPanel({
   const presenterName = getPresenterName(room.players, room.currentPresenterPlayerId);
   const isTeamBattleResult = gameSession?.gameMode === "TEAM_BATTLE" && Boolean(gameSession.teamBattleState);
   const playerById = new Map(room.players.map((player) => [player.id, player]));
-  const questionCount = questionSet?.questions?.length ?? questionSet?.imageCount ?? 0;
+  const questionCount = gameSession?.questionCount ?? questionSet?.questions?.length ?? questionSet?.imageCount ?? 0;
   const questionIndexes = Array.from({ length: questionCount }, (_, index) => index);
   const scoreByPlayerQuestion = new Map<string, number>();
   const scoreByTeamQuestion = new Map<string, number>();
@@ -2699,6 +2754,7 @@ export default function RoomPage({ initialRoomCode = "" }: { initialRoomCode?: s
         playerCapacity: normalizedSettings.playerCapacity,
         spectatorCapacity: normalizedSettings.spectatorCapacity,
         teamAssignmentMode: normalizedSettings.teamAssignmentMode,
+        questionCount: normalizedSettings.questionCount,
       });
 
       if (settingsUpdateSeqRef.current === updateSeq) {
@@ -2739,6 +2795,7 @@ export default function RoomPage({ initialRoomCode = "" }: { initialRoomCode?: s
         roomId,
         presenterPlayerId,
         questionSetId,
+        gameSettings.questionCount,
       ]);
       if (!startGameAttemptRef.current) {
         startGameAttemptRef.current = getStoredStartGameAttempt(roomId);
@@ -2766,6 +2823,7 @@ export default function RoomPage({ initialRoomCode = "" }: { initialRoomCode?: s
           teamRevealVoteSeconds: gameSettings.teamRevealVoteSeconds,
           teamGuessVoteSeconds: gameSettings.teamGuessVoteSeconds,
           teamPresenterBlockEnabled: gameSettings.teamPresenterBlockEnabled,
+          questionCount: gameSettings.questionCount,
         });
 
       let started: Awaited<ReturnType<typeof requestStart>>;

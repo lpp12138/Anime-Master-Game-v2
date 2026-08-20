@@ -101,6 +101,14 @@ Generation 4 不再为新房间写 `players` 表。玩家名单以版本化、�
 
 按项目基准 50 人 × 30 题计算，玩家 mutation、答案、判定和持久化上限不变。极端 50 玩家 + 50 观战时，全房小 delta 的接收连接数相对原 50 人房间最多翻倍；包含完整成员名单的房间快照同时可能扩大约 2 倍，因此一次全名单广播的网络字节上界约为原模型的 4 倍。该变化不增加 Cloudflare 普通 Workers HTTP 请求或 D1/DO SQLite 行读写，但会增加 Room DO 的序列化、内存和 WebSocket 出站压力；容量回归必须覆盖 50+50 同时加入、重连、聊天、复盘和结算，并继续禁止用全员 snapshot 补拉代替 delta 广播。`scripts/authority-write-budget.mjs` 的写入模型不变，无需调整。
 
+## 本局随机抽题预算（2026-08-20）
+
+本局题数复用房主已有的房间设置 mutation、Room DO WebSocket 和同一行 `rooms` 更新；只有房主实际改变选择时产生 1 条入站消息、1 行 D1 房间读取、最多 1 行 D1 房间更新、1 行 DO runtime version 更新和 1 次现有 `room_updated` 广播，不产生全员补拉、Alarm 或逐题写入。开局仍只读取既有题集 manifest 1 行，旧题库最多再读取 30 行 `questions`；该读取原本就是 authority vNext bootstrap 所需，本功能只是把读取提前到 game session 插入前，不增加开局 D1 查询或 Worker/DO 请求。
+
+少于整套题数时，服务端在单次开局处理中对最多 30 个内存题目执行无重复洗牌，把最多 30 个题目 ID 作为不超过 4,096 字符的 JSON 写入既有 `game_sessions` 行；不新增数据行、索引或后续 checkpoint。重复开局请求、刷新、重连、Hibernation 和结算回退只读取该快照，不重新抽取或写入。选全部题目时仍保留原顺序；抽取较少题目会缩小 active-game questions、广播快照和后续每题操作数量，因此 50 人 × 30 题的现有极端预算不增加。
+
+按每天 60 局且每局由房主修改一次题数估算，最多增加 60 条低频设置消息、60 行 D1 房间读取/更新和 60 行 DO runtime version 更新，分别占 100,000 行日写入硬额度的 0.06%；人数不会把入站操作乘以 50。D1 migration `0028_game_question_sampling.sql` 和 DO schema v14 只增加三个有界、无索引列，历史 game session 默认空数组并按全题库旧行为读取。单局 mutation、checkpoint、Alarm、最终投影语句数和索引计量模型不变，因此无需修改 `scripts/authority-write-budget.mjs`。
+
 ## Question Set Manifest V2 预算（2026-07-31）
 
 本轮预算以 [`cloudflare-usage-history/2026-07-30.md`](cloudflare-usage-history/2026-07-30.md) 的完整生产窗口为依据，不把 SQL 语句数当作计费行数。该窗口 D1 共写入 3,795 行，其中题目创建 796 行、题集创建 146 行、结算逐题标签投影 810 行，三项合计 1,752 行，占 46.2%；孤儿私有题集候选查询读取 65,062 行，占当日 D1 读取 64.9%。

@@ -22,6 +22,7 @@ const D1_MAX_BOUND_PARAMETERS_PER_QUERY = 100;
 const JSON_COLUMNS = new Set([
   "revealed_blocks",
   "round_scores",
+  "selected_question_ids",
   "team_battle_state",
   "lobby_round_scores",
   "anime_tags_json",

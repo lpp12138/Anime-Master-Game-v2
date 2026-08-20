@@ -22,6 +22,7 @@ export const DEFAULT_TEAM_BATTLE_REVEAL_VOTE_SECONDS = 25;
 export const DEFAULT_TEAM_BATTLE_GUESS_VOTE_SECONDS = 50;
 export const TEAM_BATTLE_ALL_SUBMITTED_GRACE_SECONDS = 5;
 export const MAX_TEAM_BATTLE_GUESS_LENGTH = 80;
+export const MAX_GAME_QUESTION_COUNT = 30;
 
 export type TeamBattleGuessVote = {
   type: "skip" | "guess";
@@ -85,6 +86,8 @@ export type Room = {
   currentPresenterPlayerId?: string | null;
   currentGameId?: string | null;
   preparedQuestionSetId?: string | null;
+  preparedQuestionCount?: number | null;
+  questionCount?: number | null;
   visibility?: RoomVisibility;
   name?: string | null;
   notice?: string | null;
@@ -115,6 +118,8 @@ export type DbRoom = {
   current_presenter_player_id: string | null;
   current_game_id: string | null;
   prepared_question_set_id?: string | null;
+  prepared_question_count?: number | null;
+  lobby_question_count?: number | null;
   room_visibility?: RoomVisibility | null;
   room_name?: string | null;
   room_notice?: string | null;
@@ -278,6 +283,7 @@ export type GameSession = {
   maxRevealRounds: number;
   roundSeconds: number;
   roundScores: number[];
+  questionCount?: number;
   eligiblePlayerIds?: string[];
   roundStartedAt?: string | null;
   serverNow?: string;
@@ -510,6 +516,7 @@ export type DbGameSession = {
   max_reveal_rounds?: number;
   round_seconds?: number;
   round_scores?: unknown;
+  selected_question_ids?: unknown;
   team_battle_state?: unknown;
   round_started_at: string | null;
   created_at: string;

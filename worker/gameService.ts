@@ -5,6 +5,7 @@ import { normalizeBangumiQuestionTags } from "../src/lib/bangumiTags";
 import {
   DEFAULT_TEAM_BATTLE_GUESS_VOTE_SECONDS,
   DEFAULT_TEAM_BATTLE_REVEAL_VOTE_SECONDS,
+  MAX_GAME_QUESTION_COUNT,
   MAX_TEAM_BATTLE_GUESS_LENGTH,
   MAX_ROOM_NOTICE_LENGTH,
   TEAM_BATTLE_ALL_SUBMITTED_GRACE_SECONDS,
@@ -100,7 +101,7 @@ const mutationTrackerContext = new AsyncLocalStorage<GameDatabaseMutationTracker
 const unboundD1 = createD1QueryClient(null);
 const DEFAULT_ROUND_SECONDS = 45;
 const DEFAULT_ROUND_SCORES = [5, 3, 1];
-const MAX_QUESTION_SET_QUESTIONS = 30;
+const MAX_QUESTION_SET_QUESTIONS = MAX_GAME_QUESTION_COUNT;
 const MAX_HOMEPAGE_QUESTION_SET_TITLE_LENGTH = 80;
 const MAX_HOMEPAGE_QUESTION_SET_DESCRIPTION_LENGTH = 300;
 const MAX_HOMEPAGE_QUESTION_LABEL_LENGTH = 100;
@@ -239,6 +240,31 @@ function normalizeSpectatorCapacity(value: unknown) {
   return Math.max(0, Math.min(50, Math.floor(typeof value === "number" && Number.isFinite(value) ? value : 50)));
 }
 
+function normalizeQuestionCount(value: unknown) {
+  return typeof value === "number" && Number.isInteger(value) && value >= 1 && value <= MAX_QUESTION_SET_QUESTIONS
+    ? value
+    : null;
+}
+
+function requireQuestionCount(value: unknown) {
+  if (value === null) return null;
+  if (typeof value !== "number" || !Number.isInteger(value) || value < 1 || value > MAX_QUESTION_SET_QUESTIONS) {
+    throw new Error(`本局题数必须是 1 到 ${MAX_QUESTION_SET_QUESTIONS} 之间的整数，或选择全部题目。`);
+  }
+  return value;
+}
+
+function requireStartQuestionCount(value: unknown, availableQuestionCount: number) {
+  if (value == null) return availableQuestionCount;
+  if (typeof value !== "number" || !Number.isInteger(value) || value < 1 || value > MAX_QUESTION_SET_QUESTIONS) {
+    rejectStartGame(`开始游戏失败：本局题数必须是 1 到 ${MAX_QUESTION_SET_QUESTIONS} 之间的整数，或选择全部题目。`);
+  }
+  if (value > availableQuestionCount) {
+    rejectStartGame(`开始游戏失败：本局抽取 ${value} 道题，但当前题库只有 ${availableQuestionCount} 道题。`);
+  }
+  return value;
+}
+
 function requirePlayerCapacity(value: unknown) {
   if (typeof value !== "number" || !Number.isInteger(value) || value < 1 || value > 50) {
     throw new Error("玩家人数上限必须是 1 到 50 之间的整数。");
@@ -283,6 +309,8 @@ function toRoom(room: DbRoom, players: DbPlayer[] = getRoomStatePlayers(room)): 
     currentPresenterPlayerId: room.current_presenter_player_id,
     currentGameId: room.current_game_id,
     preparedQuestionSetId: room.prepared_question_set_id ?? null,
+    preparedQuestionCount: normalizeQuestionCount(room.prepared_question_count),
+    questionCount: normalizeQuestionCount(room.lobby_question_count),
     visibility: room.room_visibility ?? "PRIVATE",
     name: room.room_name ?? null,
     notice: room.room_notice ?? null,
@@ -357,6 +385,13 @@ function toQuestionSet(questionSet: DbQuestionSet, questions: DbQuestion[] = [])
   };
 }
 
+function toGameQuestionSet(questionSet: DbQuestionSet, questions: DbQuestion[]) {
+  return {
+    ...toQuestionSet(questionSet, questions),
+    imageUrlsText: questions.map((question) => question.image_url).join("\n"),
+  };
+}
+
 async function getPlayerNickname(playerId: string, roomId?: string) {
   assertD1Env();
   if (!roomId) return null;
@@ -393,6 +428,7 @@ function toGameSession(gameSession: DbGameSession): GameSession {
     maxRevealRounds: gameSession.max_reveal_rounds ?? 3,
     roundSeconds: gameSession.round_seconds ?? DEFAULT_ROUND_SECONDS,
     roundScores,
+    questionCount: normalizeSelectedQuestionIds(gameSession.selected_question_ids).length || undefined,
     roundStartedAt: gameSession.round_started_at,
     serverNow: new Date().toISOString(),
     teamBattleState,
@@ -624,6 +660,40 @@ function pruneUnusedTeamGuessProposals(state: TeamBattleState) {
 
 function randomInt(maxExclusive: number) {
   return Math.floor(Math.random() * maxExclusive);
+}
+
+function secureRandomInt(maxExclusive: number) {
+  if (!Number.isInteger(maxExclusive) || maxExclusive < 1 || maxExclusive > 0x100000000) {
+    throw new Error("随机抽题范围无效。");
+  }
+  const range = 0x100000000;
+  const acceptedLimit = Math.floor(range / maxExclusive) * maxExclusive;
+  const randomValue = new Uint32Array(1);
+  do {
+    crypto.getRandomValues(randomValue);
+  } while (randomValue[0] >= acceptedLimit);
+  return randomValue[0] % maxExclusive;
+}
+
+export function selectQuestionsForGame<T>(
+  questions: readonly T[],
+  questionCount: number,
+  getRandomInt: (maxExclusive: number) => number = secureRandomInt,
+) {
+  if (!Number.isInteger(questionCount) || questionCount < 1 || questionCount > questions.length) {
+    throw new Error("本局抽取题数无效。");
+  }
+  if (questionCount === questions.length) return [...questions];
+
+  const shuffled = [...questions];
+  for (let index = shuffled.length - 1; index > 0; index -= 1) {
+    const swapIndex = getRandomInt(index + 1);
+    if (!Number.isInteger(swapIndex) || swapIndex < 0 || swapIndex > index) {
+      throw new Error("随机抽题结果无效。");
+    }
+    [shuffled[index], shuffled[swapIndex]] = [shuffled[swapIndex], shuffled[index]];
+  }
+  return shuffled.slice(0, questionCount);
 }
 
 function shuffleItems<T>(items: T[]) {
@@ -2238,6 +2308,8 @@ export async function leaveRoom(roomId: string, playerId: string) {
     roomUpdates.game_status = "LOBBY";
     roomUpdates.current_presenter_player_id = null;
     roomUpdates.prepared_question_set_id = null;
+    roomUpdates.prepared_question_count = null;
+    roomUpdates.lobby_question_count = null;
     roomUpdates.prepared_question_source = null;
   }
 
@@ -2308,6 +2380,8 @@ export async function kickPlayerFromRoom(roomId: string, hostPlayerId: string, t
       current_presenter_player_id: null,
       current_game_id: null,
       prepared_question_set_id: null,
+      prepared_question_count: null,
+      lobby_question_count: null,
       prepared_question_source: null,
       game_status: "LOBBY",
     } satisfies Partial<DbRoom>);
@@ -2381,6 +2455,8 @@ export async function selectPresenterForRound(roomId: string, hostPlayerId: stri
       game_status: "QUESTION_SETUP",
       current_game_id: null,
       prepared_question_set_id: null,
+      prepared_question_count: null,
+      lobby_question_count: null,
       prepared_question_source: null,
       lobby_team_assignments: JSON.stringify(nextAssignments),
       public_activity_at: new Date().toISOString(),
@@ -2422,6 +2498,8 @@ export async function cancelCurrentRound(roomId: string, hostPlayerId: string) {
       current_presenter_player_id: null,
       current_game_id: null,
       prepared_question_set_id: null,
+      prepared_question_count: null,
+      lobby_question_count: null,
       prepared_question_source: null,
       game_status: "LOBBY",
       public_activity_at: new Date().toISOString(),
@@ -2451,6 +2529,8 @@ export async function cancelPresenterSetup(roomId: string, presenterPlayerId: st
       current_presenter_player_id: null,
       current_game_id: null,
       prepared_question_set_id: null,
+      prepared_question_count: null,
+      lobby_question_count: null,
       prepared_question_source: null,
       game_status: "LOBBY",
       public_activity_at: new Date().toISOString(),
@@ -3231,6 +3311,8 @@ export async function prepareQuestionSetForStart(params: {
     .from("rooms")
     .update({
       prepared_question_set_id: params.questionSetId,
+      prepared_question_count: questionSet.image_count,
+      lobby_question_count: null,
       prepared_question_source: preparedQuestionSource,
       public_activity_at: new Date().toISOString(),
     })
@@ -3320,6 +3402,7 @@ export async function updateRoomGameSettings(params: {
   playerCapacity?: number;
   spectatorCapacity?: number;
   teamAssignmentMode?: TeamAssignmentMode;
+  questionCount?: number | null;
 }) {
   assertD1Env();
 
@@ -3367,6 +3450,14 @@ export async function updateRoomGameSettings(params: {
   const spectatorCapacity = params.spectatorCapacity === undefined
     ? normalizeSpectatorCapacity(currentRoom.lobby_spectator_capacity)
     : requireSpectatorCapacity(params.spectatorCapacity);
+  let questionCount = params.questionCount === undefined
+    ? normalizeQuestionCount(currentRoom.lobby_question_count)
+    : requireQuestionCount(params.questionCount);
+  const preparedQuestionCount = normalizeQuestionCount(currentRoom.prepared_question_count);
+  if (questionCount != null && preparedQuestionCount != null && questionCount > preparedQuestionCount) {
+    throw new Error(`本局抽取题数不能超过当前题库的 ${preparedQuestionCount} 道题。`);
+  }
+  if (questionCount != null && questionCount === preparedQuestionCount) questionCount = null;
   const currentPlayers = getRoomStatePlayers(currentRoom);
   const playerCount = countGamePlayers(currentPlayers);
   const spectatorCount = countSpectators(currentPlayers);
@@ -3389,6 +3480,7 @@ export async function updateRoomGameSettings(params: {
     lobby_spectator_player_answers_enabled: spectatorPlayerAnswersEnabled ? 1 : 0,
     lobby_player_capacity: playerCapacity,
     lobby_spectator_capacity: spectatorCapacity,
+    lobby_question_count: questionCount,
     lobby_team_assignment_mode: teamAssignmentMode,
     ...(params.gameMode !== "TEAM_BATTLE" || teamAssignmentMode === "AUTO"
       ? { lobby_team_assignments: "{}" }
@@ -3484,6 +3576,7 @@ export async function startGameWithQuestionSet(params: {
   teamRevealVoteSeconds?: number;
   teamGuessVoteSeconds?: number;
   teamPresenterBlockEnabled?: boolean;
+  questionCount?: number | null;
   authorityVersion?: 2;
 }) {
   assertD1Env();
@@ -3505,11 +3598,13 @@ export async function startGameWithQuestionSet(params: {
   const roomPlayers = getRoomStatePlayers(room);
 
   if (room.game_status === "PLAYING" && room.current_game_id) {
+    let currentDbGameSession: DbGameSession | null = null;
     const currentGameSession = params.authorityVersion === 2
       ? await (async () => {
           const { data, error } = await d1.from("game_sessions").select("*").eq("id", room.current_game_id).maybeSingle<DbGameSession>();
           if (error) throw new Error(error.message);
           if (!data) return null;
+          currentDbGameSession = data;
           const currentPlayers = roomPlayers;
           return {
             ...toGameSession(data),
@@ -3530,13 +3625,14 @@ export async function startGameWithQuestionSet(params: {
           .eq("id", params.questionSetId)
           .maybeSingle<DbQuestionSet>();
         if (currentQuestionSetError || !currentQuestionSet) throw new Error(currentQuestionSetError?.message ?? "题库不存在。");
-        const currentQuestions = await getDbQuestionsForQuestionSet(currentQuestionSet);
+        if (!currentDbGameSession) throw new Error("本局抽题快照不存在。");
+        const currentQuestions = await getDbQuestionsForGameSession(currentDbGameSession, currentQuestionSet);
         return {
           gameSession: currentGameSession,
           room: toRoom(room, currentPlayers),
           __authorityVNextBootstrap: {
             players: currentPlayers.map(toPlayer),
-            questionSet: toQuestionSet(currentQuestionSet, currentQuestions),
+            questionSet: toGameQuestionSet(currentQuestionSet, currentQuestions),
             questions: currentQuestions.map(toQuestion),
             questionSetManifestVersion: currentQuestionSet.manifest_version ?? null,
           },
@@ -3629,6 +3725,16 @@ export async function startGameWithQuestionSet(params: {
       })
     : null;
   const roundScores = normalizeRoundScores(params.roundScores ?? room.lobby_round_scores, maxRevealRounds);
+  const availableQuestions = await getDbQuestionsForQuestionSet(questionSet);
+  if (availableQuestions.length !== questionSet.image_count) {
+    rejectStartGame("开始游戏失败：题库题目数量不一致，请重新准备题库。");
+  }
+  const configuredQuestionCount = params.questionCount === undefined
+    ? room.lobby_question_count
+    : params.questionCount;
+  const questionCount = requireStartQuestionCount(configuredQuestionCount, availableQuestions.length);
+  const selectedQuestions = selectQuestionsForGame(availableQuestions, questionCount);
+  const selectedQuestionIds = selectedQuestions.map((question) => question.id);
 
   const initialGameSessionValues = {
     room_id: params.roomId,
@@ -3642,6 +3748,7 @@ export async function startGameWithQuestionSet(params: {
     max_reveal_rounds: maxRevealRounds,
     round_seconds: roundSeconds,
     round_scores: roundScores,
+    selected_question_ids: selectedQuestionIds,
     team_battle_state: teamBattleState,
     round_started_at: null,
     ended_at: null,
@@ -3768,6 +3875,8 @@ export async function startGameWithQuestionSet(params: {
     .update({
       current_game_id: gameSession.id,
       prepared_question_set_id: null,
+      prepared_question_count: null,
+      lobby_question_count: questionCount === availableQuestions.length ? null : questionCount,
       game_status: "PLAYING",
       public_activity_at: new Date().toISOString(),
     })
@@ -3809,7 +3918,7 @@ export async function startGameWithQuestionSet(params: {
     throw new Error("开始游戏失败：房间状态已变化，请刷新后重试。");
   }
 
-  const vnextQuestions = params.authorityVersion === 2 ? await getDbQuestionsForQuestionSet(questionSet) : [];
+  const vnextQuestions = params.authorityVersion === 2 ? await getDbQuestionsForGameSession(gameSession, questionSet) : [];
   return {
     gameSession: hydratedGameSession,
     room: toRoom(updatedRoom),
@@ -3817,7 +3926,7 @@ export async function startGameWithQuestionSet(params: {
       ? {
           __authorityVNextBootstrap: {
             players: players.map(toPlayer),
-            questionSet: toQuestionSet(questionSet, vnextQuestions),
+            questionSet: toGameQuestionSet(questionSet, vnextQuestions),
             questions: vnextQuestions.map(toQuestion),
             questionSetManifestVersion: questionSet.manifest_version ?? null,
           },
@@ -3931,8 +4040,64 @@ async function getLegacyDbQuestionsByQuestionSetId(questionSetId: string) {
   return data ?? [];
 }
 
+function normalizeSelectedQuestionIds(value: unknown) {
+  if (value == null || value === "") return [];
+  let parsed = value;
+  if (typeof parsed === "string") {
+    try {
+      parsed = JSON.parse(parsed) as unknown;
+    } catch {
+      throw new Error("本局抽题快照已损坏。");
+    }
+  }
+  if (!Array.isArray(parsed) || parsed.length > MAX_QUESTION_SET_QUESTIONS) {
+    throw new Error("本局抽题快照无效。");
+  }
+  const ids = parsed.map((id) => {
+    if (typeof id !== "string" || !id.trim() || id.length > 128) throw new Error("本局抽题快照无效。");
+    return id;
+  });
+  if (new Set(ids).size !== ids.length) throw new Error("本局抽题快照包含重复题目。");
+  return ids;
+}
+
 async function getDbQuestionsForQuestionSet(questionSet: DbQuestionSet) {
   return decodeQuestionSetManifest(questionSet) ?? await getLegacyDbQuestionsByQuestionSetId(questionSet.id);
+}
+
+async function getDbQuestionsForGameSession(gameSession: DbGameSession, questionSet?: DbQuestionSet) {
+  let resolvedQuestionSet = questionSet;
+  if (!resolvedQuestionSet) {
+    const { data, error } = await d1
+      .from("question_sets")
+      .select("*")
+      .eq("id", gameSession.question_set_id)
+      .maybeSingle<DbQuestionSet>();
+    if (error) throw new Error(error.message);
+    if (!data) throw new Error("本局题库不存在。");
+    resolvedQuestionSet = data;
+  }
+  if (resolvedQuestionSet.id !== gameSession.question_set_id) throw new Error("本局抽题快照与题库不匹配。");
+
+  const allQuestions = await getDbQuestionsForQuestionSet(resolvedQuestionSet);
+  const selectedQuestionIds = normalizeSelectedQuestionIds(gameSession.selected_question_ids);
+  if (selectedQuestionIds.length === 0) return allQuestions;
+  const questionById = new Map(allQuestions.map((question) => [question.id, question]));
+  return selectedQuestionIds.map((questionId, orderIndex) => {
+    const question = questionById.get(questionId);
+    if (!question) throw new Error("本局抽题快照引用了不存在的题目。");
+    return { ...question, order_index: orderIndex };
+  });
+}
+
+async function getDbGameSessionById(gameSessionId: string) {
+  const { data, error } = await d1
+    .from("game_sessions")
+    .select("*")
+    .eq("id", gameSessionId)
+    .maybeSingle<DbGameSession>();
+  if (error) throw new Error(error.message);
+  return data;
 }
 
 async function getDbQuestionsByQuestionSetId(questionSetId: string) {
@@ -3951,6 +4116,22 @@ async function getDbQuestionsByQuestionSetId(questionSetId: string) {
 export async function getQuestionsByQuestionSetId(questionSetId: string) {
   const questions = await getDbQuestionsByQuestionSetId(questionSetId);
   return questions.map(toQuestion);
+}
+
+async function getQuestionsForGameSession(gameSession: DbGameSession) {
+  return (await getDbQuestionsForGameSession(gameSession)).map(toQuestion);
+}
+
+async function getQuestionSetForGameSession(gameSession: DbGameSession) {
+  const { data: questionSet, error } = await d1
+    .from("question_sets")
+    .select("*")
+    .eq("id", gameSession.question_set_id)
+    .maybeSingle<DbQuestionSet>();
+  if (error) throw new Error(error.message);
+  if (!questionSet) return null;
+  const questions = await getDbQuestionsForGameSession(gameSession, questionSet);
+  return toGameQuestionSet(questionSet, questions);
 }
 
 export async function confirmRevealBlocks(params: {
@@ -4274,14 +4455,13 @@ export async function getRoundSnapshot(gameSessionId: string): Promise<RoundSnap
 export async function getGameBootstrapSnapshot(gameSessionId: string): Promise<GameBootstrapSnapshot> {
   assertD1Env();
 
-  const gameSession = await getGameSessionById(gameSessionId);
-
-  if (!gameSession) {
+  const dbGameSession = await getDbGameSessionById(gameSessionId);
+  if (!dbGameSession) {
     throw new Error("加载游戏快照失败：当前游戏不存在。");
   }
-
+  const gameSession = await hydrateGameSessionEligibility(toGameSession(dbGameSession));
   const [questions, roundSnapshot] = await Promise.all([
-    getQuestionsByQuestionSetId(gameSession.questionSetId),
+    getQuestionsForGameSession(dbGameSession),
     getRoundSnapshot(gameSession.id),
   ]);
 
@@ -4357,10 +4537,11 @@ export async function getLeaderboardForGameSession(gameSessionId: string): Promi
 export async function getGameResultSnapshot(gameSessionId: string): Promise<GameResultSnapshot> {
   assertD1Env();
 
-  const gameSession = await getGameSessionById(gameSessionId);
-  if (!gameSession) {
+  const dbGameSession = await getDbGameSessionById(gameSessionId);
+  if (!dbGameSession) {
     throw new Error("加载结算快照失败：游戏不存在。");
   }
+  const gameSession = await hydrateGameSessionEligibility(toGameSession(dbGameSession));
 
   if (gameSession.status === "GAME_RESULT" && gameSession.completedNormallyAt) {
     await recordCompletedQuestionSetPlay({
@@ -4372,7 +4553,7 @@ export async function getGameResultSnapshot(gameSessionId: string): Promise<Game
 
   const [archive, questionSet] = await Promise.all([
     getGameResultArchive(gameSession.id),
-    getQuestionSetById(gameSession.questionSetId),
+    getQuestionSetForGameSession(dbGameSession),
   ]);
 
   if (archive) {
@@ -4399,11 +4580,12 @@ export async function getGameResultSnapshot(gameSessionId: string): Promise<Game
 
 export async function getArchivedGameResultSnapshot(gameSessionId: string): Promise<GameResultSnapshot | null> {
   assertD1Env();
-  const gameSession = await getGameSessionById(gameSessionId);
-  if (!gameSession) return null;
+  const dbGameSession = await getDbGameSessionById(gameSessionId);
+  if (!dbGameSession) return null;
+  const gameSession = await hydrateGameSessionEligibility(toGameSession(dbGameSession));
   const archive = await getGameResultArchive(gameSession.id);
   if (!archive) return null;
-  const questionSet = await getQuestionSetById(gameSession.questionSetId);
+  const questionSet = await getQuestionSetForGameSession(dbGameSession);
   return {
     gameSession,
     leaderboard: archive.leaderboard,
@@ -6805,7 +6987,7 @@ async function getCompletedQuestionTransitionResult(currentGameSession: DbGameSe
   let resultRoom: Room | null = null;
 
   if (currentGameSession.status === "GAME_RESULT" && currentGameSession.current_question_index === expectedQuestionIndex) {
-    const questions = await getQuestionsByQuestionSetId(currentGameSession.question_set_id);
+    const questions = await getQuestionsForGameSession(currentGameSession);
     resultRoom = await getRoomWithPlayersById(currentGameSession.room_id);
     advancedToGameResult =
       Boolean(currentGameSession.completed_normally_at) &&
@@ -7050,7 +7232,7 @@ export async function advanceReviewedQuestion(params: {
     throw new Error("当前还没有进入完整图片复盘阶段，不能进入下一题。");
   }
 
-  const questions = await getQuestionsByQuestionSetId(currentGameSession.question_set_id);
+  const questions = await getQuestionsForGameSession(currentGameSession);
   const nextQuestionIndex = currentGameSession.current_question_index + 1;
 
   if (nextQuestionIndex >= questions.length) {
@@ -7191,7 +7373,7 @@ export async function updateQuestionLabel(params: {
     throw new Error("当前题库不存在，不能填写正确答案。");
   }
 
-  const question = (await getDbQuestionsForQuestionSet(questionSet)).find(
+  const question = (await getDbQuestionsForGameSession(currentGameSession, questionSet)).find(
     (item) => item.id === params.questionId && item.order_index === currentGameSession.current_question_index,
   );
   if (!question) {
@@ -7249,13 +7431,11 @@ export async function updateQuestionLabel(params: {
     let currentQuestionSet = questionSet;
     for (let attempt = 0; attempt < 3; attempt += 1) {
       const currentQuestions = decodeQuestionSetManifest(currentQuestionSet);
-      const currentQuestion = currentQuestions?.find(
-        (item) => item.id === question.id && item.order_index === currentGameSession.current_question_index,
-      );
+      const currentQuestion = currentQuestions?.find((item) => item.id === question.id);
       if (!currentQuestion) throw new Error("当前题目不存在，不能填写正确答案。");
       if (currentQuestion.label_text?.trim()) throw new Error("正确答案已被其他操作更新，请刷新后重试。");
 
-      const nextQuestion = {
+      const nextStoredQuestion = {
         ...toQuestion(currentQuestion),
         labelText,
         labelSource: params.source,
@@ -7263,7 +7443,7 @@ export async function updateQuestionLabel(params: {
         labelUpdatedByPlayerId: params.presenterPlayerId,
         labelUpdatedAt,
       };
-      const nextQuestions = currentQuestions.map((item) => item.id === currentQuestion.id ? nextQuestion : toQuestion(item));
+      const nextQuestions = currentQuestions.map((item) => item.id === currentQuestion.id ? nextStoredQuestion : toQuestion(item));
       const revision = currentQuestionSet.manifest_revision ?? 0;
       const { data: updatedQuestionSet, error: manifestUpdateError } = await d1
         .from("question_sets")
@@ -7277,7 +7457,7 @@ export async function updateQuestionLabel(params: {
         .select()
         .maybeSingle<DbQuestionSet>();
       if (manifestUpdateError) throw new Error(manifestUpdateError.message);
-      if (updatedQuestionSet) return nextQuestion;
+      if (updatedQuestionSet) return { ...nextStoredQuestion, orderIndex: currentGameSession.current_question_index };
 
       const { data: reloaded, error: reloadError } = await d1
         .from("question_sets")
@@ -7313,7 +7493,7 @@ export async function updateQuestionLabel(params: {
     throw new Error("正确答案已被其他操作更新，请刷新后重试。");
   }
 
-  return toQuestion(updatedQuestion);
+  return { ...toQuestion(updatedQuestion), orderIndex: currentGameSession.current_question_index };
 }
 
 export async function skipCurrentQuestion(params: {
@@ -7355,7 +7535,7 @@ export async function skipCurrentQuestion(params: {
     throw new Error("题目状态已变化，请刷新后重试。");
   }
 
-  const questions = await getQuestionsByQuestionSetId(currentGameSession.question_set_id);
+  const questions = await getQuestionsForGameSession(currentGameSession);
   const nextQuestionIndex = currentGameSession.current_question_index + 1;
 
   if (nextQuestionIndex >= questions.length) {
@@ -7495,6 +7675,8 @@ export async function returnRoomToLobby(roomId: string, hostPlayerId: string) {
       current_presenter_player_id: null,
       current_game_id: null,
       prepared_question_set_id: null,
+      prepared_question_count: null,
+      lobby_question_count: null,
       prepared_question_source: null,
       lobby_team_assignments: "{}",
       game_status: "LOBBY",

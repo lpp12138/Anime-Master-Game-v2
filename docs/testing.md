@@ -25,6 +25,7 @@ npm run build
 | IndexedDB Outbox、ACK、clientSeq、刷新补发 | `npm run test:authority-outbox`、`npm run test:authority-vnext` |
 | WebSocket 协议、delta、snapshot、加入/退出、判定反馈 | `npm run test:authority-vnext`、`npm run test:authority-full-game` |
 | 四种游戏模式、计分、阶段转换、deadline | `npm run test:authority-full-game`、`npm run test:authority-state-machine`、`npm run test:authority-vnext` |
+| 本局随机抽题、题数设置、开局幂等或抽题快照恢复 | `npm run test:question-set-creation-method`、`npm run test:authority-vnext`、`npm run test:authority-full-game`、`npm run test:game-result-archive` |
 | DO checkpoint、Hibernation、Attachment、Alarm、恢复 | `npm run test:authority-vnext`、`npm run test:authority-budget` |
 | D1 最终投影、历史结算、roster handoff | `npm run test:authority-vnext`、`npm run test:game-result-archive`、`npm run test:authority-budget` |
 | D1 migration 或 DO schema migration | 对应升级测试、重复初始化测试、失败不推进版本测试，以及 `worker:typecheck` |

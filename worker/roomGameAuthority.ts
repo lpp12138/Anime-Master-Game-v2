@@ -2,7 +2,7 @@ import { DurableSqlDatabase } from "./durableSqlDatabase";
 
 type Row = Record<string, unknown>;
 
-const AUTHORITY_SCHEMA_VERSION = 13;
+const AUTHORITY_SCHEMA_VERSION = 14;
 const AUTHORITY_VNEXT_SCHEMA = [
   `CREATE TABLE IF NOT EXISTS authority_vnext_active_game (
     id INTEGER PRIMARY KEY CHECK(id=1), room_id TEXT NOT NULL, game_id TEXT NOT NULL,
@@ -33,11 +33,11 @@ const SCHEMA = [
   `CREATE TABLE IF NOT EXISTS mutation_journal (id INTEGER PRIMARY KEY CHECK(id=1), room_id TEXT NOT NULL, name TEXT NOT NULL, action_key TEXT, started_at INTEGER NOT NULL)`,
   `CREATE TABLE IF NOT EXISTS mutation_journal_payload (id INTEGER PRIMARY KEY CHECK(id=1), payload_json TEXT NOT NULL)`,
   MUTATION_JOURNAL_VALIDATION_SCHEMA,
-  `CREATE TABLE IF NOT EXISTS rooms (id TEXT PRIMARY KEY, room_code TEXT NOT NULL UNIQUE, host_player_id TEXT NOT NULL, game_status TEXT NOT NULL, current_presenter_player_id TEXT, current_game_id TEXT, prepared_question_set_id TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, lobby_game_mode TEXT NOT NULL DEFAULT 'ROUND_REVEAL', lobby_max_reveal_rounds INTEGER NOT NULL DEFAULT 3, lobby_round_seconds INTEGER NOT NULL DEFAULT 45, lobby_round_scores TEXT NOT NULL DEFAULT '[5,3,1]', lobby_team_reveal_vote_seconds INTEGER NOT NULL DEFAULT 15 CHECK (lobby_team_reveal_vote_seconds BETWEEN 1 AND 600), lobby_team_guess_vote_seconds INTEGER NOT NULL DEFAULT 50 CHECK (lobby_team_guess_vote_seconds BETWEEN 1 AND 600), lobby_team_assignment_mode TEXT NOT NULL DEFAULT 'AUTO' CHECK (lobby_team_assignment_mode IN ('AUTO','MANUAL')), lobby_team_assignments TEXT NOT NULL DEFAULT '{}', lobby_team_presenter_block_enabled INTEGER NOT NULL DEFAULT 0 CHECK (lobby_team_presenter_block_enabled IN (0,1)), lobby_spectator_question_preview_enabled INTEGER NOT NULL DEFAULT 1 CHECK (lobby_spectator_question_preview_enabled IN (0,1)), lobby_spectator_player_answers_enabled INTEGER NOT NULL DEFAULT 1 CHECK (lobby_spectator_player_answers_enabled IN (0,1)), lobby_player_capacity INTEGER NOT NULL DEFAULT 50 CHECK (lobby_player_capacity BETWEEN 1 AND 50), lobby_spectator_capacity INTEGER NOT NULL DEFAULT 50 CHECK (lobby_spectator_capacity BETWEEN 0 AND 50))`,
+  `CREATE TABLE IF NOT EXISTS rooms (id TEXT PRIMARY KEY, room_code TEXT NOT NULL UNIQUE, host_player_id TEXT NOT NULL, game_status TEXT NOT NULL, current_presenter_player_id TEXT, current_game_id TEXT, prepared_question_set_id TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, lobby_game_mode TEXT NOT NULL DEFAULT 'ROUND_REVEAL', lobby_max_reveal_rounds INTEGER NOT NULL DEFAULT 3, lobby_round_seconds INTEGER NOT NULL DEFAULT 45, lobby_round_scores TEXT NOT NULL DEFAULT '[5,3,1]', lobby_team_reveal_vote_seconds INTEGER NOT NULL DEFAULT 15 CHECK (lobby_team_reveal_vote_seconds BETWEEN 1 AND 600), lobby_team_guess_vote_seconds INTEGER NOT NULL DEFAULT 50 CHECK (lobby_team_guess_vote_seconds BETWEEN 1 AND 600), lobby_team_assignment_mode TEXT NOT NULL DEFAULT 'AUTO' CHECK (lobby_team_assignment_mode IN ('AUTO','MANUAL')), lobby_team_assignments TEXT NOT NULL DEFAULT '{}', lobby_team_presenter_block_enabled INTEGER NOT NULL DEFAULT 0 CHECK (lobby_team_presenter_block_enabled IN (0,1)), lobby_spectator_question_preview_enabled INTEGER NOT NULL DEFAULT 1 CHECK (lobby_spectator_question_preview_enabled IN (0,1)), lobby_spectator_player_answers_enabled INTEGER NOT NULL DEFAULT 1 CHECK (lobby_spectator_player_answers_enabled IN (0,1)), lobby_player_capacity INTEGER NOT NULL DEFAULT 50 CHECK (lobby_player_capacity BETWEEN 1 AND 50), lobby_spectator_capacity INTEGER NOT NULL DEFAULT 50 CHECK (lobby_spectator_capacity BETWEEN 0 AND 50), lobby_question_count INTEGER CHECK (lobby_question_count IS NULL OR lobby_question_count BETWEEN 1 AND 30), prepared_question_count INTEGER CHECK (prepared_question_count IS NULL OR prepared_question_count BETWEEN 1 AND 30))`,
   `CREATE TABLE IF NOT EXISTS players (id TEXT PRIMARY KEY, room_id TEXT NOT NULL, nickname TEXT NOT NULL, is_host INTEGER NOT NULL DEFAULT 0, joined_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')), last_seen_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')), role TEXT NOT NULL DEFAULT 'PLAYER')`,
   `CREATE TABLE IF NOT EXISTS question_sets (id TEXT PRIMARY KEY, title TEXT NOT NULL, description TEXT, created_by_player_id TEXT NOT NULL, source TEXT NOT NULL DEFAULT 'uploaded', creation_method TEXT CHECK (creation_method IS NULL OR creation_method IN ('player_manual','creation_tool_assisted')), is_public INTEGER NOT NULL DEFAULT 0, image_urls_text TEXT, image_count INTEGER NOT NULL DEFAULT 0, rating_avg REAL NOT NULL DEFAULT 0, rating_count INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, created_by_nickname TEXT, play_count INTEGER NOT NULL DEFAULT 0)`,
   `CREATE TABLE IF NOT EXISTS questions (id TEXT PRIMARY KEY, question_set_id TEXT NOT NULL, image_url TEXT NOT NULL, order_index INTEGER NOT NULL, label_text TEXT, label_source TEXT, label_source_answer_id TEXT, label_updated_by_player_id TEXT, label_updated_at TEXT, created_at TEXT NOT NULL)`,
-  `CREATE TABLE IF NOT EXISTS game_sessions (id TEXT PRIMARY KEY, room_id TEXT NOT NULL, question_set_id TEXT NOT NULL, presenter_player_id TEXT NOT NULL, status TEXT NOT NULL, game_mode TEXT NOT NULL, current_question_index INTEGER NOT NULL DEFAULT 0, current_reveal_round INTEGER NOT NULL DEFAULT 1, revealed_blocks TEXT NOT NULL DEFAULT '[]', max_reveal_rounds INTEGER NOT NULL DEFAULT 3, round_seconds INTEGER NOT NULL DEFAULT 45, round_scores TEXT NOT NULL DEFAULT '[5,3,1]', team_battle_state TEXT, round_started_at TEXT, created_at TEXT NOT NULL, ended_at TEXT, completed_normally_at TEXT)`,
+  `CREATE TABLE IF NOT EXISTS game_sessions (id TEXT PRIMARY KEY, room_id TEXT NOT NULL, question_set_id TEXT NOT NULL, presenter_player_id TEXT NOT NULL, status TEXT NOT NULL, game_mode TEXT NOT NULL, current_question_index INTEGER NOT NULL DEFAULT 0, current_reveal_round INTEGER NOT NULL DEFAULT 1, revealed_blocks TEXT NOT NULL DEFAULT '[]', max_reveal_rounds INTEGER NOT NULL DEFAULT 3, round_seconds INTEGER NOT NULL DEFAULT 45, round_scores TEXT NOT NULL DEFAULT '[5,3,1]', selected_question_ids TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(selected_question_ids) AND json_type(selected_question_ids)='array' AND json_array_length(selected_question_ids) BETWEEN 0 AND 30 AND length(selected_question_ids)<=4096), team_battle_state TEXT, round_started_at TEXT, created_at TEXT NOT NULL, ended_at TEXT, completed_normally_at TEXT)`,
   `CREATE TABLE IF NOT EXISTS answers (id TEXT PRIMARY KEY, game_session_id TEXT NOT NULL, question_index INTEGER NOT NULL, reveal_round INTEGER NOT NULL, player_id TEXT NOT NULL, answer_text TEXT NOT NULL, submitted_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')), UNIQUE(game_session_id, question_index, reveal_round, player_id))`,
   `CREATE TABLE IF NOT EXISTS buzzer_answers (id TEXT PRIMARY KEY, game_session_id TEXT NOT NULL, question_index INTEGER NOT NULL, reveal_round INTEGER NOT NULL, player_id TEXT NOT NULL, answer_text TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending', score_awarded INTEGER NOT NULL DEFAULT 0, submitted_at TEXT NOT NULL, server_received_at TEXT, judged_at TEXT, judged_by_player_id TEXT, UNIQUE(game_session_id, question_index, reveal_round, player_id))`,
   `CREATE TABLE IF NOT EXISTS player_scores (id TEXT PRIMARY KEY, game_session_id TEXT NOT NULL, player_id TEXT NOT NULL, score INTEGER NOT NULL DEFAULT 0, correct_count INTEGER NOT NULL DEFAULT 0, UNIQUE(game_session_id, player_id))`,
@@ -295,6 +295,49 @@ export class RoomGameAuthority {
         if (advanced.version !== 13) throw new Error("authority schema v13 version did not advance");
       });
       currentVersion = 13;
+    }
+
+    if (currentVersion < 14) {
+      this.storage.transactionSync(() => {
+        const roomColumns = new Set(
+          this.storage.sql.exec<{ name: string }>("PRAGMA table_info(rooms)").toArray().map((row) => row.name),
+        );
+        if (!roomColumns.has("lobby_question_count")) {
+          this.storage.sql.exec(
+            "ALTER TABLE rooms ADD COLUMN lobby_question_count INTEGER CHECK (lobby_question_count IS NULL OR lobby_question_count BETWEEN 1 AND 30)",
+          );
+        }
+        if (!roomColumns.has("prepared_question_count")) {
+          this.storage.sql.exec(
+            "ALTER TABLE rooms ADD COLUMN prepared_question_count INTEGER CHECK (prepared_question_count IS NULL OR prepared_question_count BETWEEN 1 AND 30)",
+          );
+        }
+        const gameSessionColumns = new Set(
+          this.storage.sql.exec<{ name: string }>("PRAGMA table_info(game_sessions)").toArray().map((row) => row.name),
+        );
+        if (!gameSessionColumns.has("selected_question_ids")) {
+          this.storage.sql.exec(
+            "ALTER TABLE game_sessions ADD COLUMN selected_question_ids TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(selected_question_ids) AND json_type(selected_question_ids)='array' AND json_array_length(selected_question_ids) BETWEEN 0 AND 30 AND length(selected_question_ids)<=4096)",
+          );
+        }
+        const migratedRoomColumns = new Set(
+          this.storage.sql.exec<{ name: string }>("PRAGMA table_info(rooms)").toArray().map((row) => row.name),
+        );
+        const migratedGameSessionColumns = new Set(
+          this.storage.sql.exec<{ name: string }>("PRAGMA table_info(game_sessions)").toArray().map((row) => row.name),
+        );
+        if (
+          !migratedRoomColumns.has("lobby_question_count") ||
+          !migratedRoomColumns.has("prepared_question_count") ||
+          !migratedGameSessionColumns.has("selected_question_ids")
+        ) {
+          throw new Error("authority schema v14 validation failed: game question sampling");
+        }
+        this.storage.sql.exec("UPDATE authority_schema SET version=14 WHERE id=1 AND version=13");
+        const advanced = this.storage.sql.exec<{ version: number }>("SELECT version FROM authority_schema WHERE id=1").one();
+        if (advanced.version !== 14) throw new Error("authority schema v14 version did not advance");
+      });
+      currentVersion = 14;
     }
   }
 
@@ -1106,7 +1149,7 @@ export class RoomGameAuthority {
         }
       }
       if (roomState?.game_status === "QUESTION_SETUP" && !remainingPlayers.some((player) => player.id === roomState.current_presenter_player_id)) {
-        this.storage.sql.exec("UPDATE rooms SET game_status='LOBBY',current_presenter_player_id=NULL,current_game_id=NULL,prepared_question_set_id=NULL WHERE id = ?", roomId);
+        this.storage.sql.exec("UPDATE rooms SET game_status='LOBBY',current_presenter_player_id=NULL,current_game_id=NULL,prepared_question_set_id=NULL,prepared_question_count=NULL,lobby_question_count=NULL WHERE id = ?", roomId);
       }
       const room = this.storage.sql.exec<Row>("SELECT game_status FROM rooms WHERE id = ?", roomId).toArray()[0];
       const handoffApplied = name === "dissolveRoom" ? !room : ["returnRoomToLobby", "cancelCurrentRound"].includes(name) && room?.game_status === "LOBBY";

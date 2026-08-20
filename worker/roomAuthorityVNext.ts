@@ -597,6 +597,7 @@ export class RoomAuthorityVNext {
       .map((player) => ({ id: `${bootstrap.gameSession.id}:${player.id}`, gameSessionId: bootstrap.gameSession.id, playerId: player.id, score: 0, correctCount: 0 }));
     const gameSession = {
       ...bootstrap.gameSession,
+      questionCount: bootstrap.questions.length,
       eligiblePlayerIds: bootstrap.gameSession.eligiblePlayerIds ?? this.eligiblePlayers(players, bootstrap.gameSession.presenterPlayerId),
     };
     const normalizedTeam = normalizeTeamSessionDeadline(gameSession, Date.now());
@@ -1845,6 +1846,8 @@ export class RoomAuthorityVNext {
     aggregate.room.currentGameId = null;
     aggregate.room.currentPresenterPlayerId = null;
     aggregate.room.preparedQuestionSetId = null;
+    aggregate.room.preparedQuestionCount = null;
+    aggregate.room.questionCount = null;
     aggregate.room.preparedQuestionSource = null;
     aggregate.room.teamAssignments = {};
     aggregate.cutoverState = "ended";
@@ -1861,6 +1864,8 @@ export class RoomAuthorityVNext {
     aggregate.room.currentGameId = null;
     aggregate.room.currentPresenterPlayerId = null;
     aggregate.room.preparedQuestionSetId = null;
+    aggregate.room.preparedQuestionCount = null;
+    aggregate.room.questionCount = null;
     aggregate.room.preparedQuestionSource = null;
     aggregate.room.teamAssignments = {};
     aggregate.resultArchiveSuppressed = true;
@@ -2140,7 +2145,7 @@ export class RoomAuthorityVNext {
           if (game.projectionVersion === 3) {
             if (!game.room?.id) throw new Error("room state projection is missing room data");
             statements.push(this.d1.prepare(`UPDATE rooms SET
-              host_player_id=?,game_status=?,current_presenter_player_id=?,current_game_id=?,prepared_question_set_id=?,prepared_question_source=?,member_count=?,spectator_count=?,lobby_team_assignment_mode=?,lobby_team_assignments=?,
+              host_player_id=?,game_status=?,current_presenter_player_id=?,current_game_id=?,prepared_question_set_id=?,prepared_question_count=?,lobby_question_count=?,prepared_question_source=?,member_count=?,spectator_count=?,lobby_team_assignment_mode=?,lobby_team_assignments=?,
               room_state_version=?,room_state_revision=room_state_revision+1,room_state_json=?,public_activity_at=?,updated_at=?
               WHERE id=? AND runtime_generation=?`).bind(
               game.room.hostPlayerId,
@@ -2148,6 +2153,8 @@ export class RoomAuthorityVNext {
               game.room.currentPresenterPlayerId ?? null,
               game.room.currentGameId ?? null,
               game.room.preparedQuestionSetId ?? null,
+              game.room.preparedQuestionCount ?? null,
+              game.room.questionCount ?? null,
               game.room.preparedQuestionSource ?? null,
               countPlayersByRole(game.players, "PLAYER"),
               countPlayersByRole(game.players, "SPECTATOR"),
@@ -2166,12 +2173,14 @@ export class RoomAuthorityVNext {
               joinedAt: typeof player.joinedAt === "number" ? nowIso(player.joinedAt) : player.joinedAt,
               lastSeenAt: player.lastSeenAt ?? nowIso(),
             }));
-            if (game.room?.id) statements.push(this.d1.prepare("UPDATE rooms SET host_player_id=?,game_status=?,current_presenter_player_id=?,current_game_id=?,prepared_question_set_id=?,prepared_question_source=?,member_count=?,spectator_count=?,lobby_team_assignment_mode=?,lobby_team_assignments=?,public_activity_at=?,updated_at=? WHERE id=?").bind(
+            if (game.room?.id) statements.push(this.d1.prepare("UPDATE rooms SET host_player_id=?,game_status=?,current_presenter_player_id=?,current_game_id=?,prepared_question_set_id=?,prepared_question_count=?,lobby_question_count=?,prepared_question_source=?,member_count=?,spectator_count=?,lobby_team_assignment_mode=?,lobby_team_assignments=?,public_activity_at=?,updated_at=? WHERE id=?").bind(
               game.room.hostPlayerId,
               game.room.status,
               game.room.currentPresenterPlayerId ?? null,
               game.room.currentGameId ?? null,
               game.room.preparedQuestionSetId ?? null,
+              game.room.preparedQuestionCount ?? null,
+              game.room.questionCount ?? null,
               game.room.preparedQuestionSource ?? null,
               countPlayersByRole(game.players, "PLAYER"),
               countPlayersByRole(game.players, "SPECTATOR"),

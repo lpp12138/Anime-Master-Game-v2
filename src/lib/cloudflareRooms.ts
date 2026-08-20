@@ -213,6 +213,7 @@ export const updateRoomGameSettings = (params: {
   playerCapacity?: number;
   spectatorCapacity?: number;
   teamAssignmentMode?: TeamAssignmentMode;
+  questionCount?: number | null;
 }) => rpc<Room>("updateRoomGameSettings", params);
 
 export const updateRoomNotice = (params: { roomId: string; hostPlayerId: string; notice: string }) =>
@@ -231,6 +232,7 @@ export const startGameWithQuestionSet = (params: {
   teamRevealVoteSeconds?: number;
   teamGuessVoteSeconds?: number;
   teamPresenterBlockEnabled?: boolean;
+  questionCount?: number | null;
 }) => rpc<{ gameSession: GameSession; room: Room }>("startGameWithQuestionSet", params);
 
 export const getGameSessionById = (gameSessionId: string) =>

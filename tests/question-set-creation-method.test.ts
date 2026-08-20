@@ -16,6 +16,8 @@ import {
   createQuestionSetFromUrlText,
   getCommunityQuestionSetDetail,
   getCommunityQuestionSets,
+  getGameBootstrapSnapshot,
+  getGameResultSnapshot,
   getRoomWithPlayers,
   getQuestionSetById,
   joinRoom,
@@ -24,6 +26,7 @@ import {
   returnRoomToLobby,
   runWithGameDatabase,
   selectPresenterForRound,
+  selectQuestionsForGame,
   StartGameRejectedError,
   startGameWithQuestionSet,
   selectTeamForPlayer,
@@ -80,7 +83,7 @@ function migrationFiles() {
   return readdirSync(migrationsDirectory).filter((name) => /^\d{4}_.+\.sql$/.test(name)).sort();
 }
 
-function applyMigrations(db: DatabaseSync, through = "0025") {
+function applyMigrations(db: DatabaseSync, through = "0028") {
   for (const name of migrationFiles()) {
     if (name.slice(0, 4) > through) break;
     db.exec(readFileSync(join(migrationsDirectory, name), "utf8"));
@@ -557,6 +560,41 @@ test("room role-capacity migration backfills player counts and enforces independ
   assert.throws(() => db.prepare("UPDATE rooms SET lobby_spectator_capacity=51 WHERE id='capacity-old'").run(), /CHECK constraint failed/);
 });
 
+test("game question sampling migration is transactional and bounds room/session snapshots", () => {
+  const db = new DatabaseSync(":memory:");
+  applyMigrations(db, "0027");
+  db.prepare("INSERT INTO rooms(id,room_code,host_player_id) VALUES(?,?,?)").run("sample-old", "SMP028", "host");
+  db.prepare("INSERT INTO question_sets(id,title,created_by_player_id,image_count) VALUES(?,?,?,?)")
+    .run("sample-set", "Sample", "host", 1);
+  db.prepare("INSERT INTO game_sessions(id,room_id,question_set_id,presenter_player_id) VALUES(?,?,?,?)")
+    .run("sample-game", "sample-old", "sample-set", "host");
+  const migration = readFileSync(join(migrationsDirectory, "0028_game_question_sampling.sql"), "utf8");
+
+  db.exec("BEGIN");
+  try {
+    const firstStatement = migration.split(";").map((statement) => statement.trim()).filter(Boolean)[0];
+    db.exec(`${firstStatement};`);
+    throw new Error("injected migration failure");
+  } catch {
+    db.exec("ROLLBACK");
+  }
+  assert.equal(db.prepare("SELECT COUNT(*) count FROM pragma_table_info('rooms') WHERE name='lobby_question_count'").get().count, 0);
+
+  db.exec(migration);
+  assert.deepEqual({ ...db.prepare("SELECT lobby_question_count,prepared_question_count FROM rooms WHERE id='sample-old'").get() }, {
+    lobby_question_count: null,
+    prepared_question_count: null,
+  });
+  assert.equal(db.prepare("SELECT selected_question_ids FROM game_sessions WHERE id='sample-game'").get().selected_question_ids, "[]");
+  assert.throws(() => db.prepare("UPDATE rooms SET lobby_question_count=0 WHERE id='sample-old'").run(), /CHECK constraint failed/);
+  assert.throws(() => db.prepare("UPDATE rooms SET prepared_question_count=31 WHERE id='sample-old'").run(), /CHECK constraint failed/);
+  assert.throws(() => db.prepare("UPDATE game_sessions SET selected_question_ids='not-json' WHERE id='sample-game'").run(), /CHECK constraint failed/);
+  assert.throws(
+    () => db.prepare("UPDATE game_sessions SET selected_question_ids=? WHERE id='sample-game'").run(JSON.stringify(Array.from({ length: 31 }, (_, index) => `q${index}`))),
+    /CHECK constraint failed/,
+  );
+});
+
 test("room notices are host-authoritative, recoverable, bounded, and emit only changed deltas", async () => {
   const db = new DatabaseAdapter();
   applyMigrations(db.sqlite);
@@ -732,6 +770,140 @@ test("public room question source freezes when prepared and clears on cancellati
     });
     const manual = await prepareQuestionSetForStart({ roomId: room.id, presenterPlayerId: "source-host", questionSetId: manualSet.id });
     assert.equal(manual.preparedQuestionSource, "MANUAL");
+  });
+});
+
+test("room question-count settings sample once, persist order, and replay the same start snapshot", async () => {
+  assert.deepEqual(selectQuestionsForGame([0, 1, 2, 3, 4], 2, () => 0), [1, 2]);
+  assert.deepEqual(selectQuestionsForGame([0, 1, 2], 3, () => { throw new Error("must not shuffle all questions"); }), [0, 1, 2]);
+
+  const db = new DatabaseAdapter();
+  applyMigrations(db.sqlite);
+  await runWithGameDatabase(db, async () => {
+    const room = await createRoom("sample-host", "Sample Host");
+    await selectPresenterForRound(room.id!, "sample-host", "sample-host");
+    const questionSet = await createUploadedQuestionSet({
+      roomId: room.id!,
+      presenterPlayerId: "sample-host",
+      title: "Sampling Set",
+      questions: Array.from({ length: 6 }, (_, index) => ({
+        imageUrl: `https://example.com/sample-${index + 1}.webp`,
+        labelText: `Answer ${index + 1}`,
+      })),
+    });
+    let prepared = await prepareQuestionSetForStart({
+      roomId: room.id!,
+      presenterPlayerId: "sample-host",
+      questionSetId: questionSet.id,
+    });
+    assert.equal(prepared.preparedQuestionCount, 6);
+    assert.equal(prepared.questionCount, null);
+
+    prepared = await updateRoomGameSettings({
+      roomId: room.id!,
+      hostPlayerId: "sample-host",
+      gameMode: "ROUND_REVEAL",
+      questionCount: 6,
+    });
+    assert.equal(prepared.questionCount, null, "choosing the full set must preserve its original order");
+    await assert.rejects(
+      updateRoomGameSettings({
+        roomId: room.id!,
+        hostPlayerId: "sample-host",
+        gameMode: "ROUND_REVEAL",
+        questionCount: 7,
+      }),
+      /不能超过当前题库的 6 道题/,
+    );
+
+    prepared = await updateRoomGameSettings({
+      roomId: room.id!,
+      hostPlayerId: "sample-host",
+      gameMode: "ROUND_REVEAL",
+      questionCount: 3,
+    });
+    assert.equal(prepared.questionCount, 3);
+
+    const startParams = {
+      startRequestId: "sample-start-request-01",
+      roomId: room.id!,
+      hostPlayerId: "sample-host",
+      presenterPlayerId: "sample-host",
+      questionSetId: questionSet.id,
+      questionCount: 3,
+      authorityVersion: 2 as const,
+    };
+    const started = await startGameWithQuestionSet(startParams);
+    const firstQuestions = started.__authorityVNextBootstrap.questions;
+    assert.equal(started.gameSession.questionCount, 3);
+    assert.equal(started.room.preparedQuestionCount, null);
+    assert.equal(started.room.questionCount, 3);
+    assert.equal(firstQuestions.length, 3);
+    assert.equal(new Set(firstQuestions.map((question) => question.id)).size, 3);
+    assert.deepEqual(firstQuestions.map((question) => question.orderIndex), [0, 1, 2]);
+
+    const storedIds = JSON.parse(String(
+      db.sqlite.prepare("SELECT selected_question_ids FROM game_sessions WHERE id=?").get(startParams.startRequestId).selected_question_ids,
+    )) as string[];
+    assert.deepEqual(storedIds, firstQuestions.map((question) => question.id));
+    const fallbackBootstrap = await getGameBootstrapSnapshot(startParams.startRequestId);
+    assert.equal(fallbackBootstrap.gameSession.questionCount, 3);
+    assert.deepEqual(fallbackBootstrap.questions.map((question) => question.id), storedIds);
+    const fallbackResult = await getGameResultSnapshot(startParams.startRequestId);
+    assert.equal(fallbackResult.gameSession.questionCount, 3);
+    assert.deepEqual(fallbackResult.questionSet?.questions?.map((question) => question.id), storedIds);
+
+    const retried = await startGameWithQuestionSet(startParams);
+    assert.equal(db.sqlite.prepare("SELECT COUNT(*) count FROM game_sessions WHERE id=?").get(startParams.startRequestId).count, 1);
+    assert.deepEqual(
+      retried.__authorityVNextBootstrap.questions.map((question) => question.id),
+      firstQuestions.map((question) => question.id),
+    );
+  });
+});
+
+test("room question-count start validation rejects stale settings without creating a game", async () => {
+  const db = new DatabaseAdapter();
+  applyMigrations(db.sqlite);
+  await runWithGameDatabase(db, async () => {
+    const room = await createRoom("stale-count-host", "Stale Count Host");
+    await selectPresenterForRound(room.id!, "stale-count-host", "stale-count-host");
+    const questionSet = await createUploadedQuestionSet({
+      roomId: room.id!,
+      presenterPlayerId: "stale-count-host",
+      title: "Small Set",
+      imageUrls: ["https://example.com/one.webp", "https://example.com/two.webp"],
+    });
+    await prepareQuestionSetForStart({ roomId: room.id!, presenterPlayerId: "stale-count-host", questionSetId: questionSet.id });
+    await assert.rejects(
+      startGameWithQuestionSet({
+        startRequestId: "invalid-count-start-01",
+        roomId: room.id!,
+        hostPlayerId: "stale-count-host",
+        presenterPlayerId: "stale-count-host",
+        questionSetId: questionSet.id,
+        questionCount: 0,
+        authorityVersion: 2,
+      }),
+      (error: unknown) => error instanceof StartGameRejectedError && /本局题数必须是 1 到 30/.test(error.message),
+    );
+    await assert.rejects(
+      startGameWithQuestionSet({
+        startRequestId: "stale-count-start-01",
+        roomId: room.id!,
+        hostPlayerId: "stale-count-host",
+        presenterPlayerId: "stale-count-host",
+        questionSetId: questionSet.id,
+        questionCount: 3,
+        authorityVersion: 2,
+      }),
+      (error: unknown) => error instanceof StartGameRejectedError && /只有 2 道题/.test(error.message),
+    );
+    assert.equal(db.sqlite.prepare("SELECT COUNT(*) count FROM game_sessions").get().count, 0);
+    assert.deepEqual({ ...db.sqlite.prepare("SELECT game_status,prepared_question_set_id FROM rooms WHERE id=?").get(room.id) }, {
+      game_status: "QUESTION_SETUP",
+      prepared_question_set_id: questionSet.id,
+    });
   });
 });
 
