@@ -646,10 +646,10 @@ export default function QuestionSetAdminPage() {
                           <p className="mt-1 text-xs leading-5 text-slate-500">可逐题查询、编辑答案和 Bangumi 标签、替换截图、调整顺序、新增或删除。图片使用 no-referrer，管理密钥不会发送到图片源站。</p>
                         </div>
                         <div className="flex items-center gap-3">
-                          <span className="text-xs text-slate-500">共 {detail.questions.length} / 30 题</span>
+                          <span className="text-xs text-slate-500">共 {detail.questions.length} 题</span>
                           <Button
                             className="h-10 px-3"
-                            disabled={!detail.canEditQuestions || detail.questions.length >= 30 || isBusy || isDirty || showAddQuestion || editingQuestionId !== null}
+                            disabled={!detail.canEditQuestions || isBusy || isDirty || showAddQuestion || editingQuestionId !== null}
                             type="button"
                             onClick={() => {
                               setEditingQuestionId(null);

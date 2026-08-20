@@ -687,7 +687,7 @@ test("same-title append retries a lost manifest revision CAS without duplicating
   assert.equal(counts.submissions, 2);
 });
 
-test("same-title append rejects a submission that would exceed the 30-question set limit", async () => {
+test("same-title append accumulates beyond 30 while a single submission stays capped at 30", async () => {
   const { db, env, objects } = createTestEnv();
   const makeStoredKey = (index: number) => {
     const key = `question-images/community/2026/08/20/00000000-0000-4000-8000-${String(index).padStart(12, "0")}-screenshot.png`;
@@ -698,10 +698,9 @@ test("same-title append rejects a submission that would exceed the 30-question s
     return key;
   };
   const initialKeys = Array.from({ length: 29 }, (_, index) => makeStoredKey(index));
-  const overflowKeys = [makeStoredKey(29), makeStoredKey(30)];
   const createdResponse = await worker.fetch(finalizeRequest({
     submissionId: "capacity-initial-submission",
-    title: "容量边界题库",
+    title: "无上限累计题库",
     playerId: "test-player",
     nickname: "测试者",
     questions: initialKeys.map((r2Key, index) => ({ r2Key, labelText: `答案 ${index + 1}` })),
@@ -709,21 +708,66 @@ test("same-title append rejects a submission that would exceed the 30-question s
   assert.equal(createdResponse.status, 200, await createdResponse.clone().text());
   const created = await createdResponse.json() as { id: string };
 
+  // 已满 30 题的题库仍可继续追加：29 + 2 = 31 > 30
+  const appendedResponse = await worker.fetch(finalizeRequest({
+    submissionId: "capacity-append-submission",
+    title: "无上限累计题库",
+    playerId: "test-player",
+    nickname: "测试者",
+    questions: [makeStoredKey(29), makeStoredKey(30)].map((r2Key, index) => ({ r2Key, labelText: `追加 ${index + 1}` })),
+  }), env);
+  assert.equal(appendedResponse.status, 200, await appendedResponse.clone().text());
+  const appended = await appendedResponse.json() as { id: string; imageCount: number; appended: boolean; addedImageCount: number };
+  assert.equal(appended.id, created.id);
+  assert.equal(appended.imageCount, 31);
+  assert.equal(appended.appended, true);
+  assert.equal(appended.addedImageCount, 2);
+
+  const row = db.sqlite.prepare("SELECT id,image_count,manifest_revision,manifest_version,manifest_json FROM question_sets WHERE id=?")
+    .get(created.id) as { id: string; image_count: number; manifest_revision: number; manifest_version: number; manifest_json: string };
+  assert.equal(row.image_count, 31);
+  assert.equal(row.manifest_revision, 1);
+  assert.equal(decodeQuestionSetManifest(row)?.length, 31);
+  const counts = db.sqlite.prepare(`SELECT
+    (SELECT COUNT(*) FROM question_image_index WHERE question_set_id=?) AS images,
+    (SELECT COUNT(*) FROM community_question_set_submissions WHERE question_set_id=?) AS submissions
+  `).get(created.id, created.id) as { images: number; submissions: number };
+  assert.equal(counts.images, 31);
+  assert.equal(counts.submissions, 2);
+  const ranges = db.sqlite.prepare(`SELECT start_order_index,added_image_count FROM community_question_set_submissions
+    WHERE question_set_id=? ORDER BY start_order_index`).all(created.id) as Array<{ start_order_index: number; added_image_count: number }>;
+  assert.deepEqual(ranges.map((range) => ({ ...range })), [
+    { start_order_index: 0, added_image_count: 29 },
+    { start_order_index: 29, added_image_count: 2 },
+  ]);
+
+  // 单次投稿仍最多 30 张：31 题之上一次投 31 张被拒绝（30 张以内仍可继续追加）
+  const overflowKeys = Array.from({ length: 31 }, (_, index) => makeStoredKey(31 + index));
   const overflowResponse = await worker.fetch(finalizeRequest({
     submissionId: "capacity-overflow-submission",
-    title: "容量边界题库",
+    title: "无上限累计题库",
     playerId: "test-player",
     nickname: "测试者",
     questions: overflowKeys.map((r2Key, index) => ({ r2Key, labelText: `溢出 ${index + 1}` })),
   }), env);
-  assert.equal(overflowResponse.status, 409);
-  assert.match(JSON.stringify(await overflowResponse.json()), /已有 29 道题.*超过 30 道上限/);
-  const questionSet = db.sqlite.prepare("SELECT image_count,manifest_revision FROM question_sets WHERE id=?")
-    .get(created.id) as { image_count: number; manifest_revision: number };
-  assert.deepEqual({ ...questionSet }, { image_count: 29, manifest_revision: 0 });
-  const overflowSubmission = db.sqlite.prepare("SELECT submission_id FROM community_question_set_submissions WHERE submission_id=?")
-    .get("capacity-overflow-submission");
-  assert.equal(overflowSubmission, undefined);
+  assert.equal(overflowResponse.status, 400);
+  assert.match(JSON.stringify(await overflowResponse.json()), /1 到 30 张截图/);
+  const afterOverflow = db.sqlite.prepare("SELECT image_count FROM question_sets WHERE id=?")
+    .get(created.id) as { image_count: number };
+  assert.equal(afterOverflow.image_count, 31);
+
+  // 31 题之上再追加 5 张 → 36 题
+  const fiveMoreResponse = await worker.fetch(finalizeRequest({
+    submissionId: "capacity-five-more-submission",
+    title: "无上限累计题库",
+    playerId: "test-player",
+    nickname: "测试者",
+    questions: Array.from({ length: 5 }, (_, index) => ({ r2Key: makeStoredKey(61 + index), labelText: `继续 ${index + 1}` })),
+  }), env);
+  assert.equal(fiveMoreResponse.status, 200, await fiveMoreResponse.clone().text());
+  const fiveMore = await fiveMoreResponse.json() as { imageCount: number; appended: boolean };
+  assert.equal(fiveMore.imageCount, 36);
+  assert.equal(fiveMore.appended, true);
 });
 
 test("question-set finalization rejects key tampering, duplicate objects, and unvalidated metadata", async () => {
@@ -1713,7 +1757,7 @@ test("question-set admin order-only PATCH reuses stored answer and tags without 
   assert.equal(bangumiUpstreamRequestCount, before + 1);
 });
 
-test("question-set admin enforces the 30-question ceiling when adding questions", async () => {
+test("question-set admin can add questions beyond 30 one at a time", async () => {
   const { db, env } = createTestEnv();
   const manifest = encodeQuestionSetManifest(Array.from({ length: 30 }, (_, index) => ({
     id: `admin-30-question-${index}`,
@@ -1727,12 +1771,14 @@ test("question-set admin enforces the 30-question ceiling when adding questions"
   db.sqlite.prepare(`INSERT INTO question_sets
     (id,title,created_by_player_id,is_public,image_count,manifest_version,manifest_revision,manifest_json,created_at,updated_at)
     VALUES (?,?,?,?,?,?,?,?,?,?)`)
-    .run("admin-30-set", "30 题上限题库", "thirty-owner", 0, 30, 1, 0, manifest, "2026-02-01T00:00:00.000Z", "2026-02-01T00:00:00.000Z");
+    .run("admin-30-set", "30 题后仍可新增题库", "thirty-owner", 0, 30, 1, 0, manifest, "2026-02-01T00:00:00.000Z", "2026-02-01T00:00:00.000Z");
   const uploadResponse = await worker.fetch(uploadRequest(ONE_PIXEL_PNG), env);
   const uploaded = await uploadResponse.json() as { key: string };
   const detailResponse = await worker.fetch(questionSetAdminRequest("/api/admin/question-sets/admin-30-set"), env);
-  const detail = await detailResponse.json() as { updatedAt: string; canEditQuestions: boolean };
+  const detail = await detailResponse.json() as { updatedAt: string; canEditQuestions: boolean; questions: Array<{ id: string }> };
   assert.equal(detail.canEditQuestions, true);
+  assert.equal(detail.questions.length, 30);
+
   const addResponse = await worker.fetch(questionSetAdminRequest(
     "/api/admin/question-sets/admin-30-set/questions",
     {
@@ -1740,19 +1786,37 @@ test("question-set admin enforces the 30-question ceiling when adding questions"
       body: { r2Key: uploaded.key, answerText: "第 31 题", animeTags: [], characterTags: [], expectedUpdatedAt: detail.updatedAt },
     },
   ), env);
-  assert.equal(addResponse.status, 409);
-  assert.match(JSON.stringify(await addResponse.json()), /30 题上限/);
-  const count = db.sqlite.prepare("SELECT image_count FROM question_sets WHERE id='admin-30-set'").get() as { image_count: number };
-  assert.equal(count.image_count, 30);
+  assert.equal(addResponse.status, 200, await addResponse.clone().text());
+  const added = await addResponse.json() as { questionSet: { imageCount: number; questions: Array<{ id: string }>; updatedAt: string } };
+  assert.equal(added.questionSet.imageCount, 31);
+  assert.equal(added.questionSet.questions.length, 31);
+  const count = db.sqlite.prepare("SELECT image_count,manifest_revision FROM question_sets WHERE id='admin-30-set'").get() as { image_count: number; manifest_revision: number };
+  assert.deepEqual({ ...count }, { image_count: 31, manifest_revision: 1 });
+  const indexCount = db.sqlite.prepare("SELECT COUNT(*) AS count FROM question_image_index WHERE question_set_id='admin-30-set'").get() as { count: number };
+  assert.equal(indexCount.count, 31);
+
+  // 再新增第 32 题仍然允许（每次只新增 1 题）
+  const secondUploadResponse = await worker.fetch(uploadRequest(ONE_PIXEL_WEBP), env);
+  const secondUploaded = await secondUploadResponse.json() as { key: string };
+  const secondAddResponse = await worker.fetch(questionSetAdminRequest(
+    "/api/admin/question-sets/admin-30-set/questions",
+    {
+      method: "POST",
+      body: { r2Key: secondUploaded.key, answerText: "第 32 题", animeTags: [], characterTags: [], expectedUpdatedAt: added.questionSet.updatedAt },
+    },
+  ), env);
+  assert.equal(secondAddResponse.status, 200, await secondAddResponse.clone().text());
+  const secondAdded = await secondAddResponse.json() as { questionSet: { imageCount: number } };
+  assert.equal(secondAdded.questionSet.imageCount, 32);
 });
 
-test("question-set admin refuses unsafe deletion of an oversized legacy question shape", async () => {
+test("question-set admin refuses unsafe deletion of a legacy question shape with inconsistent order", async () => {
   const { db, env } = createTestEnv();
   const updatedAt = "2026-02-01T00:00:00.000Z";
   db.sqlite.prepare(`INSERT INTO question_sets
     (id,title,created_by_player_id,is_public,image_count,created_at,updated_at)
     VALUES (?,?,?,?,?,?,?)`)
-    .run("admin-legacy-31-set", "异常 31 题 legacy", "legacy-owner", 0, 31, updatedAt, updatedAt);
+    .run("admin-legacy-31-set", "顺序异常的 31 题 legacy", "legacy-owner", 0, 31, updatedAt, updatedAt);
   const insertQuestion = db.sqlite.prepare(`INSERT INTO questions
     (id,question_set_id,image_url,order_index,label_text,created_at) VALUES (?,?,?,?,?,?)`);
   for (let index = 0; index < 31; index += 1) {
@@ -1765,6 +1829,9 @@ test("question-set admin refuses unsafe deletion of an oversized legacy question
       updatedAt,
     );
   }
+  // 超过 30 题的题库本身是合法形状（社区集合可累计超过 30 题），但顺序不连续
+  // （0..30 之后直接跳到 32）仍然属于无法安全管理的异常形状。
+  db.sqlite.prepare("UPDATE questions SET order_index=32 WHERE id='legacy-31-question-30'").run();
 
   const detailResponse = await worker.fetch(questionSetAdminRequest("/api/admin/question-sets/admin-legacy-31-set"), env);
   assert.equal(detailResponse.status, 200);
@@ -1923,6 +1990,168 @@ test("D1 0030 structure-edit migration upgrades the production schema transactio
     /CHECK constraint failed/,
   );
   sqlite.prepare("UPDATE question_sets SET community_structure_edited=1 WHERE id='migration-0030-set'").run();
+});
+
+test("D1 0031 relaxes community collection storage caps transactionally", () => {
+  const sqlite = new DatabaseSync(":memory:");
+  applyMigrations(sqlite, "0030");
+  const migration = readFileSync(resolve(
+    import.meta.dirname,
+    "..",
+    "d1",
+    "migrations",
+    "0031_relax_community_set_storage_cap.sql",
+  ), "utf8");
+  sqlite.prepare(`INSERT INTO question_sets
+    (id,title,created_by_player_id,is_public,image_count,community_submission_id,community_collection_title,created_at,updated_at)
+    VALUES (?,?,?,?,?,?,?,?,?)`)
+    .run(
+      "migration-0031-set",
+      "迁移前 31 题社区题库",
+      "migration-owner",
+      1,
+      3,
+      "migration-0031-submission-000000",
+      "迁移前 31 题社区题库",
+      "2026-02-01T00:00:00.000Z",
+      "2026-02-01T00:00:00.000Z",
+    );
+  const insertIndex = sqlite.prepare(`INSERT INTO question_image_index
+    (question_id,question_set_id,image_url,answer_text,order_index,created_at) VALUES (?,?,?,?,?,?)`);
+  for (let index = 0; index < 3; index += 1) {
+    insertIndex.run(`migration-0031-image-${index}`, "migration-0031-set", `https://example.com/${index}.webp`, `答案 ${index + 1}`, index, "2026-02-01T00:00:00.000Z");
+  }
+  sqlite.prepare(`INSERT INTO community_question_set_submissions
+    (submission_id,submission_fingerprint,question_set_id,start_order_index,added_image_count,created_at)
+    VALUES (?,?,?,?,?,?)`)
+    .run(
+      "migration-0031-submission-000000",
+      "0000000000000000000000000000000000000000000000000000000000000000",
+      "migration-0031-set",
+      0,
+      3,
+      "2026-02-01T00:00:00.000Z",
+    );
+
+  // 旧 schema 的累计 30 上限仍生效：order_index >= 30 与 start_order_index >= 30 被 CHECK 拒绝。
+  assert.throws(
+    () => insertIndex.run("migration-0031-old-order-30", "migration-0031-set", "https://example.com/30.webp", "越界题", 30, "2026-02-01T00:00:00.000Z"),
+    /CHECK constraint failed/,
+  );
+  assert.throws(
+    () => sqlite.prepare(`INSERT INTO community_question_set_submissions
+      (submission_id,submission_fingerprint,question_set_id,start_order_index,added_image_count,created_at)
+      VALUES (?,?,?,?,?,?)`)
+      .run(
+        "migration-0031-old-overflow-submission",
+        "1111111111111111111111111111111111111111111111111111111111111111",
+        "migration-0031-set",
+        30,
+        1,
+        "2026-02-01T00:00:00.000Z",
+      ),
+    /CHECK constraint failed/,
+  );
+
+  // 失败回滚后旧表原样保留，越界写入仍被拒绝。
+  sqlite.exec("BEGIN IMMEDIATE");
+  try {
+    sqlite.exec(migration);
+    throw new Error("injected migration failure");
+  } catch {
+    sqlite.exec("ROLLBACK");
+  }
+  const tempTableCount = sqlite.prepare(`SELECT COUNT(*) AS count FROM sqlite_master
+    WHERE type='table' AND name LIKE 'question_image_index_v2%' OR type='table' AND name LIKE 'community_question_set_submissions_v2%'`)
+    .get() as { count: number };
+  assert.equal(tempTableCount.count, 0);
+  assert.equal(sqlite.prepare("SELECT COUNT(*) AS count FROM question_image_index").get().count, 3);
+  assert.throws(() => insertIndex.run("migration-0031-still-blocked", "migration-0031-set", "https://example.com/31.webp", "仍越界", 31, "2026-02-01T00:00:00.000Z"), /CHECK constraint failed/);
+
+  // 正式应用：数据原样保留，约束被放宽。
+  sqlite.exec(migration);
+  assert.equal(sqlite.prepare("SELECT COUNT(*) AS count FROM question_image_index").get().count, 3);
+  assert.equal(sqlite.prepare("SELECT COUNT(*) AS count FROM community_question_set_submissions").get().count, 1);
+  const preserved = sqlite.prepare(`SELECT image_url,answer_text,order_index FROM question_image_index
+    WHERE question_id='migration-0031-image-0'`).get() as { image_url: string; answer_text: string; order_index: number };
+  assert.deepEqual({ ...preserved }, { image_url: "https://example.com/0.webp", answer_text: "答案 1", order_index: 0 });
+
+  // 越界顺序现在可写：累计 31 题（order_index 30）、追加范围超过 30。
+  insertIndex.run("migration-0031-order-30", "migration-0031-set", "https://example.com/30.webp", "第 31 题", 30, "2026-02-01T00:00:00.000Z");
+  const insertSubmission = sqlite.prepare(`INSERT INTO community_question_set_submissions
+    (submission_id,submission_fingerprint,question_set_id,start_order_index,added_image_count,created_at)
+    VALUES (?,?,?,?,?,?)`);
+  insertSubmission.run(
+    "migration-0031-overflow-submission",
+    "2222222222222222222222222222222222222222222222222222222222222222",
+    "migration-0031-set",
+    30,
+    1,
+    "2026-02-01T00:00:00.000Z",
+  );
+  insertSubmission.run(
+    "migration-0031-later-submission",
+    "3333333333333333333333333333333333333333333333333333333333333333",
+    "migration-0031-set",
+    31,
+    2,
+    "2026-02-01T00:00:00.000Z",
+  );
+  insertSubmission.run(
+    "migration-0031-full-batch-submission",
+    "4444444444444444444444444444444444444444444444444444444444444444",
+    "migration-0031-set",
+    33,
+    30,
+    "2026-02-01T00:00:00.000Z",
+  );
+
+  // 单次投稿上限与格式约束仍然保留。
+  assert.throws(() => insertSubmission.run(
+    "migration-0031-too-many-added",
+    "5555555555555555555555555555555555555555555555555555555555555555",
+    "migration-0031-set",
+    63,
+    31,
+    "2026-02-01T00:00:00.000Z",
+  ), /CHECK constraint failed/);
+  assert.throws(() => insertSubmission.run(
+    "migration-0031-zero-added",
+    "6666666666666666666666666666666666666666666666666666666666666666",
+    "migration-0031-set",
+    63,
+    0,
+    "2026-02-01T00:00:00.000Z",
+  ), /CHECK constraint failed/);
+  assert.throws(() => insertSubmission.run(
+    "migration-0031-negative-start",
+    "7777777777777777777777777777777777777777777777777777777777777777",
+    "migration-0031-set",
+    -1,
+    1,
+    "2026-02-01T00:00:00.000Z",
+  ), /CHECK constraint failed/);
+  // 同题库同起始顺序仍然唯一，图片索引的 (question_set_id, order_index) 也仍唯一。
+  assert.throws(() => insertSubmission.run(
+    "migration-0031-duplicate-range",
+    "8888888888888888888888888888888888888888888888888888888888888888",
+    "migration-0031-set",
+    30,
+    1,
+    "2026-02-01T00:00:00.000Z",
+  ), /UNIQUE constraint failed/);
+  assert.throws(() => insertIndex.run("migration-0031-duplicate-order", "migration-0031-set", "https://example.com/32.webp", "重复顺序", 30, "2026-02-01T00:00:00.000Z"), /UNIQUE constraint failed/);
+
+  // 重建后的索引与主键仍然存在。
+  const indexes = sqlite.prepare(`SELECT name FROM sqlite_master
+    WHERE type='index' AND name IN ('community_question_set_submissions_set_idx','question_image_index_anime_idx')`)
+    .all() as Array<{ name: string }>;
+  assert.deepEqual(indexes.map((item) => item.name).sort(), ["community_question_set_submissions_set_idx", "question_image_index_anime_idx"]);
+
+  // 重复执行迁移保持幂等（数据不丢失、不重复）。
+  sqlite.exec(migration);
+  assert.equal(sqlite.prepare("SELECT COUNT(*) AS count FROM question_image_index").get().count, 4);
+  assert.equal(sqlite.prepare("SELECT COUNT(*) AS count FROM community_question_set_submissions").get().count, 4);
 });
 
 test("D1 0029 admin integrity migration is transactional and idempotent", () => {

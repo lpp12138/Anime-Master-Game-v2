@@ -1,5 +1,4 @@
 import type { AdminQuestionSetSummary } from "./questionSetAdmin";
-import { COMMUNITY_SCREENSHOT_MAX_QUESTIONS } from "./communityScreenshotPolicy";
 
 /**
  * 社区截图投稿“追加到现有题库”的目标选项。
@@ -9,7 +8,8 @@ import { COMMUNITY_SCREENSHOT_MAX_QUESTIONS } from "./communityScreenshotPolicy"
  *   且未被管理员解除绑定）才会接收同标题追加；
  * - 追加要求题库公开、未被管理员人工改动结构（community_structure_edited = 0）、
  *   manifest 版本为当前版本；
- * - 追加后整套题库仍不得超过 30 题，因此已满 30 题的题库不再列出。
+ * - 整套题库不再受累计 30 题限制（可跨多次投稿继续增长），只有单次投稿最多
+ *   30 张，因此已有 30 题或更多题目的题库仍可继续选择追加。
  *
  * 这里只使用管理列表接口的公开摘要字段，不读取任何题目/答案数据。
  */
@@ -24,7 +24,6 @@ export type AppendableQuestionSetOption = {
 
 export function isAppendableCommunityQuestionSet(
   item: AdminQuestionSetSummary,
-  maxQuestions: number = COMMUNITY_SCREENSHOT_MAX_QUESTIONS,
 ): boolean {
   return Boolean(
     item.isCanonicalCollection
@@ -32,8 +31,7 @@ export function isAppendableCommunityQuestionSet(
     && !item.isStructureEdited
     && item.manifestVersion === COMMUNITY_APPEND_MANIFEST_VERSION
     && Number.isInteger(item.imageCount)
-    && item.imageCount >= 0
-    && item.imageCount < maxQuestions,
+    && item.imageCount >= 0,
   );
 }
 
@@ -44,14 +42,13 @@ export function isAppendableCommunityQuestionSet(
  */
 export function toAppendableQuestionSetOptions(
   items: readonly AdminQuestionSetSummary[],
-  maxQuestions: number = COMMUNITY_SCREENSHOT_MAX_QUESTIONS,
 ): AppendableQuestionSetOption[] {
   const seenTitles = new Set<string>();
   const options: AppendableQuestionSetOption[] = [];
   for (const item of items) {
     const title = item.title.trim();
     if (!title || seenTitles.has(title)) continue;
-    if (!isAppendableCommunityQuestionSet(item, maxQuestions)) continue;
+    if (!isAppendableCommunityQuestionSet(item)) continue;
     seenTitles.add(title);
     options.push({
       id: item.id,
@@ -74,4 +71,12 @@ export function findAppendableQuestionSetByTitle(
   const exactTitle = title.trim();
   if (!exactTitle) return null;
   return options.find((option) => option.title === exactTitle) ?? null;
+}
+
+/** Prefer the requested exact title, then the first available collection. */
+export function getDefaultAppendableQuestionSetId(
+  options: readonly AppendableQuestionSetOption[],
+  preferredTitle: string,
+): string {
+  return findAppendableQuestionSetByTitle(options, preferredTitle)?.id ?? options[0]?.id ?? "";
 }

@@ -255,7 +255,7 @@ function requireQuestionCount(value: unknown) {
 }
 
 function requireStartQuestionCount(value: unknown, availableQuestionCount: number) {
-  if (value == null) return availableQuestionCount;
+  if (value == null) return Math.min(availableQuestionCount, MAX_QUESTION_SET_QUESTIONS);
   if (typeof value !== "number" || !Number.isInteger(value) || value < 1 || value > MAX_QUESTION_SET_QUESTIONS) {
     rejectStartGame(`开始游戏失败：本局题数必须是 1 到 ${MAX_QUESTION_SET_QUESTIONS} 之间的整数，或选择全部题目。`);
   }
@@ -2657,13 +2657,6 @@ export class HomepageCommunityQuestionSetConflictError extends Error {
   }
 }
 
-export class HomepageCommunityQuestionSetCapacityError extends Error {
-  constructor(title: string, currentCount: number, addedCount: number) {
-    super(`同名题库“${title}”已有 ${currentCount} 道题，本次追加 ${addedCount} 道会超过 ${MAX_QUESTION_SET_QUESTIONS} 道上限。`);
-    this.name = "HomepageCommunityQuestionSetCapacityError";
-  }
-}
-
 type CommunityQuestionSetSubmissionRow = {
   submission_id: string;
   submission_fingerprint: string;
@@ -2830,9 +2823,6 @@ async function appendHomepageCommunityQuestions(params: {
 }) {
   const existingQuestions = getAppendableHomepageQuestions(params.questionSet, params.title);
   const startOrderIndex = existingQuestions.length;
-  if (startOrderIndex + params.questionItems.length > MAX_QUESTION_SET_QUESTIONS) {
-    throw new HomepageCommunityQuestionSetCapacityError(params.title, startOrderIndex, params.questionItems.length);
-  }
   const revision = params.questionSet.manifest_revision;
   if (!Number.isInteger(revision) || (revision ?? -1) < 0 || typeof params.questionSet.manifest_json !== "string") {
     throw new HomepageCommunityQuestionSetPersistenceError("同名题库 manifest 修订号无效。");
@@ -2971,7 +2961,7 @@ export async function createHomepageCommunityQuestionSet(params: {
   }
   if (!Array.isArray(params.questions) || params.questions.length === 0) throw new Error("请至少上传一张截图。");
   if (params.questions.length > MAX_QUESTION_SET_QUESTIONS) {
-    throw new Error(`单个题库最多包含 ${MAX_QUESTION_SET_QUESTIONS} 道题。`);
+    throw new Error(`单次投稿最多包含 ${MAX_QUESTION_SET_QUESTIONS} 道题。`);
   }
   if (params.questions.some((question) => !question.labelText?.trim())) {
     throw new Error("每张截图都必须填写正确答案。");
@@ -3299,9 +3289,6 @@ export async function prepareQuestionSetForStart(params: {
   if (!questionSet || questionSet.image_count <= 0) {
     throw new Error("题库不存在，或题库中没有图片。");
   }
-  if (questionSet.image_count > MAX_QUESTION_SET_QUESTIONS) {
-    throw new Error(`单个题库最多包含 ${MAX_QUESTION_SET_QUESTIONS} 道题，请删减后再开始。`);
-  }
 
   if (questionSet.created_by_player_id !== params.presenterPlayerId && !questionSet.is_public) {
     throw new Error("不能使用他人的未公开题库。");
@@ -3317,7 +3304,8 @@ export async function prepareQuestionSetForStart(params: {
     .from("rooms")
     .update({
       prepared_question_set_id: params.questionSetId,
-      prepared_question_count: questionSet.image_count,
+      // 社区题库可累计超过 30 题；每局仍最多 30 题，这里只记录本局上限。
+      prepared_question_count: Math.min(questionSet.image_count, MAX_QUESTION_SET_QUESTIONS),
       lobby_question_count: null,
       prepared_question_source: preparedQuestionSource,
       public_activity_at: new Date().toISOString(),
@@ -3673,9 +3661,6 @@ export async function startGameWithQuestionSet(params: {
 
   if (!questionSet || questionSet.image_count <= 0) {
     rejectStartGame("开始游戏失败：题库不存在，或题库中没有图片。");
-  }
-  if (questionSet.image_count > MAX_QUESTION_SET_QUESTIONS) {
-    rejectStartGame(`开始游戏失败：单个题库最多包含 ${MAX_QUESTION_SET_QUESTIONS} 道题。`);
   }
 
   if (questionSet.created_by_player_id !== params.presenterPlayerId && !questionSet.is_public) {

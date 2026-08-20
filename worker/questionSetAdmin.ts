@@ -7,7 +7,7 @@ import type {
   QuestionSetCreationMethod,
   QuestionSetSource,
 } from "../src/types/game";
-import { decodeQuestionSetManifest, encodeDbQuestionSetManifest } from "./questionSetManifest";
+import { decodeQuestionSetManifest, encodeDbQuestionSetManifest, QUESTION_SET_MANIFEST_MAX_QUESTIONS } from "./questionSetManifest";
 
 const ADMIN_QUESTION_SET_PAGE_SIZE = 20;
 const ADMIN_QUESTION_SET_MAX_PAGE_SIZE = 50;
@@ -267,7 +267,7 @@ async function getLegacyQuestions(db: D1Database, questionSetId: string) {
     FROM questions
     WHERE question_set_id = ?
     ORDER BY order_index ASC, id ASC
-    LIMIT 31
+    LIMIT ${QUESTION_SET_MANIFEST_MAX_QUESTIONS + 1}
   `).bind(questionSetId).all<DbQuestion>();
   return result.results ?? [];
 }
@@ -279,7 +279,7 @@ async function getIndexedQuestions(db: D1Database, questionSetId: string) {
     FROM question_image_index
     WHERE question_set_id = ?
     ORDER BY order_index ASC, question_id ASC
-    LIMIT 31
+    LIMIT ${QUESTION_SET_MANIFEST_MAX_QUESTIONS + 1}
   `).bind(questionSetId).all<AdminQuestionIndexDbRow>();
   return result.results ?? [];
 }
@@ -372,7 +372,8 @@ export async function getAdminQuestionSetDetail(db: D1Database, questionSetId: s
   }
 
   const summary = toSummary(row);
-  const hasQuestionShapeIssue = sourceQuestions.length > 30
+  // 社区题库可累计超过 30 题，因此这里的“形状异常”只以存储安全上限为界。
+  const hasQuestionShapeIssue = sourceQuestions.length > QUESTION_SET_MANIFEST_MAX_QUESTIONS
     || sourceQuestions.length !== asCount(row.image_count)
     || sourceQuestions.some((question, index) => question.order_index !== index);
   const hasUnwritableImageUrl = sourceQuestions.some(
@@ -580,7 +581,7 @@ async function loadAdminQuestionMutationState(
     }
   }
   if (
-    questions.length > 30
+    questions.length > QUESTION_SET_MANIFEST_MAX_QUESTIONS
     || questions.length !== asCount(row.image_count)
     || questions.some((question, index) => question.order_index !== index)
   ) {
@@ -802,7 +803,11 @@ export async function createAdminQuestionSetQuestion(
   assertQuestionSetId(questionSetId);
   const expectedUpdatedAt = normalizeExpectedUpdatedAt(input.expectedUpdatedAt);
   const state = await loadAdminQuestionMutationState(db, questionSetId, expectedUpdatedAt);
-  if (state.questions.length >= 30) throw new QuestionSetAdminError("题库已达到 30 题上限。", 409);
+  // 逐题新增不受 30 题限制（社区题库可累计超过 30 题），但仍受 manifest 存储
+  // 安全上限约束；每次新增只允许 1 题。
+  if (state.questions.length >= QUESTION_SET_MANIFEST_MAX_QUESTIONS) {
+    throw new QuestionSetAdminError(`题库已达到 ${QUESTION_SET_MANIFEST_MAX_QUESTIONS} 题存储上限。`, 409);
+  }
   const answerText = normalizeAdminAnswer(input.answerText ?? "");
   const imageUrl = normalizeAdminImageUrl(input.imageUrl ?? "");
   if (state.questions.some((question) => question.image_url === imageUrl)) {
@@ -948,7 +953,7 @@ export async function deleteAdminQuestionSet(
     throw new QuestionSetAdminError("题库 manifest 已损坏；为避免遗留无法追踪的图片，修复前不能删除。", 409);
   }
   if (!detail.canDelete) {
-    const hasUnsafeShape = detail.questions.length > 30
+    const hasUnsafeShape = detail.questions.length > QUESTION_SET_MANIFEST_MAX_QUESTIONS
       || detail.questions.length !== detail.imageCount
       || detail.questions.some((question, index) => question.orderIndex !== index);
     if (hasUnsafeShape) {

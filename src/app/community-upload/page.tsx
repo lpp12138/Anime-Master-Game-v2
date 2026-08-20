@@ -13,6 +13,7 @@ import {
 } from "@/lib/communityScreenshotUpload";
 import {
   findAppendableQuestionSetByTitle,
+  getDefaultAppendableQuestionSetId,
   toAppendableQuestionSetOptions,
   type AppendableQuestionSetOption,
 } from "@/lib/communityUploadTitleOptions";
@@ -90,18 +91,28 @@ export default function CommunityUploadPage() {
   const [isUploading, setIsUploading] = useState(false);
   const [isAutoTagging, setIsAutoTagging] = useState(false);
   const [isImportingQuestionList, setIsImportingQuestionList] = useState(false);
-  const isBusy = isUploading || isAutoTagging || isImportingQuestionList;
   const fileInputRef = useRef<HTMLInputElement>(null);
   const questionListInputRef = useRef<HTMLInputElement>(null);
   const uploadKeyInputRef = useRef<HTMLInputElement>(null);
   const editorRef = useRef<HTMLElement>(null);
   const dragDepthRef = useRef(0);
   const draftsRef = useRef<ScreenshotDraft[]>([]);
+  const userChoseTitleRef = useRef(false);
   const submissionRef = useRef<{ id: string; signature: string } | null>(null);
   const uploadedKeysRef = useRef(new Map<string, string>());
   const operationAbortRef = useRef<AbortController | null>(null);
   const existingSetsAbortRef = useRef<AbortController | null>(null);
   const existingSetsLoadedKeyRef = useRef("");
+  const isBusy = isUploading || isAutoTagging || isImportingQuestionList;
+  // 密钥只有在受保护列表接口成功返回后才算验证通过；为空、防抖/加载中或失败时
+  // 除密钥输入与返回导航外，上传/导入/编辑/提交/题库选择全部禁用。
+  const normalizedUploadKey = uploadKey.trim();
+  const isKeyVerified = existingSetsStatus === "ready"
+    && normalizedUploadKey !== ""
+    && existingSetsLoadedKeyRef.current === normalizedUploadKey;
+  const isLocked = !isKeyVerified || isBusy;
+  // 验证/重试按钮：密钥非空、不在加载中、不在业务操作中时允许点击（验证失败后仍可重试）。
+  const canVerifyKey = normalizedUploadKey !== "" && !isBusy && existingSetsStatus !== "loading";
   const selectedDraft = drafts.find((draft) => draft.id === selectedDraftId) ?? drafts[0] ?? null;
   const selectedExistingSet = existingSetOptions.find((option) => option.id === selectedExistingSetId) ?? null;
   const matchedExistingSet = findAppendableQuestionSetByTitle(existingSetOptions, newTitle);
@@ -133,6 +144,7 @@ export default function CommunityUploadPage() {
     if (!key) {
       existingSetsAbortRef.current?.abort();
       existingSetsLoadedKeyRef.current = "";
+      userChoseTitleRef.current = false;
       setExistingSetOptions([]);
       setSelectedExistingSetId("");
       setExistingSetsStatus("idle");
@@ -144,6 +156,7 @@ export default function CommunityUploadPage() {
     // 避免旧密钥的结果在防抖期间或快速改回原密钥后覆盖当前状态。
     existingSetsAbortRef.current?.abort();
     existingSetsLoadedKeyRef.current = "";
+    userChoseTitleRef.current = false;
     setExistingSetOptions([]);
     setSelectedExistingSetId("");
     setExistingSetsStatus("idle");
@@ -154,16 +167,21 @@ export default function CommunityUploadPage() {
     return () => window.clearTimeout(timer);
   }, [uploadKey]);
 
-  // 刷新后所选题库若已不可追加（被删除、改结构或已满 30 题），自动回到新建模式，保留自定义标题。
+  // 刷新后所选题库若已不可追加（被删除、改结构等），回到新建模式并保留自定义标题；
+  // 若用户从未主动选择，则重新应用默认选中逻辑。
   useEffect(() => {
-    if (selectedExistingSetId && !existingSetOptions.some((option) => option.id === selectedExistingSetId)) {
+    if (!selectedExistingSetId) return;
+    if (existingSetOptions.some((option) => option.id === selectedExistingSetId)) return;
+    if (!userChoseTitleRef.current) {
+      applyDefaultTitleSelection(existingSetOptions);
+    } else {
       setSelectedExistingSetId("");
     }
   }, [existingSetOptions, selectedExistingSetId]);
 
   useEffect(() => {
     const handleClipboardPaste = (event: ClipboardEvent) => {
-      if (isBusy) return;
+      if (isLocked) return;
       const target = event.target;
       const isEditable = target instanceof HTMLInputElement
         || target instanceof HTMLTextAreaElement
@@ -191,7 +209,7 @@ export default function CommunityUploadPage() {
     };
     window.addEventListener("paste", handleClipboardPaste);
     return () => window.removeEventListener("paste", handleClipboardPaste);
-  }, [isBusy]);
+  }, [isLocked]);
 
   useEffect(() => () => {
     operationAbortRef.current?.abort();
@@ -256,9 +274,27 @@ export default function CommunityUploadPage() {
         controller.signal,
       );
       if (controller.signal.aborted) return;
+      let items = page.items;
+      let options = toAppendableQuestionSetOptions(items);
+      // “猜猜群题库”即使不在最近更新的首 50 项中，也应能成为默认选项。
+      if (page.hasMore && !findAppendableQuestionSetByTitle(options, DEFAULT_QUESTION_SET_TITLE)) {
+        const preferredPage = await listAdminQuestionSets(
+          { search: DEFAULT_QUESTION_SET_TITLE, visibility: "public", source: "all", limit: 50, offset: 0 },
+          normalizedKey,
+          controller.signal,
+        );
+        if (controller.signal.aborted) return;
+        const knownIds = new Set(items.map((item) => item.id));
+        items = [...items, ...preferredPage.items.filter((item) => !knownIds.has(item.id))];
+        options = toAppendableQuestionSetOptions(items);
+      }
       existingSetsLoadedKeyRef.current = normalizedKey;
-      setExistingSetOptions(toAppendableQuestionSetOptions(page.items));
+      setExistingSetOptions(options);
       setExistingSetsStatus("ready");
+      // 密钥验证成功且用户尚未主动选择时应用默认选中：精确标题
+      // DEFAULT_QUESTION_SET_TITLE 优先，其次第一项现有可追加题库，
+      // 没有任何现有题库时才保持“新建题库”。用户主动选择后不再覆盖。
+      if (!userChoseTitleRef.current) applyDefaultTitleSelection(options);
     } catch (loadError) {
       if (controller.signal.aborted) return;
       existingSetsLoadedKeyRef.current = "";
@@ -267,6 +303,14 @@ export default function CommunityUploadPage() {
     } finally {
       if (existingSetsAbortRef.current === controller) existingSetsAbortRef.current = null;
     }
+  }
+
+  /**
+   * 默认选中逻辑：精确标题“猜猜群题库”优先；不存在时选第一项现有可追加题库；
+   * 没有任何现有题库时落到“新建题库”。
+   */
+  function applyDefaultTitleSelection(options: AppendableQuestionSetOption[]) {
+    setSelectedExistingSetId(getDefaultAppendableQuestionSetId(options, DEFAULT_QUESTION_SET_TITLE));
   }
 
   function focusEditorForDraft(id: string) {
@@ -336,14 +380,17 @@ export default function CommunityUploadPage() {
   }
 
   function handleDragEnter(event: ReactDragEvent<HTMLElement>) {
+    // 始终阻止默认行为（否则浏览器会直接打开被拖入的文件），
+    // 但未验证密钥时不进入可添加状态。
     event.preventDefault();
+    if (isLocked) return;
     dragDepthRef.current += 1;
     setIsDraggingImages(true);
   }
 
   function handleDragOver(event: ReactDragEvent<HTMLElement>) {
     event.preventDefault();
-    event.dataTransfer.dropEffect = "copy";
+    event.dataTransfer.dropEffect = isLocked ? "none" : "copy";
   }
 
   function handleDragLeave(event: ReactDragEvent<HTMLElement>) {
@@ -356,7 +403,7 @@ export default function CommunityUploadPage() {
     event.stopPropagation();
     dragDepthRef.current = 0;
     setIsDraggingImages(false);
-    if (isBusy) return;
+    if (isLocked) return;
     const files = Array.from(event.dataTransfer.files).filter((file) => file.type.startsWith("image/") || ACCEPTED_IMAGE_EXTENSION.test(file.name));
     if (files.length > 0) {
       addLocalFiles(files, "已拖放");
@@ -730,6 +777,7 @@ export default function CommunityUploadPage() {
       setUploadKey("");
       setNewTitle(DEFAULT_QUESTION_SET_TITLE);
       setSelectedExistingSetId("");
+      userChoseTitleRef.current = false;
       existingSetsLoadedKeyRef.current = "";
       setDescription("");
       setQuestionListText("");
@@ -774,14 +822,14 @@ export default function CommunityUploadPage() {
           <div className="flex flex-wrap items-center gap-2">
             <button
               className="rounded-full border border-slate-300 bg-white px-3 py-1.5 text-xs font-semibold text-slate-700 transition hover:border-slate-400 hover:text-slate-950 disabled:opacity-50"
-              disabled={isBusy}
+              disabled={isLocked}
               type="button"
               onClick={() => router.push("/question-set-admin")}
             >
               题库管理
             </button>
             <div className="rounded-full border border-sky-200 bg-sky-50 px-3 py-1.5 text-xs font-semibold text-sky-800">
-              1–30 张 · 自动压缩至 1080p
+              单次 1–30 张 · 自动压缩至 1080p
             </div>
           </div>
         </header>
@@ -820,6 +868,17 @@ export default function CommunityUploadPage() {
                   value={uploadKey}
                   onChange={(event) => setUploadKey(event.target.value)}
                 />
+                {!isKeyVerified ? (
+                  <span className="mt-1 block text-xs leading-5 text-slate-500" role="status">
+                    {existingSetsStatus === "loading"
+                      ? "正在验证密钥并加载现有题库…"
+                      : existingSetsStatus === "error"
+                        ? "密钥验证失败：上传、导入与编辑功能已禁用。"
+                        : "请输入上传密钥；验证通过前，上传、导入与编辑功能不可用。"}
+                  </span>
+                ) : (
+                  <span className="mt-1 block text-xs leading-5 text-emerald-700" role="status">密钥已通过验证，可开始上传。</span>
+                )}
               </label>
               <div className="space-y-2">
                 <span className="mb-1 block text-sm font-semibold text-slate-900">题库标题</span>
@@ -827,51 +886,63 @@ export default function CommunityUploadPage() {
                   <select
                     aria-label="题库标题：新建或选择现有题库"
                     className="h-11 min-w-0 flex-1 rounded-md border border-[var(--line)] bg-white px-3 text-sm outline-none transition focus:border-[var(--primary)] focus:ring-4 focus:ring-rose-100 disabled:bg-slate-100"
-                    disabled={isBusy}
+                    disabled={isLocked}
                     value={selectedExistingSetId}
-                    onChange={(event) => setSelectedExistingSetId(event.target.value)}
+                    onChange={(event) => {
+                      userChoseTitleRef.current = true;
+                      setSelectedExistingSetId(event.target.value);
+                    }}
                   >
-                    <option value="">＋ 新建题库（自定义标题）</option>
-                    {existingSetOptions.length > 0 ? (
-                      <optgroup label="追加到现有题库（精确标题）">
-                        {existingSetOptions.map((option) => (
-                          <option key={option.id} value={option.id}>
-                            {option.title}（{option.imageCount}/{COMMUNITY_SCREENSHOT_MAX_QUESTIONS} 题）
-                          </option>
-                        ))}
-                      </optgroup>
-                    ) : null}
+                    {isKeyVerified ? (
+                      <>
+                        <option value="">＋ 新建题库（自定义标题）</option>
+                        {existingSetOptions.length > 0 ? (
+                          <optgroup label="追加到现有题库（精确标题）">
+                            {existingSetOptions.map((option) => (
+                              <option key={option.id} value={option.id}>
+                                {option.title}（已有 {option.imageCount} 题）
+                              </option>
+                            ))}
+                          </optgroup>
+                        ) : null}
+                      </>
+                    ) : (
+                      <option value="">请先验证上传密钥</option>
+                    )}
                   </select>
                   <button
                     className="shrink-0 rounded-md border border-slate-300 bg-white px-2.5 text-xs font-semibold text-slate-600 transition hover:border-slate-400 hover:text-slate-950 disabled:opacity-50"
-                    disabled={isBusy || !uploadKey.trim() || existingSetsStatus === "loading"}
+                    disabled={!canVerifyKey}
                     type="button"
                     onClick={() => void loadAppendableQuestionSets(uploadKey)}
                   >
-                    {existingSetsStatus === "loading" ? "加载中…" : "刷新"}
+                    {existingSetsStatus === "loading" ? "加载中…" : isKeyVerified ? "刷新" : "验证"}
                   </button>
                 </div>
-                {selectedExistingSetId === "" ? (
+                {isKeyVerified && selectedExistingSetId === "" ? (
                   <>
                     <input
                       className="h-11 w-full rounded-md border border-[var(--line)] px-3 outline-none transition focus:border-[var(--primary)] focus:ring-4 focus:ring-rose-100 disabled:bg-slate-100"
-                      disabled={isBusy}
+                      disabled={isLocked}
                       maxLength={80}
                       placeholder="输入新题库的标题"
                       value={newTitle}
-                      onChange={(event) => setNewTitle(event.target.value)}
+                      onChange={(event) => {
+                        userChoseTitleRef.current = true;
+                        setNewTitle(event.target.value);
+                      }}
                     />
                     {existingSetsStatus === "ready" && matchedExistingSet ? (
                       <p className="text-xs leading-5 text-amber-700">
-                        标题与现有题库「{matchedExistingSet.title}」完全相同，本次提交会按顺序追加到该题库（当前 {matchedExistingSet.imageCount}/{COMMUNITY_SCREENSHOT_MAX_QUESTIONS} 题）；如需独立新题库，请更换标题。
+                        标题与现有题库「{matchedExistingSet.title}」完全相同，本次提交会按顺序追加到该题库（当前 {matchedExistingSet.imageCount} 题）；如需独立新题库，请更换标题。
                       </p>
                     ) : (
-                      <p className="text-xs leading-5 text-slate-500">新建独立题库；若标题与现有社区截图题库完全相同，本次图片会按顺序追加。整套题库仍最多 {COMMUNITY_SCREENSHOT_MAX_QUESTIONS} 题。</p>
+                      <p className="text-xs leading-5 text-slate-500">新建独立题库；若标题与现有社区截图题库完全相同，本次图片会按顺序追加到该题库（整套不再受累计 30 题限制，单次投稿最多 {COMMUNITY_SCREENSHOT_MAX_QUESTIONS} 张）。</p>
                     )}
                   </>
                 ) : selectedExistingSet ? (
                   <p className="rounded-md bg-sky-50 px-3 py-2 text-xs leading-5 text-slate-700">
-                    已选择「{selectedExistingSet.title}」：本次提交的截图会按顺序追加到该公开社区题库（当前 {selectedExistingSet.imageCount}/{COMMUNITY_SCREENSHOT_MAX_QUESTIONS} 题），提交标题使用题库的精确标题。
+                    已选择「{selectedExistingSet.title}」：本次提交的截图会按顺序追加到该公开社区题库（当前 {selectedExistingSet.imageCount} 题），提交标题使用题库的精确标题。
                   </p>
                 ) : null}
                 {existingSetsStatus === "loading" ? (
@@ -879,10 +950,10 @@ export default function CommunityUploadPage() {
                 ) : existingSetsStatus === "error" ? (
                   <p className="flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-rose-700" role="alert">
                     <span>现有题库加载失败：{existingSetsError}</span>
-                    <button className="underline disabled:opacity-50" disabled={isBusy} type="button" onClick={() => void loadAppendableQuestionSets(uploadKey)}>重试</button>
+                    <button className="underline disabled:opacity-50" disabled={!canVerifyKey} type="button" onClick={() => void loadAppendableQuestionSets(uploadKey)}>重试</button>
                   </p>
                 ) : existingSetsStatus === "ready" && existingSetOptions.length === 0 ? (
-                  <p className="text-xs text-slate-500">当前没有可继续追加的现有社区题库（需公开、未满 {COMMUNITY_SCREENSHOT_MAX_QUESTIONS} 题且未被人工改动）。</p>
+                  <p className="text-xs text-slate-500">当前没有可继续追加的现有社区题库（需公开且未被人工改动）。</p>
                 ) : uploadKey.trim() === "" && existingSetsStatus === "idle" ? (
                   <p className="text-xs text-slate-500">填写上传密钥后，可加载并选择可继续追加的现有社区题库。</p>
                 ) : null}
@@ -891,7 +962,7 @@ export default function CommunityUploadPage() {
                 <span className="mb-1 block text-sm font-semibold text-slate-900">上传者昵称</span>
                 <input
                   className="h-11 w-full rounded-md border border-[var(--line)] px-3 outline-none transition focus:border-[var(--primary)] focus:ring-4 focus:ring-rose-100 disabled:bg-slate-100"
-                  disabled={isBusy}
+                  disabled={isLocked}
                   maxLength={20}
                   placeholder="社区中显示的昵称"
                   value={uploaderNickname}
@@ -902,7 +973,7 @@ export default function CommunityUploadPage() {
                 <span className="mb-1 block text-sm font-semibold text-slate-900">题库说明（可选）</span>
                 <textarea
                   className="min-h-20 w-full resize-y rounded-md border border-[var(--line)] px-3 py-2 outline-none transition focus:border-[var(--primary)] focus:ring-4 focus:ring-rose-100 disabled:bg-slate-100"
-                  disabled={isBusy}
+                  disabled={isLocked}
                   maxLength={300}
                   placeholder="说明截图范围、难度或出处"
                   value={description}
@@ -919,11 +990,11 @@ export default function CommunityUploadPage() {
                   onDragOver={handleDragOver}
                   onDrop={handleImageDrop}
                 >
-                  <p className="text-sm font-semibold text-slate-800">{isDraggingImages ? "松开即可添加图片或链接" : "把截图拖到这里"}</p>
+                  <p className="text-sm font-semibold text-slate-800">{isDraggingImages ? "松开即可添加图片或链接" : isLocked ? "请先验证上传密钥" : "把截图拖到这里"}</p>
                   <p className="max-w-xl text-xs leading-5 text-slate-500">可一次拖入多张 JPEG、PNG、WebP、GIF、AVIF 图片，也可拖入 FanCaps / Bangumi 图片直链。</p>
                   <button
                     className="rounded-md bg-[var(--primary)] px-4 py-2 text-sm font-semibold text-white transition hover:opacity-90 disabled:opacity-50"
-                    disabled={isBusy}
+                    disabled={isLocked}
                     type="button"
                     onClick={() => fileInputRef.current?.click()}
                   >选择图片文件</button>
@@ -932,7 +1003,7 @@ export default function CommunityUploadPage() {
                     ref={fileInputRef}
                     accept="image/jpeg,image/png,image/webp,image/gif,image/avif"
                     className="hidden"
-                    disabled={isBusy}
+                    disabled={isLocked}
                     multiple
                     type="file"
                     onChange={handleFiles}
@@ -948,7 +1019,7 @@ export default function CommunityUploadPage() {
                   </div>
                   <button
                     className="shrink-0 rounded-md bg-sky-700 px-4 py-2 text-sm font-semibold text-white hover:bg-sky-800 disabled:opacity-50"
-                    disabled={isBusy || !imageUrlText.trim()}
+                    disabled={isLocked || !imageUrlText.trim()}
                     type="button"
                     onClick={() => void importImageLinks()}
                   >{isImportingQuestionList ? "正在导入…" : "导入截图链接"}</button>
@@ -956,7 +1027,7 @@ export default function CommunityUploadPage() {
                 <textarea
                   aria-label="截图图片直链，每行一个"
                   className="min-h-24 w-full resize-y break-all rounded-md border border-sky-200 bg-white px-3 py-2 font-mono text-xs leading-5 outline-none transition focus:border-[var(--primary)] focus:ring-4 focus:ring-rose-100 disabled:bg-slate-100"
-                  disabled={isBusy}
+                  disabled={isLocked}
                   placeholder={"https://cdni.fancaps.net/file/...jpg\nhttps://lain.bgm.tv/pic/cover/...jpg"}
                   value={imageUrlText}
                   onChange={(event) => {
@@ -966,7 +1037,7 @@ export default function CommunityUploadPage() {
                   }}
                 />
                 <p className="text-xs leading-5 text-slate-600">
-                  支持 FanCaps（cdni.fancaps.net 等）与 Bangumi（lain.bgm.tv）的 HTTPS 直链，最多 {COMMUNITY_SCREENSHOT_MAX_QUESTIONS} 个；`#` 开头的行为注释，已成功导入的图片在重试或提交时会复用服务器对象。
+                  支持 FanCaps（cdni.fancaps.net 等）与 Bangumi（lain.bgm.tv）的 HTTPS 直链，单次最多 {COMMUNITY_SCREENSHOT_MAX_QUESTIONS} 个；`#` 开头的行为注释，已成功导入的图片在重试或提交时会复用服务器对象。
                 </p>
               </section>
               <section className="space-y-3 rounded-xl border border-sky-200 bg-sky-50/60 p-4 md:col-span-2" aria-labelledby="question-list-import-title">
@@ -977,7 +1048,7 @@ export default function CommunityUploadPage() {
                   </div>
                   <button
                     className="shrink-0 rounded-md border border-sky-300 bg-white px-3 py-2 text-xs font-semibold text-sky-800 hover:bg-sky-100 disabled:opacity-50"
-                    disabled={isBusy}
+                    disabled={isLocked}
                     type="button"
                     onClick={() => questionListInputRef.current?.click()}
                   >选择题单文件</button>
@@ -985,7 +1056,7 @@ export default function CommunityUploadPage() {
                     ref={questionListInputRef}
                     accept=".json,.jsonl,.ndjson,application/json,application/x-ndjson,text/plain"
                     className="hidden"
-                    disabled={isBusy}
+                    disabled={isLocked}
                     type="file"
                     onChange={(event) => void handleQuestionListFile(event)}
                   />
@@ -993,7 +1064,7 @@ export default function CommunityUploadPage() {
                 <textarea
                   aria-label="出题工具 JSON 题单内容"
                   className="min-h-32 w-full resize-y rounded-md border border-sky-200 bg-white px-3 py-2 font-mono text-xs leading-5 outline-none transition focus:border-[var(--primary)] focus:ring-4 focus:ring-rose-100 disabled:bg-slate-100"
-                  disabled={isBusy}
+                  disabled={isLocked}
                   placeholder={'{"image_url":"https://cdni.fancaps.net/file/...jpg","label_text":"动画名"}'}
                   value={questionListText}
                   onChange={(event) => {
@@ -1008,11 +1079,11 @@ export default function CommunityUploadPage() {
                       ? questionListPreview.error
                       : questionListPreview.count > 0
                         ? `已识别 ${questionListPreview.count} 道题；空答案可在导入后逐题补充。`
-                        : "兼容截图工具复制或导出的 image_url / label_text 格式，最多 30 题。"}
+                        : "兼容截图工具复制或导出的 image_url / label_text 格式，单次最多 30 题。"}
                   </p>
                   <button
                     className="shrink-0 rounded-md bg-sky-700 px-4 py-2 text-sm font-semibold text-white hover:bg-sky-800 disabled:opacity-50"
-                    disabled={isBusy || !questionListText.trim() || Boolean(questionListPreview.error)}
+                    disabled={isLocked || !questionListText.trim() || Boolean(questionListPreview.error)}
                     type="button"
                     onClick={() => void importQuestionList()}
                   >{isImportingQuestionList ? "正在导入…" : "导入粘贴题单"}</button>
@@ -1052,7 +1123,7 @@ export default function CommunityUploadPage() {
                   </div>
                   <button
                     className="rounded-md border border-sky-300 bg-sky-50 px-3 py-2 text-xs font-semibold text-sky-800 hover:bg-sky-100 disabled:opacity-50"
-                    disabled={isBusy}
+                    disabled={isLocked}
                     type="button"
                     onClick={() => void autoMatchAnimeTags()}
                   >
@@ -1075,7 +1146,7 @@ export default function CommunityUploadPage() {
                           type="button"
                           aria-pressed={isSelected}
                           aria-label={`编辑第 ${index + 1} 张截图${hasAnswer ? `，答案 ${draft.labelText.trim()}` : "，尚未填写答案"}`}
-                          disabled={isBusy}
+                          disabled={isLocked}
                           onClick={() => focusEditorForDraft(draft.id)}
                         >
                           <img className="h-full w-full object-contain transition duration-200 group-hover:scale-[1.02]" src={draft.previewUrl} alt="" />
@@ -1109,7 +1180,7 @@ export default function CommunityUploadPage() {
                           <button
                             aria-label={`移除第 ${index + 1} 张截图：${draft.displayName}`}
                             className="shrink-0 text-xs font-semibold text-slate-500 hover:text-rose-700 disabled:opacity-50"
-                            disabled={isBusy}
+                            disabled={isLocked}
                             type="button"
                             onClick={() => removeDraft(draft.id)}
                           >移除</button>
@@ -1131,7 +1202,7 @@ export default function CommunityUploadPage() {
                       {selectedIndex > 0 ? (
                         <button
                           className="shrink-0 rounded-md border border-slate-200 px-2 py-1.5 text-[11px] font-semibold text-slate-600 hover:bg-slate-50 disabled:opacity-50"
-                          disabled={isBusy}
+                          disabled={isLocked}
                           type="button"
                           onClick={() => copyPreviousTags(selectedIndex)}
                         >复制上一张标签</button>
@@ -1142,7 +1213,7 @@ export default function CommunityUploadPage() {
                       answer={selectedDraft.labelText}
                       animeTag={selectedDraft.animeTags[0] ?? null}
                       characterTags={selectedDraft.characterTags}
-                      disabled={isBusy}
+                      disabled={isLocked}
                       uploadKey={uploadKey}
                       onAnswerChange={(answer) => updateLabel(selectedDraft.id, answer)}
                       onChange={(animeTag, characterTags) => updateTags(selectedDraft.id, animeTag, characterTags)}
@@ -1160,7 +1231,7 @@ export default function CommunityUploadPage() {
             <CommunityImageIndexPreview
               animeTags={drafts.flatMap((draft) => draft.animeTags)}
               characterTags={drafts.flatMap((draft) => draft.characterTags)}
-              disabled={isBusy}
+              disabled={isLocked}
               uploadKey={uploadKey}
             />
           ) : null}
@@ -1176,7 +1247,7 @@ export default function CommunityUploadPage() {
               {isBusy ? (
                 <Button type="button" variant="secondary" onClick={cancelCurrentOperation}>取消当前操作</Button>
               ) : null}
-              <Button disabled={isBusy || drafts.length === 0} type="submit">
+              <Button disabled={isLocked || drafts.length === 0} type="submit">
                 {isUploading
                   ? "正在上传…"
                   : isAutoTagging

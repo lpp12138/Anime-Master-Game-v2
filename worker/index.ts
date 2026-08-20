@@ -2657,7 +2657,7 @@ async function handleCommunityQuestionSetCreate(request: Request, env: Env, cach
     return json({ error: "题库请求参数无效。" }, { status: 400 }, request, env);
   }
   if (payload.questions.length === 0 || payload.questions.length > COMMUNITY_SCREENSHOT_MAX_QUESTIONS) {
-    return json({ error: `每个题库必须包含 1 到 ${COMMUNITY_SCREENSHOT_MAX_QUESTIONS} 张截图。` }, { status: 400 }, request, env);
+    return json({ error: `单次投稿必须包含 1 到 ${COMMUNITY_SCREENSHOT_MAX_QUESTIONS} 张截图。` }, { status: 400 }, request, env);
   }
   const submissionId = typeof payload.submissionId === "string" ? payload.submissionId.trim() : "";
   if (!/^[a-zA-Z0-9_-]{16,160}$/.test(submissionId)) {
@@ -2768,10 +2768,7 @@ async function handleCommunityQuestionSetCreate(request: Request, env: Env, cach
       })),
     }));
   } catch (error) {
-    if (
-      error instanceof gameService.HomepageCommunityQuestionSetConflictError
-      || error instanceof gameService.HomepageCommunityQuestionSetCapacityError
-    ) {
+    if (error instanceof gameService.HomepageCommunityQuestionSetConflictError) {
       return json({ error: error.message }, { status: 409 }, request, env);
     }
     if (error instanceof gameService.HomepageCommunityQuestionSetPersistenceError) {

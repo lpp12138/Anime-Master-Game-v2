@@ -1,7 +1,12 @@
 import type { DbQuestion, DbQuestionSet, Question } from "../src/types/game";
 
 export const QUESTION_SET_MANIFEST_VERSION = 1 as const;
-export const QUESTION_SET_MANIFEST_MAX_QUESTIONS = 30;
+
+// 单套题库 manifest 的存储安全上限（fail-closed 边界），不是玩法上限：社区截图
+// 同标题集合可跨多次投稿累计超过 30 题，但每单次投稿仍最多 30 张、每局游戏仍
+// 最多抽 30 题（见 MAX_GAME_QUESTION_COUNT）。manifest 以单行 JSON 存在 D1，
+// 2000 题约数百 KiB，仍远低于 D1 行大小上限。
+export const QUESTION_SET_MANIFEST_MAX_QUESTIONS = 2000;
 
 type StoredManifestQuestion = {
   id: string;

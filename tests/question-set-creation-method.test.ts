@@ -862,6 +862,69 @@ test("room question-count settings sample once, persist order, and replay the sa
   });
 });
 
+test("community sets beyond 30 questions prepare and start with the per-game 30 cap", async () => {
+  const db = new DatabaseAdapter();
+  applyMigrations(db.sqlite);
+  await runWithGameDatabase(db, async () => {
+    const room = await createRoom("large-set-host", "Large Set Host");
+    await selectPresenterForRound(room.id!, "large-set-host", "large-set-host");
+    const questions = Array.from({ length: 40 }, (_, index) => ({
+      id: `large-set-question-${index}`,
+      questionSetId: "large-community-set",
+      imageUrl: `https://example.com/large-${index}.webp`,
+      orderIndex: index,
+      labelText: `Answer ${index + 1}`,
+      labelSource: "manual" as const,
+      createdAt: "2026-02-01T00:00:00.000Z",
+    }));
+    db.sqlite.prepare(`INSERT INTO question_sets
+      (id,title,created_by_player_id,is_public,image_count,manifest_version,manifest_revision,manifest_json,
+       community_submission_id,community_collection_title,created_at,updated_at)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`)
+      .run(
+        "large-community-set",
+        "大型社区题库",
+        "large-set-host",
+        1,
+        40,
+        1,
+        0,
+        encodeQuestionSetManifest(questions),
+        "large-set-submission-0000000000",
+        "大型社区题库",
+        "2026-02-01T00:00:00.000Z",
+        "2026-02-01T00:00:00.000Z",
+      );
+
+    const prepared = await prepareQuestionSetForStart({
+      roomId: room.id!,
+      presenterPlayerId: "large-set-host",
+      questionSetId: "large-community-set",
+    });
+    // 已准备题数按每局上限记录为 30，而不是整套 40 题。
+    assert.equal(prepared.preparedQuestionCount, 30);
+
+    // 默认“全部题目”在超过 30 题的题库上按每局上限 30 题随机抽取。
+    const started = await startGameWithQuestionSet({
+      startRequestId: "large-set-start-request",
+      roomId: room.id!,
+      hostPlayerId: "large-set-host",
+      presenterPlayerId: "large-set-host",
+      questionSetId: "large-community-set",
+      authorityVersion: 2 as const,
+    });
+    assert.equal(started.gameSession.questionCount, 30);
+    const firstQuestions = started.__authorityVNextBootstrap.questions;
+    assert.equal(firstQuestions.length, 30);
+    assert.equal(new Set(firstQuestions.map((question) => question.id)).size, 30);
+    const storedIds = JSON.parse(String(
+      db.sqlite.prepare("SELECT selected_question_ids FROM game_sessions WHERE id='large-set-start-request'").get().selected_question_ids,
+    )) as string[];
+    assert.equal(storedIds.length, 30);
+    assert.deepEqual(storedIds, firstQuestions.map((question) => question.id));
+  });
+});
+
 test("room question-count start validation rejects stale settings without creating a game", async () => {
   const db = new DatabaseAdapter();
   applyMigrations(db.sqlite);
