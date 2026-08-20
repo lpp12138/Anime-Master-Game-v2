@@ -33,6 +33,7 @@ npm run build
 | Worker 本地运行时、重连、并发、D1 热路径或额度模型 | 上述相关测试，再运行 `npm run test:authority-local-runtime` |
 | 公开房间创建、目录、实时人数或题目来源 | `npm run test:public-rooms`、`npm run test:question-set-creation-method`、`npm run test:authority-vnext`、`npm run test:authority-local-runtime` |
 | 首页密钥截图上传、出题工具 JSON/JSONL 导入、同标题追加、答案/标签、图片索引或投稿幂等 | `npm run test:community-screenshot-upload`、`npm run test:r2-upload`、`npm run test:question-set-creation-method` |
+| 题库管理鉴权、检索、详情答案、元数据更新、安全删除、D1 引用保护或 R2 引用清理 | `npm run test:community-screenshot-upload`、`npm run test:r2-upload`、`npm run test:question-set-creation-method` |
 | Bangumi 代理、规范化、缓存或上游边界 | `npm run test:bangumi-api`、`npm run test:community-screenshot-upload` |
 | 首页 finalize 的 D1 batch/migration | 上述测试外，使用独立 `--persist-to` 状态在真实本地 Wrangler 中验证强制失败整批回滚、同投稿 ID 并发重试及不同投稿同标题并发追加 |
 
@@ -63,6 +64,10 @@ npm run build
 ### `test:authority-budget`
 
 执行快速、确定性的单局 DO/D1 写入预算断言。改变 checkpoint、投影、索引或归档结构时必须同步更新模型，不能只提高上限让测试通过。
+
+### `test:community-screenshot-upload`
+
+覆盖受保护投稿及题库管理 API，包括密钥拒绝、列表边界、答案只在管理详情返回、legacy/manifest/corrupt 存储检查、`updatedAt` 并发冲突、规范集合标题冲突、活动游戏和准备房间删除拒绝、D1 级联，以及共享、损坏引用和 R2 删除失败时的安全清理行为。
 
 ### `test:authority-local-runtime`
 

@@ -40,7 +40,7 @@ npm install
 cp .env.example .env.local
 ```
 
-首页密钥上传还需要只供本地 Worker 读取的 `.dev.vars`（至少 24 个字符，不能使用 `NEXT_PUBLIC_` 前缀）：
+首页密钥上传和受保护题库管理共用一个只供本地 Worker 读取的 `.dev.vars` 密钥（至少 24 个字符，不能使用 `NEXT_PUBLIC_` 前缀）：
 
 ```bash
 printf 'COMMUNITY_UPLOAD_SECRET=%s\n' "$(openssl rand -base64 32 | tr -d '\n')" > .dev.vars
@@ -164,7 +164,7 @@ URL/JSONL 导入统一由 Worker 在校验当前房间出题人身份后有界�
 npm run d1:migrate:remote
 ```
 
-给首页截图上传入口配置 Worker secret：
+给首页截图上传和题库管理入口配置 Worker secret：
 
 ```bash
 npx wrangler secret put COMMUNITY_UPLOAD_SECRET
@@ -174,9 +174,13 @@ npx wrangler secret put COMMUNITY_UPLOAD_SECRET
 
 首页按钮进入独立上传页；该页面接受本地图片，也接受动画截图工具导出的 JSON/JSONL 文件或直接粘贴的 `image_url` / `label_text` 题单，并以自适应网格展示截图。题单远端图片只通过受上传密钥保护的 `POST /api/community-remote-image-source` 获取；该接口限定为工具使用的 FanCaps/Bangumi HTTPS 域名、拒绝跨域重定向、限制 20 MiB 和 15 秒上游请求，随后仍由浏览器压缩、由截图上传接口重新校验。反向代理必须为该接口单独限速。
 
-页面通过 Worker 访问官方 `https://api.bgm.tv/v0` 建立 BGM（Bangumi）番剧和角色标签。正确答案输入框同时用于番剧搜索，下方角色输入只筛选所选番剧的官方角色列表。上游请求使用项目专属 User-Agent；无需 Bangumi token。Worker Cache API 分别缓存番剧搜索 12 小时、finalize 使用的番剧详情 30 天和整份番剧角色列表 7 天；选角色直接复用列表结果，不产生逐角色 N+1 请求。finalize 会按官方 ID 重写名称并校验角色归属，避免信任客户端标签、浏览器直连和重复打到 Bangumi。finalize JSON 请求体上限为 512 KiB；浏览器在相同内容的重试期间保留已上传的 R2 key 和一个稳定投稿 ID；Worker 把该 ID 与服务端计算的内容指纹绑定并拒绝同 ID 下被修改的内容。标题完全相同的社区截图投稿会追加到同一规范题库，总题数仍不得超过 30；新建和追加分别通过 D1 batch 原子写入/更新 manifest、图片索引与投稿记录，并以 manifest 修订号解决并发追加。D1 migrations `0026_question_image_bangumi_tags.sql` 与 `0027_homepage_question_set_appends.sql` 分别保存逐图片规范标签及同标题集合/多投稿幂等记录；`0028_game_question_sampling.sql` 保存房间题数设置、已准备题数和每局固定抽题顺序。因此部署新版 Worker 前必须先执行上述迁移；旧 game session 的空抽题快照继续按全题库原顺序读取。
+页面通过 Worker 访问官方 `https://api.bgm.tv/v0` 建立 BGM（Bangumi）番剧和角色标签。正确答案输入框同时用于番剧搜索，下方角色输入只筛选所选番剧的官方角色列表。上游请求使用项目专属 User-Agent；无需 Bangumi token。Worker Cache API 分别缓存番剧搜索 12 小时、finalize 使用的番剧详情 30 天和整份番剧角色列表 7 天；选角色直接复用列表结果，不产生逐角色 N+1 请求。finalize 会按官方 ID 重写名称并校验角色归属，避免信任客户端标签、浏览器直连和重复打到 Bangumi。finalize JSON 请求体上限为 512 KiB；浏览器在相同内容的重试期间保留已上传的 R2 key 和一个稳定投稿 ID；Worker 把该 ID 与服务端计算的内容指纹绑定并拒绝同 ID 下被修改的内容。标题完全相同的社区截图投稿会追加到同一规范题库，总题数仍不得超过 30；新建和追加分别通过 D1 batch 原子写入/更新 manifest、图片索引与投稿记录，并以 manifest 修订号解决并发追加。D1 migrations `0026_question_image_bangumi_tags.sql` 与 `0027_homepage_question_set_appends.sql` 分别保存逐图片规范标签及同标题集合/多投稿幂等记录；`0028_game_question_sampling.sql` 保存房间题数设置、已准备题数和每局固定抽题顺序；`0029_question_set_admin_integrity.sql` 为历史结算引用计数增加索引，并用 D1 trigger 补齐 `rooms.prepared_question_set_id` 的引用完整性。因此部署新版 Worker 前必须先执行上述迁移；旧 game session 的空抽题快照继续按全题库原顺序读取。
 
-受同一上传密钥保护的 `GET /api/community-image-index?animeSubjectId=<id>&characterId=<optional>&limit=<1-50>` 只查询公开题库，返回图片标识和规范标签，不返回 `answer_text`。它是可信预览/整理工具的后端读模型，不应改成匿名答案接口。部署在 Nginx 或其他反向代理后时，必须分别限制图片上传、finalize、Bangumi helper 和图片索引的速率；不要仅依赖共享密钥承担配额控制。
+受同一上传密钥保护的 `GET /api/community-image-index?animeSubjectId=<id>&characterId=<optional>&limit=<1-50>` 只查询公开题库，返回图片标识和规范标签，不返回 `answer_text`。它是可信预览/整理工具的后端读模型，不应改成匿名答案接口。
+
+`/question-set-admin` 使用同一密钥访问 `/api/admin/question-sets` 管理 API。密钥只驻留页面内存；列表不返回答案，只有受保护详情返回答案和 Bangumi 标签。PATCH 更新与 DELETE 删除都要求当前 `expectedUpdatedAt`，删除还要求完全匹配的 `confirmQuestionSetId`。服务端拒绝删除活动游戏、已准备房间或损坏 manifest 引用的题库；历史归档是自包含快照，可以保留。删除先提交 D1 级联，再重新扫描剩余引用并批量清理最多 30 个独占 R2 对象；扫描、映射或 R2 删除失败只报告待重试对象，不回滚或伪报 D1 删除。损坏的剩余 manifest 会让引用扫描失败关闭，避免误删未追踪图片。
+
+部署在 Nginx 或其他反向代理后时，必须分别限制图片上传、finalize、Bangumi helper、图片索引和题库管理 API 的速率；题库管理 mutation 请求体上限是 16 KiB，允许方法为 GET、PATCH、DELETE 和 OPTIONS。不要仅依赖共享密钥承担配额控制。
 
 ### 3. 部署 Worker
 

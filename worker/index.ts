@@ -19,6 +19,13 @@ import {
 import { getRoomNoticeUpdatedDelta } from "./roomNotice";
 import type { GameDatabase, GameDatabaseMutationTracker } from "./d1QueryCompat";
 import { getManifestImageUrls } from "./questionSetManifest";
+import {
+  deleteAdminQuestionSet,
+  getAdminQuestionSetDetail,
+  listAdminQuestionSets,
+  QuestionSetAdminError,
+  updateAdminQuestionSet,
+} from "./questionSetAdmin";
 import { buildRoomChatTeamAudience, RoomChatRateLimiter, tryHandleRoomChatMessage } from "./roomChat";
 import {
   isR2ImageUploadTooLarge,
@@ -260,6 +267,8 @@ const REMOTE_IMAGE_FETCH_MAX_BYTES = 20 * 1024 * 1024;
 const REMOTE_IMAGE_FETCH_TIMEOUT_MS = 15_000;
 const R2_IMAGE_ROUTE_PREFIX = "/api/r2-images/";
 const COMMUNITY_QUESTION_SET_BODY_MAX_BYTES = 512 * 1024;
+const QUESTION_SET_ADMIN_BODY_MAX_BYTES = 16 * 1024;
+const QUESTION_SET_ADMIN_PATH_PREFIX = "/api/admin/question-sets/";
 const COMMUNITY_UPLOAD_KEY_HEADER = "x-community-upload-key";
 const COMMUNITY_UPLOAD_SECRET_MIN_LENGTH = 24;
 const ROOM_CLEANUP_IDLE_MS = 48 * 60 * 60 * 1000;
@@ -530,7 +539,7 @@ function corsHeaders(request: Request, env: Env) {
 
   return {
     "Access-Control-Allow-Origin": allowOrigin,
-    "Access-Control-Allow-Methods": "GET,HEAD,POST,OPTIONS",
+    "Access-Control-Allow-Methods": "GET,HEAD,POST,PATCH,DELETE,OPTIONS",
     "Access-Control-Allow-Headers": `content-type,${COMMUNITY_UPLOAD_KEY_HEADER}`,
     "Access-Control-Max-Age": "86400",
     "Vary": "Origin",
@@ -2030,6 +2039,153 @@ async function authorizeCommunityUpload(request: Request, env: Env) {
   return null;
 }
 
+function questionSetAdminErrorResponse(error: unknown, request: Request, env: Env) {
+  if (error instanceof QuestionSetAdminError) {
+    return json({ error: error.message }, { status: error.status }, request, env);
+  }
+  console.error("Question-set admin request failed", error);
+  return json({ error: "题库管理操作失败，请稍后重试。" }, { status: 500 }, request, env);
+}
+
+async function readQuestionSetAdminBody(request: Request) {
+  const contentLength = getRequestContentLength(request);
+  if (contentLength != null && contentLength > QUESTION_SET_ADMIN_BODY_MAX_BYTES) {
+    throw new QuestionSetAdminError("题库管理请求内容过大（上限 16 KiB）。", 413);
+  }
+  try {
+    const text = await readLimitedRequestText(request, QUESTION_SET_ADMIN_BODY_MAX_BYTES);
+    return JSON.parse(text) as unknown;
+  } catch (error) {
+    if (error instanceof QuestionSetAdminError) throw error;
+    if (error instanceof Error && error.message === "请求内容过大，请缩小后重试。") {
+      throw new QuestionSetAdminError("题库管理请求内容过大（上限 16 KiB）。", 413);
+    }
+    throw new QuestionSetAdminError("题库管理请求 JSON 无效。", 400);
+  }
+}
+
+async function handleQuestionSetAdminCollection(request: Request, env: Env) {
+  const authError = await authorizeCommunityUpload(request, env);
+  if (authError) return authError;
+  if (!env.DB) return json({ error: "服务器题库存储尚未配置。" }, { status: 500 }, request, env);
+  if (request.method !== "GET") {
+    return json(
+      { error: "该题库管理接口只支持 GET。" },
+      { status: 405, headers: { Allow: "GET" } },
+      request,
+      env,
+    );
+  }
+  try {
+    return json(await listAdminQuestionSets(env.DB, new URL(request.url)), {}, request, env);
+  } catch (error) {
+    return questionSetAdminErrorResponse(error, request, env);
+  }
+}
+
+async function cleanupDeletedAdminQuestionSetImages(env: Env, imageUrls: string[]) {
+  const candidateKeys = new Set<string>();
+  for (const imageUrl of imageUrls) {
+    try {
+      const key = getR2ObjectKeyFromImageUrl(imageUrl, env);
+      if (key) candidateKeys.add(key);
+    } catch {
+      // Malformed legacy URLs are never passed to R2 deletion.
+    }
+  }
+  if (candidateKeys.size === 0) {
+    return { candidateCount: 0, deletedCount: 0, preservedSharedCount: 0, pendingCount: 0 };
+  }
+  if (!env.IMAGE_BUCKET) {
+    return {
+      candidateCount: candidateKeys.size,
+      deletedCount: 0,
+      preservedSharedCount: 0,
+      pendingCount: candidateKeys.size,
+    };
+  }
+
+  let references: Awaited<ReturnType<typeof getR2ImageReferences>>;
+  try {
+    references = await getR2ImageReferences(env);
+  } catch (error) {
+    console.error("Question-set admin R2 reference scan failed", error);
+    return {
+      candidateCount: candidateKeys.size,
+      deletedCount: 0,
+      preservedSharedCount: 0,
+      pendingCount: candidateKeys.size,
+    };
+  }
+  const referencedKeys = new Set<string>();
+  for (const reference of references) {
+    try {
+      const key = getR2ObjectKeyFromImageUrl(reference.image_url, env, { allowAnyOriginPrefixPath: true });
+      if (!key) throw new Error("题库图片引用不能安全映射到本站 R2 对象。");
+      referencedKeys.add(key);
+    } catch (error) {
+      console.error("Question-set admin R2 reference mapping failed", error);
+      return {
+        candidateCount: candidateKeys.size,
+        deletedCount: 0,
+        preservedSharedCount: 0,
+        pendingCount: candidateKeys.size,
+      };
+    }
+  }
+  const keysToDelete = [...candidateKeys].filter((key) => !referencedKeys.has(key));
+  const preservedSharedCount = candidateKeys.size - keysToDelete.length;
+  const cleanup = await deleteR2KeysInBatches(env.IMAGE_BUCKET, keysToDelete, (error) => {
+    console.error("Question-set admin R2 deletion failed", error);
+  });
+  return {
+    candidateCount: candidateKeys.size,
+    deletedCount: cleanup.deletedR2KeyCount,
+    preservedSharedCount,
+    pendingCount: cleanup.failedR2Keys.size,
+  };
+}
+
+async function handleQuestionSetAdminItem(request: Request, env: Env, encodedQuestionSetId: string) {
+  const authError = await authorizeCommunityUpload(request, env);
+  if (authError) return authError;
+  if (!env.DB) return json({ error: "服务器题库存储尚未配置。" }, { status: 500 }, request, env);
+
+  let questionSetId: string;
+  try {
+    questionSetId = decodeURIComponent(encodedQuestionSetId);
+  } catch {
+    return json({ error: "题库标识无效。" }, { status: 400 }, request, env);
+  }
+  try {
+    if (request.method === "GET") {
+      return json(await getAdminQuestionSetDetail(env.DB, questionSetId), {}, request, env);
+    }
+    if (request.method === "PATCH") {
+      const detail = await updateAdminQuestionSet(env.DB, questionSetId, await readQuestionSetAdminBody(request));
+      return json(detail, {}, request, env);
+    }
+    if (request.method === "DELETE") {
+      const deleted = await deleteAdminQuestionSet(env.DB, questionSetId, await readQuestionSetAdminBody(request));
+      const imageCleanup = await cleanupDeletedAdminQuestionSetImages(env, deleted.imageUrls);
+      return json({
+        deleted: true,
+        questionSetId: deleted.id,
+        title: deleted.title,
+        imageCleanup,
+      }, {}, request, env);
+    }
+    return json(
+      { error: "该题库管理接口只支持 GET、PATCH 或 DELETE。" },
+      { status: 405, headers: { Allow: "GET, PATCH, DELETE" } },
+      request,
+      env,
+    );
+  } catch (error) {
+    return questionSetAdminErrorResponse(error, request, env);
+  }
+}
+
 async function handleCommunityScreenshotUpload(request: Request, env: Env) {
   const authError = await authorizeCommunityUpload(request, env);
   if (authError) return authError;
@@ -2650,8 +2806,21 @@ function getR2ObjectKeyFromImageUrl(imageUrl: string, env: Env, options: { allow
     return null;
   }
 
+  const configuredBase = env.R2_PUBLIC_BASE_URL?.trim().replace(/\/+$/g, "");
+  let configuredBaseUrl: URL | null = null;
+  try {
+    configuredBaseUrl = configuredBase ? new URL(`${configuredBase}/`) : null;
+  } catch {
+    configuredBaseUrl = null;
+  }
+  const trustedOrigins = new Set((env.ALLOWED_ORIGIN ?? "")
+    .split(",")
+    .map((origin) => origin.trim())
+    .filter((origin) => origin && origin !== "*"));
+  if (configuredBaseUrl) trustedOrigins.add(configuredBaseUrl.origin);
+
   const routeKey = getR2ObjectKeyFromPath(url.pathname);
-  if (routeKey) {
+  if (routeKey && (trustedOrigins.has(url.origin) || options.allowAnyOriginPrefixPath)) {
     return sanitizeCleanupR2Key(routeKey, env);
   }
 
@@ -2668,18 +2837,12 @@ function getR2ObjectKeyFromImageUrl(imageUrl: string, env: Env, options: { allow
     }
   }
 
-  const configuredBase = env.R2_PUBLIC_BASE_URL?.trim().replace(/\/+$/g, "");
-  if (!configuredBase) {
+  if (!configuredBaseUrl || url.origin !== configuredBaseUrl.origin || !url.pathname.startsWith(configuredBaseUrl.pathname)) {
     return null;
   }
 
   try {
-    const base = new URL(`${configuredBase}/`);
-    if (url.origin !== base.origin || !url.pathname.startsWith(base.pathname)) {
-      return null;
-    }
-
-    const encodedKey = url.pathname.slice(base.pathname.length);
+    const encodedKey = url.pathname.slice(configuredBaseUrl.pathname.length);
     const key = encodedKey
       .split("/")
       .map((part) => decodeURIComponent(part))
@@ -2688,16 +2851,6 @@ function getR2ObjectKeyFromImageUrl(imageUrl: string, env: Env, options: { allow
   } catch {
     return null;
   }
-}
-
-function getR2ReferenceNeedle(env: Env) {
-  const prefix = getR2ImagePrefix(env);
-  if (!prefix) {
-    return null;
-  }
-
-  // D1 limits LIKE/GLOB patterns to 50 bytes; use a literal path needle so the public base URL cannot exceed it.
-  return `/${prefix}/`;
 }
 
 type PublicRoomRow = {
@@ -3128,36 +3281,49 @@ async function deleteExpiredRooms(env: Env, roomIds: string[], cutoffIso: string
 }
 
 async function getR2ImageReferences(env: Env) {
-  const referenceNeedle = getR2ReferenceNeedle(env);
-  if (!referenceNeedle) {
+  if (!getR2ImagePrefix(env)) {
     return [];
   }
 
+  // Read every stored image reference instead of prefiltering manifest JSON with a
+  // text needle. That keeps malformed or percent-encoded local URLs from becoming
+  // invisible to destructive cleanup, and makes any corrupt manifest fail closed.
   const rows = await queryRows<R2ImageReferenceRow>(
     env,
     `select q.question_set_id, qs.is_public, q.image_url,
             null as manifest_version, null as manifest_json
      from questions q
      join question_sets qs on qs.id = q.question_set_id
-     where instr(q.image_url, ?) > 0
+     union all
+     select qi.question_set_id, qs.is_public, qi.image_url,
+            null as manifest_version, null as manifest_json
+     from question_image_index qi
+     join question_sets qs on qs.id = qi.question_set_id
      union all
      select qs.id as question_set_id, qs.is_public, null as image_url,
             qs.manifest_version, qs.manifest_json
      from question_sets qs
-     where qs.manifest_version = 1 and instr(qs.manifest_json, ?) > 0`,
-    referenceNeedle,
-    referenceNeedle,
+     where qs.manifest_version = 1`,
   );
   const references: Array<R2ImageReferenceRow & { image_url: string }> = [];
+  const addReference = (row: R2ImageReferenceRow, imageUrl: string) => {
+    const key = getR2ObjectKeyFromImageUrl(imageUrl, env, { allowAnyOriginPrefixPath: true });
+    if (!key) return;
+    references.push({ ...row, image_url: imageUrl, manifest_version: null, manifest_json: null });
+  };
   for (const row of rows) {
-    if (row.image_url) references.push({ ...row, image_url: row.image_url });
+    if (row.image_url) addReference(row, row.image_url);
     if (row.manifest_version == null) continue;
-    for (const imageUrl of getManifestImageUrls({
+    const manifestImageUrls = getManifestImageUrls({
       id: row.question_set_id,
       manifest_version: row.manifest_version,
       manifest_json: row.manifest_json ?? null,
-    }) ?? []) {
-      references.push({ question_set_id: row.question_set_id, is_public: row.is_public, image_url: imageUrl });
+    });
+    if (!manifestImageUrls) {
+      throw new Error(`题库 ${row.question_set_id} 的 manifest 已损坏，不能安全计算 R2 引用。`);
+    }
+    for (const imageUrl of manifestImageUrls) {
+      addReference({ question_set_id: row.question_set_id, is_public: row.is_public }, imageUrl);
     }
   }
   return references;
@@ -3173,7 +3339,8 @@ export async function cleanupUnreferencedR2Objects(env: Env, now = Date.now()) {
   const referencedKeys = new Set<string>();
   for (const reference of references) {
     const key = getR2ObjectKeyFromImageUrl(reference.image_url, env, { allowAnyOriginPrefixPath: true });
-    if (key) referencedKeys.add(key);
+    if (!key) throw new Error("R2 孤儿清理失败：题库图片引用不能安全映射到本站对象。");
+    referencedKeys.add(key);
   }
 
   const cutoffMs = now - R2_ORPHAN_CLEANUP_MIN_AGE_MS;
@@ -3290,7 +3457,8 @@ export async function cleanupExpiredRooms(env: Env, now = Date.now()) {
     const references = await getR2ImageReferences(env);
     for (const reference of references) {
       const key = getR2ObjectKeyFromImageUrl(reference.image_url, env, { allowAnyOriginPrefixPath: true });
-      if (!key || !candidateKeys.has(key)) {
+      if (!key) throw new Error("自动清理失败：题库图片引用不能安全映射到本站对象。");
+      if (!candidateKeys.has(key)) {
         continue;
       }
 
@@ -5958,6 +6126,18 @@ export default {
 
       if (url.pathname === "/api/community-image-index" && request.method === "GET") {
         return await handleCommunityImageIndexSearch(request, env);
+      }
+
+      if (url.pathname === "/api/admin/question-sets") {
+        return await handleQuestionSetAdminCollection(request, env);
+      }
+
+      if (url.pathname.startsWith(QUESTION_SET_ADMIN_PATH_PREFIX)) {
+        return await handleQuestionSetAdminItem(
+          request,
+          env,
+          url.pathname.slice(QUESTION_SET_ADMIN_PATH_PREFIX.length),
+        );
       }
 
       if (url.pathname === "/api/remote-image-source" && request.method === "POST") {

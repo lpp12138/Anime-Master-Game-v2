@@ -3,6 +3,7 @@ import HomePage from "@/app/page";
 import RoomPage from "@/app/room/[roomCode]/page";
 import PublicRoomsPage from "@/app/public-rooms/page";
 import CommunityUploadPage from "@/app/community-upload/page";
+import QuestionSetAdminPage from "@/app/question-set-admin/page";
 import { requestAppRouteChange } from "@/lib/router";
 
 function currentPath() {
@@ -52,6 +53,7 @@ export default function App() {
 
   if (path === "/public-rooms") return <PublicRoomsPage />;
   if (path === "/community-upload") return <CommunityUploadPage />;
+  if (path === "/question-set-admin") return <QuestionSetAdminPage />;
 
   return <HomePage />;
 }

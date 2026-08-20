@@ -543,8 +543,18 @@ export default function CommunityUploadPage() {
               可选择本地截图，或上传/粘贴动画截图工具的 JSON 题单。图片会进入自适应网格，点击任意缩略图即可填写答案并搜索 BGM（Bangumi）番剧与角色标签。
             </p>
           </div>
-          <div className="rounded-full border border-sky-200 bg-sky-50 px-3 py-1.5 text-xs font-semibold text-sky-800">
-            1–30 张 · 自动压缩至 1080p
+          <div className="flex flex-wrap items-center gap-2">
+            <button
+              className="rounded-full border border-slate-300 bg-white px-3 py-1.5 text-xs font-semibold text-slate-700 transition hover:border-slate-400 hover:text-slate-950 disabled:opacity-50"
+              disabled={isBusy}
+              type="button"
+              onClick={() => router.push("/question-set-admin")}
+            >
+              题库管理
+            </button>
+            <div className="rounded-full border border-sky-200 bg-sky-50 px-3 py-1.5 text-xs font-semibold text-sky-800">
+              1–30 张 · 自动压缩至 1080p
+            </div>
           </div>
         </header>
 

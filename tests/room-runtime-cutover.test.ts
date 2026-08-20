@@ -111,6 +111,8 @@ function seedRejectedTeamStart(db: DatabaseSync) {
     { id: "host", roomId: "room-rejected", nickname: "Host", isHost: true, joinedAt: "2026-08-08T00:00:00.000Z", lastSeenAt: "2026-08-08T00:00:00.000Z", role: "PLAYER" },
     { id: "p1", roomId: "room-rejected", nickname: "P1", isHost: false, joinedAt: "2026-08-08T00:00:01.000Z", lastSeenAt: "2026-08-08T00:00:01.000Z", role: "PLAYER" },
   ];
+  db.prepare("INSERT INTO question_sets(id,title,created_by_player_id,image_count) VALUES(?,?,?,?)")
+    .run("set-rejected", "Rejected Set", "host", 1);
   db.prepare(`INSERT INTO rooms(
     id,room_code,host_player_id,game_status,current_presenter_player_id,prepared_question_set_id,
     lobby_game_mode,runtime_generation,room_state_version,room_state_revision,room_state_json
@@ -118,8 +120,6 @@ function seedRejectedTeamStart(db: DatabaseSync) {
     "room-rejected", "REJECT", "host", "QUESTION_SETUP", "host", "set-rejected",
     "TEAM_BATTLE", CURRENT_ROOM_RUNTIME_GENERATION, 1, 0, encodeRoomState("room-rejected", "host", players),
   );
-  db.prepare("INSERT INTO question_sets(id,title,created_by_player_id,image_count) VALUES(?,?,?,?)")
-    .run("set-rejected", "Rejected Set", "host", 1);
 }
 
 function createV3State(storage: StorageAdapter, id = "room-rejected", sockets: WebSocket[] = []) {

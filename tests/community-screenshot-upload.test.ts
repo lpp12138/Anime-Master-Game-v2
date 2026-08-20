@@ -140,6 +140,7 @@ function createTestEnv() {
   const db = new DatabaseAdapter();
   applyMigrations(db.sqlite);
   const objects = new Map<string, R2Object>();
+  const deletedKeys: string[] = [];
   let putCount = 0;
   const bucket = {
     async put(key: string, value: ArrayBuffer, options?: R2PutOptions) {
@@ -164,6 +165,12 @@ function createTestEnv() {
     async head(key: string) {
       return objects.get(key) ?? null;
     },
+    async delete(keys: string | string[]) {
+      for (const key of Array.isArray(keys) ? keys : [keys]) {
+        deletedKeys.push(key);
+        objects.delete(key);
+      }
+    },
   } as R2Bucket;
   const env = {
     DB: db,
@@ -173,7 +180,7 @@ function createTestEnv() {
     COMMUNITY_UPLOAD_SECRET: UPLOAD_SECRET,
     ALLOWED_ORIGIN: "https://caicai.lpp.moe",
   } as unknown as Env;
-  return { db, env, objects, getPutCount: () => putCount };
+  return { db, env, objects, deletedKeys, getPutCount: () => putCount };
 }
 
 function uploadRequest(body: Uint8Array, key = UPLOAD_SECRET, contentType = "image/png") {
@@ -199,6 +206,21 @@ function finalizeRequest(payload: unknown, key = UPLOAD_SECRET) {
       "x-community-upload-key": key,
     },
     body: JSON.stringify(body),
+  });
+}
+
+function questionSetAdminRequest(
+  path: string,
+  options: { method?: string; body?: unknown; key?: string | null } = {},
+) {
+  const method = options.method ?? "GET";
+  return new Request(`https://caicai.lpp.moe${path}`, {
+    method,
+    headers: {
+      ...(options.body === undefined ? {} : { "content-type": "application/json" }),
+      ...(options.key === null ? {} : { "x-community-upload-key": options.key ?? UPLOAD_SECRET }),
+    },
+    ...(options.body === undefined ? {} : { body: JSON.stringify(options.body) }),
   });
 }
 
@@ -795,4 +817,664 @@ test("question-set finalization enforces count, label, and request-body limits",
     questions: [{ r2Key: uploaded.key, labelText: "答案" }],
   }), env);
   assert.equal(oversizedBody.status, 413);
+});
+
+test("question-set admin APIs require the management key and keep answers out of list responses", async () => {
+  const { env } = createTestEnv();
+  const uploadResponse = await worker.fetch(uploadRequest(ONE_PIXEL_PNG), env);
+  const uploaded = await uploadResponse.json() as { key: string };
+  const finalizeResponse = await worker.fetch(finalizeRequest({
+    submissionId: "admin-list-detail-submission",
+    title: "管理员检索题库",
+    description: "仅管理接口可见答案",
+    playerId: "admin-fixture-player",
+    nickname: "管理测试者",
+    questions: [{
+      r2Key: uploaded.key,
+      labelText: "管理接口秘密答案",
+      animeTags: [{ id: 2, name: "AIR", nameCn: "青空" }],
+      characterTags: [{ id: 3, subjectId: 2, name: "神尾観鈴", nameCn: null, relation: "主角" }],
+    }],
+  }), env);
+  assert.equal(finalizeResponse.status, 200, await finalizeResponse.clone().text());
+  const created = await finalizeResponse.json() as { id: string };
+
+  const missingKey = await worker.fetch(questionSetAdminRequest("/api/admin/question-sets", { key: null }), env);
+  const wrongKey = await worker.fetch(questionSetAdminRequest("/api/admin/question-sets", { key: "wrong-key" }), env);
+  assert.equal(missingKey.status, 401);
+  assert.equal(wrongKey.status, 401);
+
+  const listResponse = await worker.fetch(questionSetAdminRequest(
+    "/api/admin/question-sets?search=%E7%AE%A1%E7%90%86%E5%91%98&visibility=public&source=uploaded&limit=20&offset=0",
+  ), env);
+  assert.equal(listResponse.status, 200, await listResponse.clone().text());
+  const listText = await listResponse.clone().text();
+  const list = JSON.parse(listText) as { items: Array<Record<string, unknown>>; total: number };
+  assert.equal(list.total, 1);
+  assert.equal(list.items[0].id, created.id);
+  assert.equal(list.items[0].imageCount, 1);
+  assert.equal(list.items[0].indexedImageCount, 1);
+  assert.equal(list.items[0].isCanonicalCollection, true);
+  assert.equal(listText.includes("管理接口秘密答案"), false);
+  assert.equal(listText.includes("manifestJson"), false);
+  assert.equal(listText.includes("fingerprint"), false);
+
+  const detailResponse = await worker.fetch(questionSetAdminRequest(`/api/admin/question-sets/${created.id}`), env);
+  assert.equal(detailResponse.status, 200, await detailResponse.clone().text());
+  const detail = await detailResponse.json() as {
+    storageKind: string;
+    questions: Array<Record<string, unknown>>;
+    integrityIssues: string[];
+    canDelete: boolean;
+  };
+  assert.equal(detail.storageKind, "manifest");
+  assert.equal(detail.canDelete, true);
+  assert.deepEqual(detail.integrityIssues, []);
+  assert.equal(detail.questions[0].answerText, "管理接口秘密答案");
+  assert.deepEqual(detail.questions[0].animeTags, [{ id: 2, name: "AIR", nameCn: "青空" }]);
+  assert.deepEqual(detail.questions[0].characterTags, [{ id: 3, subjectId: 2, name: "神尾観鈴", nameCn: null, relation: "主角" }]);
+});
+
+test("question-set admin validates list bounds, methods, and mutation body limits", async () => {
+  const { env } = createTestEnv();
+  for (const path of [
+    "/api/admin/question-sets?limit=51",
+    "/api/admin/question-sets?offset=10001",
+    `/api/admin/question-sets?search=${"x".repeat(101)}`,
+    "/api/admin/question-sets?visibility=secret",
+    "/api/admin/question-sets?source=legacy",
+  ]) {
+    const response = await worker.fetch(questionSetAdminRequest(path), env);
+    assert.equal(response.status, 400, path);
+  }
+
+  const methodResponse = await worker.fetch(questionSetAdminRequest("/api/admin/question-sets", {
+    method: "POST",
+    body: {},
+  }), env);
+  assert.equal(methodResponse.status, 405);
+  assert.equal(methodResponse.headers.get("allow"), "GET");
+  assert.match(methodResponse.headers.get("access-control-allow-methods") ?? "", /PATCH/);
+  assert.match(methodResponse.headers.get("access-control-allow-methods") ?? "", /DELETE/);
+
+  const oversizedResponse = await worker.fetch(questionSetAdminRequest("/api/admin/question-sets/oversized-set", {
+    method: "PATCH",
+    body: { title: "x".repeat(17 * 1024), expectedUpdatedAt: "2026-01-01T00:00:00.000Z" },
+  }), env);
+  assert.equal(oversizedResponse.status, 413);
+});
+
+test("question-set admin inspects legacy rows and fails closed for corrupt manifests", async () => {
+  const { db, env } = createTestEnv();
+  db.sqlite.prepare(`INSERT INTO question_sets
+    (id,title,created_by_player_id,is_public,image_count,created_at,updated_at)
+    VALUES (?,?,?,?,?,?,?)`)
+    .run("admin-legacy-set", "旧版逐题题库", "legacy-owner", 0, 1, "2026-02-01T00:00:00.000Z", "2026-02-01T00:00:00.000Z");
+  db.sqlite.prepare(`INSERT INTO questions
+    (id,question_set_id,image_url,order_index,label_text,label_source,created_at)
+    VALUES (?,?,?,?,?,?,?)`)
+    .run(
+      "admin-legacy-question",
+      "admin-legacy-set",
+      "https://example.com/legacy.webp",
+      0,
+      "旧版秘密答案",
+      "manual",
+      "2026-02-01T00:00:00.000Z",
+    );
+  db.sqlite.prepare(`INSERT INTO question_sets
+    (id,title,created_by_player_id,is_public,image_count,manifest_version,manifest_json,created_at,updated_at)
+    VALUES (?,?,?,?,?,?,?,?,?)`)
+    .run(
+      "admin-corrupt-set",
+      "损坏 manifest 题库",
+      "corrupt-owner",
+      0,
+      1,
+      1,
+      "{not-json",
+      "2026-02-02T00:00:00.000Z",
+      "2026-02-02T00:00:00.000Z",
+    );
+
+  const legacyResponse = await worker.fetch(questionSetAdminRequest("/api/admin/question-sets/admin-legacy-set"), env);
+  assert.equal(legacyResponse.status, 200, await legacyResponse.clone().text());
+  const legacy = await legacyResponse.json() as { storageKind: string; questions: Array<{ answerText: string }>; canDelete: boolean };
+  assert.equal(legacy.storageKind, "rows");
+  assert.equal(legacy.questions[0].answerText, "旧版秘密答案");
+  assert.equal(legacy.canDelete, true);
+
+  const corruptResponse = await worker.fetch(questionSetAdminRequest("/api/admin/question-sets/admin-corrupt-set"), env);
+  assert.equal(corruptResponse.status, 200, await corruptResponse.clone().text());
+  const corrupt = await corruptResponse.json() as { storageKind: string; integrityIssues: string[]; canDelete: boolean; updatedAt: string };
+  assert.equal(corrupt.storageKind, "corrupt");
+  assert.equal(corrupt.canDelete, false);
+  assert.match(corrupt.integrityIssues.join(" "), /manifest 无法解析/);
+  const deleteResponse = await worker.fetch(questionSetAdminRequest("/api/admin/question-sets/admin-corrupt-set", {
+    method: "DELETE",
+    body: { confirmQuestionSetId: "admin-corrupt-set", expectedUpdatedAt: corrupt.updatedAt },
+  }), env);
+  assert.equal(deleteResponse.status, 409);
+  assert.match(JSON.stringify(await deleteResponse.json()), /manifest 已损坏/);
+  assert.ok(db.sqlite.prepare("SELECT id FROM question_sets WHERE id='admin-corrupt-set'").get());
+});
+
+test("question-set admin metadata updates use CAS and keep canonical collection titles consistent", async () => {
+  const { db, env } = createTestEnv();
+  const uploadResponse = await worker.fetch(uploadRequest(ONE_PIXEL_PNG), env);
+  const uploaded = await uploadResponse.json() as { key: string };
+  const finalizeResponse = await worker.fetch(finalizeRequest({
+    submissionId: "admin-update-submission",
+    title: "管理改名前",
+    playerId: "admin-update-player",
+    nickname: "管理测试者",
+    questions: [{ r2Key: uploaded.key, labelText: "答案" }],
+  }), env);
+  const created = await finalizeResponse.json() as { id: string };
+  const detailResponse = await worker.fetch(questionSetAdminRequest(`/api/admin/question-sets/${created.id}`), env);
+  const detail = await detailResponse.json() as { updatedAt: string };
+
+  const staleResponse = await worker.fetch(questionSetAdminRequest(`/api/admin/question-sets/${created.id}`, {
+    method: "PATCH",
+    body: {
+      title: "不应保存",
+      description: null,
+      isPublic: true,
+      expectedUpdatedAt: "2026-01-01T00:00:00.000Z",
+    },
+  }), env);
+  assert.equal(staleResponse.status, 409);
+
+  const renameResponse = await worker.fetch(questionSetAdminRequest(`/api/admin/question-sets/${created.id}`, {
+    method: "PATCH",
+    body: {
+      title: "管理改名后",
+      description: "新的说明",
+      isPublic: true,
+      expectedUpdatedAt: detail.updatedAt,
+    },
+  }), env);
+  assert.equal(renameResponse.status, 200, await renameResponse.clone().text());
+  const renamed = await renameResponse.json() as { title: string; description: string; isPublic: boolean; isCanonicalCollection: boolean; updatedAt: string };
+  assert.deepEqual({
+    title: renamed.title,
+    description: renamed.description,
+    isPublic: renamed.isPublic,
+    isCanonicalCollection: renamed.isCanonicalCollection,
+  }, {
+    title: "管理改名后",
+    description: "新的说明",
+    isPublic: true,
+    isCanonicalCollection: true,
+  });
+  assert.notEqual(renamed.updatedAt, detail.updatedAt);
+  const canonical = db.sqlite.prepare("SELECT title,community_collection_title FROM question_sets WHERE id=?")
+    .get(created.id) as { title: string; community_collection_title: string };
+  assert.deepEqual({ ...canonical }, { title: "管理改名后", community_collection_title: "管理改名后" });
+
+  const unpublishResponse = await worker.fetch(questionSetAdminRequest(`/api/admin/question-sets/${created.id}`, {
+    method: "PATCH",
+    body: {
+      title: "管理改名后",
+      description: "新的说明",
+      isPublic: false,
+      expectedUpdatedAt: renamed.updatedAt,
+    },
+  }), env);
+  assert.equal(unpublishResponse.status, 200, await unpublishResponse.clone().text());
+  const unpublished = await unpublishResponse.json() as { isPublic: boolean; isCanonicalCollection: boolean; updatedAt: string };
+  assert.equal(unpublished.isPublic, false);
+  assert.equal(unpublished.isCanonicalCollection, false);
+  let stored = db.sqlite.prepare("SELECT is_public,community_collection_title FROM question_sets WHERE id=?")
+    .get(created.id) as { is_public: number; community_collection_title: string | null };
+  assert.deepEqual({ ...stored }, { is_public: 0, community_collection_title: null });
+
+  const republishResponse = await worker.fetch(questionSetAdminRequest(`/api/admin/question-sets/${created.id}`, {
+    method: "PATCH",
+    body: {
+      title: "管理改名后",
+      description: "新的说明",
+      isPublic: true,
+      expectedUpdatedAt: unpublished.updatedAt,
+    },
+  }), env);
+  assert.equal(republishResponse.status, 200, await republishResponse.clone().text());
+  const republished = await republishResponse.json() as { isPublic: boolean; isCanonicalCollection: boolean; updatedAt: string };
+  assert.equal(republished.isPublic, true);
+  assert.equal(republished.isCanonicalCollection, true);
+  stored = db.sqlite.prepare("SELECT is_public,community_collection_title FROM question_sets WHERE id=?")
+    .get(created.id) as { is_public: number; community_collection_title: string | null };
+  assert.deepEqual({ ...stored }, { is_public: 1, community_collection_title: "管理改名后" });
+
+  db.sqlite.prepare(`INSERT INTO question_sets
+    (id,title,created_by_player_id,is_public,image_count,community_collection_title,created_at,updated_at)
+    VALUES (?,?,?,?,?,?,?,?)`)
+    .run("admin-title-conflict", "规范冲突标题", "conflict-owner", 1, 0, "规范冲突标题", "2026-01-01T00:00:00.000Z", "2026-01-01T00:00:00.000Z");
+  const collisionResponse = await worker.fetch(questionSetAdminRequest(`/api/admin/question-sets/${created.id}`, {
+    method: "PATCH",
+    body: {
+      title: "规范冲突标题",
+      description: "新的说明",
+      isPublic: true,
+      expectedUpdatedAt: republished.updatedAt,
+    },
+  }), env);
+  assert.equal(collisionResponse.status, 409);
+  assert.match(JSON.stringify(await collisionResponse.json()), /同名规范社区题库/);
+  stored = db.sqlite.prepare("SELECT is_public,community_collection_title FROM question_sets WHERE id=?")
+    .get(created.id) as { is_public: number; community_collection_title: string | null };
+  assert.deepEqual({ ...stored }, { is_public: 1, community_collection_title: "管理改名后" });
+
+  db.sqlite.prepare(`INSERT INTO question_sets
+    (id,title,created_by_player_id,is_public,image_count,community_submission_id,community_submission_fingerprint,created_at,updated_at)
+    VALUES (?,?,?,?,?,?,?,?,?)`)
+    .run(
+      "admin-historical-noncanonical",
+      "管理改名后",
+      "historical-owner",
+      1,
+      0,
+      "admin-historical-submission",
+      "b".repeat(64),
+      "2026-01-02T00:00:00.000Z",
+      "2026-01-02T00:00:00.000Z",
+    );
+  const historicalUpdate = await worker.fetch(questionSetAdminRequest("/api/admin/question-sets/admin-historical-noncanonical", {
+    method: "PATCH",
+    body: {
+      title: "管理改名后",
+      description: "只更新历史非规范题库说明",
+      isPublic: true,
+      expectedUpdatedAt: "2026-01-02T00:00:00.000Z",
+    },
+  }), env);
+  assert.equal(historicalUpdate.status, 200, await historicalUpdate.clone().text());
+  const historical = await historicalUpdate.json() as { isCanonicalCollection: boolean };
+  assert.equal(historical.isCanonicalCollection, false);
+});
+
+test("D1 0029 admin integrity migration is transactional and idempotent", () => {
+  const sqlite = new DatabaseSync(":memory:");
+  applyMigrations(sqlite, "0028");
+  const migration = readFileSync(resolve(
+    import.meta.dirname,
+    "..",
+    "d1",
+    "migrations",
+    "0029_question_set_admin_integrity.sql",
+  ), "utf8");
+
+  sqlite.exec("BEGIN IMMEDIATE");
+  try {
+    sqlite.exec(migration);
+    throw new Error("injected migration failure");
+  } catch {
+    sqlite.exec("ROLLBACK");
+  }
+  const rolledBackObjects = sqlite.prepare(`SELECT COUNT(*) AS count FROM sqlite_master
+    WHERE name IN (
+      'game_result_archives_question_set_id_idx',
+      'rooms_prepared_question_set_insert_guard',
+      'rooms_prepared_question_set_update_guard',
+      'question_sets_prepared_room_delete_guard'
+    )`).get() as { count: number };
+  assert.equal(rolledBackObjects.count, 0);
+
+  sqlite.exec(migration);
+  sqlite.exec(migration);
+  const installedObjects = sqlite.prepare(`SELECT COUNT(*) AS count FROM sqlite_master
+    WHERE name IN (
+      'game_result_archives_question_set_id_idx',
+      'rooms_prepared_question_set_insert_guard',
+      'rooms_prepared_question_set_update_guard',
+      'question_sets_prepared_room_delete_guard'
+    )`).get() as { count: number };
+  assert.equal(installedObjects.count, 4);
+  const archivePlan = sqlite.prepare(`EXPLAIN QUERY PLAN
+    SELECT COUNT(*) FROM game_result_archives WHERE question_set_id=?`).all("set-id")
+    .map((row) => String(row.detail)).join("\n");
+  assert.match(archivePlan, /game_result_archives_question_set_id_idx/);
+});
+
+test("D1 prepared-question-set guards reject dangling room references and deletion races", () => {
+  const { db } = createTestEnv();
+  db.sqlite.prepare("INSERT INTO rooms (id,room_code,host_player_id) VALUES (?,?,?)")
+    .run("guard-room", "GUARD1", "guard-host");
+  assert.throws(
+    () => db.sqlite.prepare("UPDATE rooms SET prepared_question_set_id=? WHERE id=?").run("missing-set", "guard-room"),
+    /prepared question set does not exist/,
+  );
+  db.sqlite.prepare(`INSERT INTO question_sets
+    (id,title,created_by_player_id,is_public,image_count,created_at,updated_at)
+    VALUES (?,?,?,?,?,?,?)`)
+    .run("guard-set", "受保护题库", "guard-host", 0, 0, "2026-01-01T00:00:00.000Z", "2026-01-01T00:00:00.000Z");
+  db.sqlite.prepare("UPDATE rooms SET prepared_question_set_id=? WHERE id=?").run("guard-set", "guard-room");
+  assert.throws(
+    () => db.sqlite.prepare("DELETE FROM question_sets WHERE id=?").run("guard-set"),
+    /question set is prepared by a room/,
+  );
+  db.sqlite.prepare("UPDATE rooms SET prepared_question_set_id=NULL WHERE id=?").run("guard-room");
+  db.sqlite.prepare("DELETE FROM question_sets WHERE id=?").run("guard-set");
+  assert.equal(db.sqlite.prepare("SELECT COUNT(*) AS count FROM question_sets WHERE id='guard-set'").get().count, 0);
+});
+
+test("question-set admin deletion rejects active games but preserves self-contained archives", async () => {
+  const { db, env, objects } = createTestEnv();
+  const uploadResponse = await worker.fetch(uploadRequest(ONE_PIXEL_PNG), env);
+  const uploaded = await uploadResponse.json() as { key: string };
+  const finalizeResponse = await worker.fetch(finalizeRequest({
+    submissionId: "admin-active-game-submission",
+    title: "活动游戏引用题库",
+    playerId: "admin-game-player",
+    nickname: "管理测试者",
+    questions: [{ r2Key: uploaded.key, labelText: "答案" }],
+  }), env);
+  const created = await finalizeResponse.json() as { id: string };
+  db.sqlite.prepare("INSERT INTO rooms (id,room_code,host_player_id) VALUES (?,?,?)")
+    .run("admin-game-room", "ADMGME", "admin-game-host");
+  db.sqlite.prepare(`INSERT INTO game_sessions (id,room_id,question_set_id,presenter_player_id)
+    VALUES (?,?,?,?)`)
+    .run("admin-active-game", "admin-game-room", created.id, "admin-game-host");
+
+  let detailResponse = await worker.fetch(questionSetAdminRequest(`/api/admin/question-sets/${created.id}`), env);
+  let detail = await detailResponse.json() as { updatedAt: string; gameSessionCount: number; archivedGameCount: number; canDelete: boolean };
+  assert.equal(detail.gameSessionCount, 1);
+  assert.equal(detail.canDelete, false);
+  const blocked = await worker.fetch(questionSetAdminRequest(`/api/admin/question-sets/${created.id}`, {
+    method: "DELETE",
+    body: { confirmQuestionSetId: created.id, expectedUpdatedAt: detail.updatedAt },
+  }), env);
+  assert.equal(blocked.status, 409);
+
+  db.sqlite.prepare("DELETE FROM game_sessions WHERE id='admin-active-game'").run();
+  db.sqlite.prepare(`INSERT INTO game_result_archives
+    (game_session_id,room_id,question_set_id,archive_version,completed_at,result_json,created_at)
+    VALUES (?,?,?,?,?,?,?)`)
+    .run(
+      "admin-archived-game",
+      "admin-game-room",
+      created.id,
+      1,
+      "2026-03-01T00:00:00.000Z",
+      JSON.stringify({ version: 1, questionCount: 1, leaderboard: [], questionScores: [] }),
+      "2026-03-01T00:00:00.000Z",
+    );
+  detailResponse = await worker.fetch(questionSetAdminRequest(`/api/admin/question-sets/${created.id}`), env);
+  detail = await detailResponse.json() as typeof detail;
+  assert.equal(detail.gameSessionCount, 0);
+  assert.equal(detail.archivedGameCount, 1);
+  assert.equal(detail.canDelete, true);
+  const deleted = await worker.fetch(questionSetAdminRequest(`/api/admin/question-sets/${created.id}`, {
+    method: "DELETE",
+    body: { confirmQuestionSetId: created.id, expectedUpdatedAt: detail.updatedAt },
+  }), env);
+  assert.equal(deleted.status, 200, await deleted.clone().text());
+  assert.ok(db.sqlite.prepare("SELECT game_session_id FROM game_result_archives WHERE game_session_id='admin-archived-game'").get());
+  assert.equal(objects.has(uploaded.key), false);
+});
+
+test("question-set admin deletion rejects prepared-room references", async () => {
+  const { db, env } = createTestEnv();
+  const uploadResponse = await worker.fetch(uploadRequest(ONE_PIXEL_PNG), env);
+  const uploaded = await uploadResponse.json() as { key: string };
+  const finalizeResponse = await worker.fetch(finalizeRequest({
+    submissionId: "admin-delete-blocked-submission",
+    title: "被房间引用的题库",
+    playerId: "admin-delete-player",
+    nickname: "管理测试者",
+    questions: [{ r2Key: uploaded.key, labelText: "答案" }],
+  }), env);
+  const created = await finalizeResponse.json() as { id: string };
+  db.sqlite.prepare(`INSERT INTO rooms (id,room_code,host_player_id,prepared_question_set_id) VALUES (?,?,?,?)`)
+    .run("admin-reference-room", "ADMREF", "admin-reference-host", created.id);
+
+  const detailResponse = await worker.fetch(questionSetAdminRequest(`/api/admin/question-sets/${created.id}`), env);
+  const detail = await detailResponse.json() as { updatedAt: string; preparedRoomCount: number; canDelete: boolean };
+  assert.equal(detail.preparedRoomCount, 1);
+  assert.equal(detail.canDelete, false);
+  const deleteResponse = await worker.fetch(questionSetAdminRequest(`/api/admin/question-sets/${created.id}`, {
+    method: "DELETE",
+    body: { confirmQuestionSetId: created.id, expectedUpdatedAt: detail.updatedAt },
+  }), env);
+  assert.equal(deleteResponse.status, 409);
+  assert.match(JSON.stringify(await deleteResponse.json()), /1 个房间引用/);
+  assert.ok(db.sqlite.prepare("SELECT id FROM question_sets WHERE id=?").get(created.id));
+});
+
+test("question-set admin deletion preserves R2 images still shared by another question set", async () => {
+  const { db, env, objects, deletedKeys } = createTestEnv();
+  const uploadResponse = await worker.fetch(uploadRequest(ONE_PIXEL_PNG), env);
+  const uploaded = await uploadResponse.json() as { key: string; url: string };
+  const finalizeResponse = await worker.fetch(finalizeRequest({
+    submissionId: "admin-shared-image-submission",
+    title: "共享图片原题库",
+    playerId: "admin-shared-player",
+    nickname: "管理测试者",
+    questions: [{ r2Key: uploaded.key, labelText: "共享答案" }],
+  }), env);
+  const created = await finalizeResponse.json() as { id: string };
+  const stored = db.sqlite.prepare("SELECT manifest_json FROM question_sets WHERE id=?").get(created.id) as { manifest_json: string };
+  const secondManifest = JSON.parse(stored.manifest_json) as { questions: Array<Record<string, unknown>> };
+  secondManifest.questions[0].id = "admin-shared-index-question";
+  secondManifest.questions[0].image_url = "https://example.com/manifest-does-not-share.webp";
+  db.sqlite.prepare(`INSERT INTO question_sets
+    (id,title,created_by_player_id,is_public,image_count,manifest_version,manifest_revision,manifest_json,created_at,updated_at)
+    VALUES (?,?,?,?,?,?,?,?,?,?)`)
+    .run(
+      "admin-shared-image-set",
+      "共享图片第二题库",
+      "shared-owner",
+      0,
+      1,
+      1,
+      0,
+      JSON.stringify(secondManifest),
+      "2026-03-01T00:00:00.000Z",
+      "2026-03-01T00:00:00.000Z",
+    );
+  db.sqlite.prepare(`INSERT INTO question_image_index
+    (question_id,question_set_id,image_url,answer_text,order_index,anime_subject_id,anime_tags_json,character_tags_json,created_at)
+    VALUES (?,?,?,?,?,?,?,?,?)`)
+    .run(
+      "admin-shared-index-question",
+      "admin-shared-image-set",
+      uploaded.url,
+      "索引仍引用共享图片",
+      0,
+      null,
+      "[]",
+      "[]",
+      "2026-03-01T00:00:00.000Z",
+    );
+
+  const detailResponse = await worker.fetch(questionSetAdminRequest(`/api/admin/question-sets/${created.id}`), env);
+  const detail = await detailResponse.json() as { updatedAt: string };
+  const deleteResponse = await worker.fetch(questionSetAdminRequest(`/api/admin/question-sets/${created.id}`, {
+    method: "DELETE",
+    body: { confirmQuestionSetId: created.id, expectedUpdatedAt: detail.updatedAt },
+  }), env);
+  assert.equal(deleteResponse.status, 200, await deleteResponse.clone().text());
+  const result = await deleteResponse.json() as { imageCleanup: Record<string, number> };
+  assert.deepEqual(result.imageCleanup, {
+    candidateCount: 1,
+    deletedCount: 0,
+    preservedSharedCount: 1,
+    pendingCount: 0,
+  });
+  assert.equal(objects.has(uploaded.key), true);
+  assert.deepEqual(deletedKeys, []);
+});
+
+test("question-set admin never maps an untrusted image origin to a local R2 deletion", async () => {
+  const { db, env, objects, deletedKeys } = createTestEnv();
+  const uploadResponse = await worker.fetch(uploadRequest(ONE_PIXEL_PNG), env);
+  const uploaded = await uploadResponse.json() as { key: string };
+  db.sqlite.prepare(`INSERT INTO question_sets
+    (id,title,created_by_player_id,is_public,image_count,created_at,updated_at)
+    VALUES (?,?,?,?,?,?,?)`)
+    .run(
+      "admin-untrusted-origin-set",
+      "外部同路径题库",
+      "external-owner",
+      0,
+      1,
+      "2026-03-01T00:00:00.000Z",
+      "2026-03-01T00:00:00.000Z",
+    );
+  db.sqlite.prepare(`INSERT INTO questions
+    (id,question_set_id,image_url,order_index,label_text,label_source,created_at)
+    VALUES (?,?,?,?,?,?,?)`)
+    .run(
+      "admin-untrusted-origin-question",
+      "admin-untrusted-origin-set",
+      `https://untrusted.example/api/r2-images/${uploaded.key}`,
+      0,
+      "外部图片",
+      "manual",
+      "2026-03-01T00:00:00.000Z",
+    );
+  const detailResponse = await worker.fetch(questionSetAdminRequest("/api/admin/question-sets/admin-untrusted-origin-set"), env);
+  const detail = await detailResponse.json() as { updatedAt: string };
+  const deleteResponse = await worker.fetch(questionSetAdminRequest("/api/admin/question-sets/admin-untrusted-origin-set", {
+    method: "DELETE",
+    body: { confirmQuestionSetId: "admin-untrusted-origin-set", expectedUpdatedAt: detail.updatedAt },
+  }), env);
+  assert.equal(deleteResponse.status, 200, await deleteResponse.clone().text());
+  const result = await deleteResponse.json() as { imageCleanup: Record<string, number> };
+  assert.deepEqual(result.imageCleanup, {
+    candidateCount: 0,
+    deletedCount: 0,
+    preservedSharedCount: 0,
+    pendingCount: 0,
+  });
+  assert.equal(objects.has(uploaded.key), true);
+  assert.deepEqual(deletedKeys, []);
+});
+
+test("question-set admin R2 cleanup fails closed when another manifest is corrupt", async () => {
+  const { db, env, objects, deletedKeys } = createTestEnv();
+  const uploadResponse = await worker.fetch(uploadRequest(ONE_PIXEL_PNG), env);
+  const uploaded = await uploadResponse.json() as { key: string };
+  const finalizeResponse = await worker.fetch(finalizeRequest({
+    submissionId: "admin-corrupt-reference-submission",
+    title: "损坏引用清理目标",
+    playerId: "admin-corrupt-reference-player",
+    nickname: "管理测试者",
+    questions: [{ r2Key: uploaded.key, labelText: "答案" }],
+  }), env);
+  const created = await finalizeResponse.json() as { id: string };
+  db.sqlite.prepare(`INSERT INTO question_sets
+    (id,title,created_by_player_id,is_public,image_count,manifest_version,manifest_revision,manifest_json,created_at,updated_at)
+    VALUES (?,?,?,?,?,?,?,?,?,?)`)
+    .run(
+      "admin-corrupt-reference-set",
+      "损坏引用题库",
+      "corrupt-reference-owner",
+      0,
+      1,
+      1,
+      0,
+      "{not-json-and-no-local-path",
+      "2026-03-02T00:00:00.000Z",
+      "2026-03-02T00:00:00.000Z",
+    );
+
+  const detailResponse = await worker.fetch(questionSetAdminRequest(`/api/admin/question-sets/${created.id}`), env);
+  const detail = await detailResponse.json() as { updatedAt: string };
+  const deleteResponse = await worker.fetch(questionSetAdminRequest(`/api/admin/question-sets/${created.id}`, {
+    method: "DELETE",
+    body: { confirmQuestionSetId: created.id, expectedUpdatedAt: detail.updatedAt },
+  }), env);
+  assert.equal(deleteResponse.status, 200, await deleteResponse.clone().text());
+  const result = await deleteResponse.json() as { imageCleanup: Record<string, number> };
+  assert.deepEqual(result.imageCleanup, {
+    candidateCount: 1,
+    deletedCount: 0,
+    preservedSharedCount: 0,
+    pendingCount: 1,
+  });
+  assert.equal(objects.has(uploaded.key), true);
+  assert.deepEqual(deletedKeys, []);
+});
+
+test("question-set admin reports R2 deletion failures after committing the D1 deletion", async () => {
+  const { db, env, objects } = createTestEnv();
+  const uploadResponse = await worker.fetch(uploadRequest(ONE_PIXEL_PNG), env);
+  const uploaded = await uploadResponse.json() as { key: string };
+  const finalizeResponse = await worker.fetch(finalizeRequest({
+    submissionId: "admin-r2-failure-submission",
+    title: "R2 删除失败题库",
+    playerId: "admin-r2-failure-player",
+    nickname: "管理测试者",
+    questions: [{ r2Key: uploaded.key, labelText: "答案" }],
+  }), env);
+  const created = await finalizeResponse.json() as { id: string };
+  (env.IMAGE_BUCKET as R2Bucket).delete = async () => {
+    throw new Error("forced R2 delete failure");
+  };
+  const detailResponse = await worker.fetch(questionSetAdminRequest(`/api/admin/question-sets/${created.id}`), env);
+  const detail = await detailResponse.json() as { updatedAt: string };
+  const deleteResponse = await worker.fetch(questionSetAdminRequest(`/api/admin/question-sets/${created.id}`, {
+    method: "DELETE",
+    body: { confirmQuestionSetId: created.id, expectedUpdatedAt: detail.updatedAt },
+  }), env);
+  assert.equal(deleteResponse.status, 200, await deleteResponse.clone().text());
+  const result = await deleteResponse.json() as { imageCleanup: Record<string, number> };
+  assert.deepEqual(result.imageCleanup, {
+    candidateCount: 1,
+    deletedCount: 0,
+    preservedSharedCount: 0,
+    pendingCount: 1,
+  });
+  assert.equal(db.sqlite.prepare("SELECT COUNT(*) AS count FROM question_sets WHERE id=?").get(created.id).count, 0);
+  assert.equal(objects.has(uploaded.key), true);
+});
+
+test("question-set admin deletion atomically removes D1 dependents and unreferenced R2 objects", async () => {
+  const { db, env, objects, deletedKeys } = createTestEnv();
+  const uploadResponse = await worker.fetch(uploadRequest(ONE_PIXEL_PNG), env);
+  const uploaded = await uploadResponse.json() as { key: string };
+  const finalizeResponse = await worker.fetch(finalizeRequest({
+    submissionId: "admin-delete-clean-submission",
+    title: "可安全删除题库",
+    playerId: "admin-delete-player",
+    nickname: "管理测试者",
+    questions: [{ r2Key: uploaded.key, labelText: "待删除答案" }],
+  }), env);
+  assert.equal(finalizeResponse.status, 200, await finalizeResponse.clone().text());
+  const created = await finalizeResponse.json() as { id: string };
+  const detailResponse = await worker.fetch(questionSetAdminRequest(`/api/admin/question-sets/${created.id}`), env);
+  const detail = await detailResponse.json() as { updatedAt: string; canDelete: boolean };
+  assert.equal(detail.canDelete, true);
+
+  const wrongConfirmation = await worker.fetch(questionSetAdminRequest(`/api/admin/question-sets/${created.id}`, {
+    method: "DELETE",
+    body: { confirmQuestionSetId: "another-set", expectedUpdatedAt: detail.updatedAt },
+  }), env);
+  assert.equal(wrongConfirmation.status, 400);
+
+  const deleteResponse = await worker.fetch(questionSetAdminRequest(`/api/admin/question-sets/${created.id}`, {
+    method: "DELETE",
+    body: { confirmQuestionSetId: created.id, expectedUpdatedAt: detail.updatedAt },
+  }), env);
+  assert.equal(deleteResponse.status, 200, await deleteResponse.clone().text());
+  const deleted = await deleteResponse.json() as {
+    deleted: boolean;
+    imageCleanup: { candidateCount: number; deletedCount: number; preservedSharedCount: number; pendingCount: number };
+  };
+  assert.equal(deleted.deleted, true);
+  assert.deepEqual(deleted.imageCleanup, {
+    candidateCount: 1,
+    deletedCount: 1,
+    preservedSharedCount: 0,
+    pendingCount: 0,
+  });
+  assert.equal(objects.has(uploaded.key), false);
+  assert.deepEqual(deletedKeys, [uploaded.key]);
+  const counts = db.sqlite.prepare(`SELECT
+    (SELECT COUNT(*) FROM question_sets WHERE id=?) AS sets,
+    (SELECT COUNT(*) FROM question_image_index WHERE question_set_id=?) AS image_indexes,
+    (SELECT COUNT(*) FROM community_question_set_submissions WHERE question_set_id=?) AS submissions
+  `).get(created.id, created.id, created.id) as { sets: number; image_indexes: number; submissions: number };
+  assert.deepEqual({ ...counts }, { sets: 0, image_indexes: 0, submissions: 0 });
 });
