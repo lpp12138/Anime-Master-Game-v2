@@ -129,8 +129,8 @@ export default function CommunityUploadPage() {
   }, [questionListText]);
   const hasUnsubmittedWork = drafts.length > 0 || Boolean(questionListText.trim()) || Boolean(imageUrlText.trim()) || isBusy;
 
+  // 上传者昵称不再从本地会话自动填入，必须由用户手动填写（提交时校验非空）。
   useEffect(() => {
-    setUploaderNickname(getLocalSession().nickname);
     uploadKeyInputRef.current?.focus();
   }, []);
 
@@ -965,6 +965,7 @@ export default function CommunityUploadPage() {
                   disabled={isLocked}
                   maxLength={20}
                   placeholder="社区中显示的昵称"
+                  required
                   value={uploaderNickname}
                   onChange={(event) => setUploaderNickname(event.target.value)}
                 />
