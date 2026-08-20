@@ -4,7 +4,7 @@ import { useEffect, useRef, useState } from "react";
 import { useRouter } from "@/lib/router";
 import { AppShell } from "@/components/AppShell";
 import { Button } from "@/components/Button";
-import { CommunityScreenshotUploader } from "@/components/CommunityScreenshotUploader";
+import { CommunityScreenshotUploadButton } from "@/components/CommunityScreenshotUploadButton";
 import { FormField } from "@/components/FormField";
 import { Panel } from "@/components/Panel";
 import { QuestionGuideButton } from "@/components/QuestionGuideButton";
@@ -447,7 +447,7 @@ export default function HomePage() {
             </p>
             <div className="mt-6 flex flex-col gap-3 sm:flex-row">
               <QuestionGuideButton className="w-full sm:w-auto" />
-              <CommunityScreenshotUploader className="w-full sm:w-auto" nickname={nickname} />
+              <CommunityScreenshotUploadButton className="w-full sm:w-auto" nickname={nickname} />
             </div>
             <div className="mt-8 grid max-w-xl gap-3 sm:grid-cols-3">
               <div className="rounded-lg border border-white bg-white/70 p-4 shadow-sm">
