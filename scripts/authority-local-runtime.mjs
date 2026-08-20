@@ -57,6 +57,7 @@ class LocalWorker {
     this.port = port;
     this.persistTo = persistTo;
     this.process = null;
+    this.processGroupPid = null;
     this.logs = "";
   }
 
@@ -65,13 +66,16 @@ class LocalWorker {
 
   async start() {
     assert.equal(this.process, null);
+    assert.equal(this.processGroupPid, null);
     const child = spawn(process.execPath, [WRANGLER, "dev", "--local", "--ip", "127.0.0.1", "--port", String(this.port), "--inspector-port", String(this.port + 1), "--persist-to", this.persistTo, "--show-interactive-dev-session=false", "--log-level=error"], {
       cwd: ROOT,
       env: { ...process.env, CI: "1" },
       stdio: ["ignore", "pipe", "pipe"],
       windowsHide: true,
+      detached: process.platform !== "win32",
     });
     this.process = child;
+    this.processGroupPid = process.platform !== "win32" ? child.pid ?? null : null;
     child.stdout.on("data", (chunk) => { this.logs += chunk; });
     child.stderr.on("data", (chunk) => { this.logs += chunk; });
     child.once("exit", () => { if (this.process === child) this.process = null; });
@@ -99,19 +103,51 @@ class LocalWorker {
 
   async stop() {
     const child = this.process;
-    if (!child) return;
-    const exited = new Promise((resolveExit) => child.once("exit", resolveExit));
-    child.kill("SIGTERM");
+    const processGroupPid = this.processGroupPid;
+    if (!child && !processGroupPid) return;
+    const exited = child && child.exitCode == null
+      ? new Promise((resolveExit) => child.once("exit", resolveExit))
+      : Promise.resolve();
+    if (child?.exitCode == null) child.kill("SIGTERM");
     await Promise.race([
       exited,
       new Promise((resolveWait) => setTimeout(resolveWait, 5_000)),
     ]);
-    if (child.exitCode == null) {
-      child.kill("SIGKILL");
-      await Promise.race([exited, new Promise((resolveWait) => setTimeout(resolveWait, 2_000))]);
+
+    if (processGroupPid && this.isProcessGroupAlive(processGroupPid)) {
+      this.signalProcessGroup(processGroupPid, "SIGTERM");
+      const deadline = Date.now() + 2_000;
+      while (Date.now() < deadline && this.isProcessGroupAlive(processGroupPid)) {
+        await new Promise((resolveWait) => setTimeout(resolveWait, 100));
+      }
     }
+    if (processGroupPid && this.isProcessGroupAlive(processGroupPid)) {
+      this.signalProcessGroup(processGroupPid, "SIGKILL");
+    } else if (child?.exitCode == null) {
+      child.kill("SIGKILL");
+    }
+    await Promise.race([exited, new Promise((resolveWait) => setTimeout(resolveWait, 2_000))]);
     if (this.process === child) this.process = null;
+    this.processGroupPid = null;
     await new Promise((resolveWait) => setTimeout(resolveWait, 300));
+  }
+
+  isProcessGroupAlive(pid) {
+    try {
+      process.kill(-pid, 0);
+      return true;
+    } catch (error) {
+      if (error?.code === "ESRCH") return false;
+      throw error;
+    }
+  }
+
+  signalProcessGroup(pid, signal) {
+    try {
+      process.kill(-pid, signal);
+    } catch (error) {
+      if (error?.code !== "ESRCH") throw error;
+    }
   }
 }
 
@@ -253,7 +289,14 @@ async function rpc(worker, metrics, name, args) {
     body: JSON.stringify({ name, args }),
     signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
   });
-  const payload = await response.json();
+  const text = await response.text();
+  let payload;
+  try {
+    payload = JSON.parse(text);
+  } catch {
+    metrics.httpErrors += 1;
+    throw new Error(`${name}: non-JSON HTTP ${response.status}: ${text.slice(0, 500)}`);
+  }
   if (!response.ok || payload.error) {
     metrics.httpErrors += 1;
     throw new Error(`${name}: ${payload.error ?? `HTTP ${response.status}`}`);
@@ -512,7 +555,9 @@ async function main() {
     `);
     await worker.start();
     await assertLegacyRoomExpired(worker);
-    contexts = await Promise.all(Array.from({ length: ROOM_COUNT }, (_, roomIndex) => setupRoom(worker, metrics, roomIndex)));
+    for (let roomIndex = 0; roomIndex < ROOM_COUNT; roomIndex += 1) {
+      contexts.push(await setupRoom(worker, metrics, roomIndex));
+    }
     await Promise.all(contexts.map((context) => connectRoom(worker, metrics, context)));
 
     await snapshotStorm(contexts);
@@ -677,6 +722,12 @@ async function main() {
     assert.equal(result.unexpectedWsErrors, 0);
     assert.equal(result.internalErrorLogMatches, 0);
     console.log(JSON.stringify(result, null, 2));
+  } catch (error) {
+    const recentWorkerLogs = worker.logs.slice(-16_000);
+    throw new Error(
+      `authority local runtime failed: ${error instanceof Error ? error.message : String(error)}${recentWorkerLogs ? `\nRecent workerd logs:\n${recentWorkerLogs}` : ""}`,
+      { cause: error },
+    );
   } finally {
     for (const context of contexts) for (const client of context.clients.values()) client.close();
     await worker.stop();
