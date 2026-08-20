@@ -12,6 +12,7 @@ type StoredManifestQuestion = {
   id: string;
   image_url: string;
   order_index: number;
+  is_r18: boolean;
   label_text: string | null;
   label_source: "manual" | "answer" | null;
   label_source_answer_id: string | null;
@@ -29,6 +30,10 @@ type ManifestQuestionSetRow = Pick<DbQuestionSet, "id" | "manifest_version" | "m
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isDbTruthy(value: unknown) {
+  return value === true || value === 1;
 }
 
 function optionalString(value: unknown, field: string) {
@@ -52,10 +57,17 @@ function parseStoredQuestion(value: unknown, expectedOrder: number): StoredManif
   if (labelSource !== null && labelSource !== undefined && labelSource !== "manual" && labelSource !== "answer") {
     throw new Error("题集 manifest 正确答案来源无效。");
   }
+  const isR18 = value.is_r18;
+  // 只接受 boolean；null/字符串/数字一律拒绝（旧 manifest 缺省该字段视为 false）。
+  if (isR18 !== undefined && typeof isR18 !== "boolean") {
+    throw new Error("题集 manifest 成人内容标记无效。");
+  }
   return {
     id: requiredString(value.id, "id"),
     image_url: requiredString(value.image_url, "image_url"),
     order_index: orderIndex,
+    // 旧 manifest 没有 is_r18 字段，历史题目一律视为非 R18。
+    is_r18: isR18 === true,
     label_text: optionalString(value.label_text, "label_text"),
     label_source: labelSource ?? null,
     label_source_answer_id: optionalString(value.label_source_answer_id, "label_source_answer_id"),
@@ -96,6 +108,7 @@ function toStoredQuestion(question: Question): StoredManifestQuestion {
     id: question.id,
     image_url: question.imageUrl,
     order_index: question.orderIndex,
+    is_r18: question.isR18 === true,
     label_text: question.labelText?.trim() || null,
     label_source: question.labelSource ?? null,
     label_source_answer_id: question.labelSourceAnswerId ?? null,
@@ -130,6 +143,7 @@ export function encodeDbQuestionSetManifest(questions: readonly DbQuestion[]) {
     questionSetId: question.question_set_id,
     imageUrl: question.image_url,
     orderIndex: question.order_index,
+    isR18: isDbTruthy(question.is_r18),
     labelText: question.label_text ?? null,
     labelSource: question.label_source ?? null,
     labelSourceAnswerId: question.label_source_answer_id ?? null,

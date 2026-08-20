@@ -46,6 +46,7 @@ type AdminQuestionIndexDbRow = {
   image_url: string;
   answer_text: string;
   order_index: number;
+  is_r18: number | boolean | null;
   anime_subject_id: number | null;
   anime_tags_json: string;
   character_tags_json: string;
@@ -82,6 +83,7 @@ export type AdminQuestionSetQuestion = {
   id: string;
   imageUrl: string;
   orderIndex: number;
+  isR18: boolean;
   answerText: string | null;
   animeSubjectId: number | null;
   animeTags: BangumiAnimeTag[];
@@ -262,7 +264,7 @@ export async function listAdminQuestionSets(db: D1Database, url: URL) {
 
 async function getLegacyQuestions(db: D1Database, questionSetId: string) {
   const result = await db.prepare(`
-    SELECT id, question_set_id, image_url, order_index, label_text, label_source,
+    SELECT id, question_set_id, image_url, order_index, is_r18, label_text, label_source,
            label_source_answer_id, label_updated_by_player_id, label_updated_at, created_at
     FROM questions
     WHERE question_set_id = ?
@@ -274,7 +276,7 @@ async function getLegacyQuestions(db: D1Database, questionSetId: string) {
 
 async function getIndexedQuestions(db: D1Database, questionSetId: string) {
   const result = await db.prepare(`
-    SELECT question_id, question_set_id, image_url, answer_text, order_index,
+    SELECT question_id, question_set_id, image_url, answer_text, order_index, is_r18,
            anime_subject_id, anime_tags_json, character_tags_json, created_at
     FROM question_image_index
     WHERE question_set_id = ?
@@ -327,6 +329,7 @@ export async function getAdminQuestionSetDetail(db: D1Database, questionSetId: s
         question_set_id: question.question_set_id,
         image_url: question.image_url,
         order_index: question.order_index,
+        is_r18: question.is_r18 ?? 0,
         label_text: question.answer_text,
         label_source: "manual",
         created_at: question.created_at,
@@ -347,10 +350,16 @@ export async function getAdminQuestionSetDetail(db: D1Database, questionSetId: s
     if (indexed && (indexed.image_url !== question.image_url || indexed.order_index !== question.order_index)) {
       integrityIssues.push(`第 ${question.order_index + 1} 题的图片索引与题库顺序不一致。`);
     }
+    // R18 mismatch 独立于答案检查：即使存储侧没有答案，只要 manifest/legacy 行与
+    // 图片索引的成人内容标记不一致，就必须报告，避免完整性报告漏报。
+    if (indexed && isDbTruthy(indexed.is_r18) !== isDbTruthy(question.is_r18)) {
+      integrityIssues.push(`第 ${question.order_index + 1} 题的成人内容标记与图片索引不一致。`);
+    }
     return {
       id: question.id,
       imageUrl: question.image_url,
       orderIndex: question.order_index,
+      isR18: isDbTruthy(question.is_r18 ?? indexed?.is_r18),
       answerText: indexedAnswer ?? storedAnswer,
       animeSubjectId: indexed?.anime_subject_id ?? null,
       animeTags: tags.animeTags,
@@ -510,6 +519,8 @@ type AdminQuestionWriteInput = {
   animeTags?: BangumiAnimeTag[];
   characterTags?: BangumiCharacterTag[];
   imageUrl?: string;
+  /** 省略时服务端复用现有值（创建默认 false）。 */
+  isR18?: boolean;
   expectedUpdatedAt: string;
   orderIndex?: number;
 };
@@ -652,9 +663,9 @@ function buildAdminQuestionIndexStatements(
     const characterTagsJson = override ? JSON.stringify(override.characterTags) : indexed?.character_tags_json ?? "[]";
     statements.push(db.prepare(`INSERT INTO question_image_index (
         question_id,question_set_id,image_url,answer_text,order_index,
-        anime_subject_id,anime_tags_json,character_tags_json,created_at
+        anime_subject_id,anime_tags_json,character_tags_json,created_at,is_r18
       )
-      SELECT ?,?,?,?,?,?,?,?,?
+      SELECT ?,?,?,?,?,?,?,?,?,?
       WHERE EXISTS (${guard})`)
       .bind(
         question.id,
@@ -666,6 +677,7 @@ function buildAdminQuestionIndexStatements(
         animeTagsJson,
         characterTagsJson,
         indexed?.created_at ?? question.created_at,
+        isDbTruthy(question.is_r18) ? 1 : 0,
         questionSetId,
         updatedAt,
       ));
@@ -737,16 +749,17 @@ async function executeAdminQuestionMutation(
       .bind(state.row.id, state.row.id, updatedAt));
     for (const question of questions) {
       statements.push(db.prepare(`INSERT INTO questions (
-          id,question_set_id,image_url,order_index,label_text,label_source,
+          id,question_set_id,image_url,order_index,is_r18,label_text,label_source,
           label_source_answer_id,label_updated_by_player_id,label_updated_at,created_at
         )
-        SELECT ?,?,?,?,?,?,?,?,?,?
+        SELECT ?,?,?,?,?,?,?,?,?,?,?
         WHERE EXISTS (${guard})`)
         .bind(
           question.id,
           state.row.id,
           question.image_url,
           question.order_index,
+          isDbTruthy(question.is_r18) ? 1 : 0,
           question.label_text ?? null,
           question.label_source ?? null,
           question.label_source_answer_id ?? null,
@@ -820,6 +833,7 @@ export async function createAdminQuestionSetQuestion(
     question_set_id: questionSetId,
     image_url: imageUrl,
     order_index: state.questions.length,
+    is_r18: input.isR18 === true,
     label_text: answerText,
     label_source: "manual",
     label_source_answer_id: null,
@@ -869,10 +883,11 @@ export async function updateAdminQuestionSetQuestion(
   const tagsProvided = input.animeTags !== undefined || input.characterTags !== undefined;
   const tags = tagsProvided ? normalizeAdminQuestionTags(input) : null;
   const tagsChanged = tagsProvided && !tagsEqual(indexed, tags);
+  const r18Changed = input.isR18 !== undefined && isDbTruthy(current.is_r18) !== input.isR18;
   const contentChanged = current.image_url !== imageUrl
     || (answerProvided && (current.label_text?.trim() ?? null) !== answerText);
   const orderChanged = currentIndex !== orderIndex;
-  if (!contentChanged && !orderChanged && !tagsChanged) {
+  if (!contentChanged && !orderChanged && !tagsChanged && !r18Changed) {
     return { questionSet: await getAdminQuestionSetDetail(db, questionSetId), removedImageUrls: [] };
   }
 
@@ -881,6 +896,7 @@ export async function updateAdminQuestionSetQuestion(
     ...current,
     image_url: imageUrl,
     order_index: orderIndex,
+    ...(input.isR18 !== undefined ? { is_r18: input.isR18 === true } : {}),
     ...(contentChanged || tagsChanged
       ? {
           label_text: answerText,

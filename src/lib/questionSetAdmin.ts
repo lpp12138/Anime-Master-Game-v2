@@ -32,6 +32,7 @@ export type AdminQuestionSetQuestion = {
   id: string;
   imageUrl: string;
   orderIndex: number;
+  isR18: boolean;
   answerText: string | null;
   animeSubjectId: number | null;
   animeTags: BangumiAnimeTag[];
@@ -206,6 +207,8 @@ export type AdminQuestionWriteInput = {
   /** 仅 PATCH 可省略；省略时服务端复用已规范化的现有标签。 */
   animeTags?: BangumiAnimeTag[];
   characterTags?: BangumiCharacterTag[];
+  /** 成人内容标记；省略时服务端复用现有值（新增默认 false）。 */
+  isR18?: boolean;
   expectedUpdatedAt: string;
   r2Key?: string;
   orderIndex?: number;

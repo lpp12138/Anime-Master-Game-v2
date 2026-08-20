@@ -250,6 +250,8 @@ export type Question = {
   questionSetId: string;
   imageUrl: string;
   orderIndex: number;
+  /** 本题是否为成人内容（R18）。默认 false；游戏运行时可见，便于未来遮罩，不自动隐藏/删除。 */
+  isR18: boolean;
   labelText?: string | null;
   labelSource?: "manual" | "answer" | null;
   labelSourceAnswerId?: string | null;
@@ -261,6 +263,7 @@ export type Question = {
 export type QuestionUrlImportInput = {
   imageUrl: string;
   labelText?: string | null;
+  isR18?: boolean;
   orderIndex: number;
 };
 
@@ -502,6 +505,7 @@ export type DbQuestion = {
   question_set_id: string;
   image_url: string;
   order_index: number;
+  is_r18?: number | boolean | null;
   label_text?: string | null;
   label_source?: "manual" | "answer" | null;
   label_source_answer_id?: string | null;

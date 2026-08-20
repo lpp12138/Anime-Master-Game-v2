@@ -34,6 +34,7 @@ import {
   updateRoomGameSettings,
   updateRoomNotice,
 } from "../worker/gameService";
+import type { QuestionImportItem } from "../worker/gameService";
 import { getRoomNoticeUpdatedDelta } from "../worker/roomNotice";
 
 const root = resolve(import.meta.dirname, "..");
@@ -1315,5 +1316,67 @@ test("returning a completed room to the lobby clears all per-game identities", a
     assert.equal(room.currentGameId, null);
     assert.equal(room.preparedQuestionSetId, null);
     assert.deepEqual(room.teamAssignments, {});
+  });
+});
+
+test("direct questions payload rejects non-boolean or null isR18 and conflicting is_r18 / isR18", async () => {
+  const db = new DatabaseAdapter();
+  applyMigrations(db.sqlite);
+  await runWithGameDatabase(db, async () => {
+    const room = await createRoom("r18-import-host", "R18 Import Host");
+    await selectPresenterForRound(room.id, "r18-import-host", "r18-import-host");
+
+    // 直接 questions payload（RPC 路径）只接受 boolean。
+    await assert.rejects(
+      createUploadedQuestionSet({
+        roomId: room.id,
+        presenterPlayerId: "r18-import-host",
+        title: "R18 字符串题库",
+        questions: [{ imageUrl: "https://example.com/1.webp", labelText: "答案", isR18: "yes" }],
+      }),
+      /is_r18 必须是布尔值/,
+    );
+    await assert.rejects(
+      createUploadedQuestionSet({
+        roomId: room.id,
+        presenterPlayerId: "r18-import-host",
+        title: "R18 null 题库",
+        questions: [{ imageUrl: "https://example.com/1.webp", labelText: "答案", isR18: null }],
+      }),
+      /is_r18 必须是布尔值/,
+    );
+    // 两个字段同时存在且值冲突必须拒绝（untyped 载荷可能带 snake_case 键）。
+    await assert.rejects(
+      createUploadedQuestionSet({
+        roomId: room.id,
+        presenterPlayerId: "r18-import-host",
+        title: "R18 冲突题库",
+        questions: [{
+          imageUrl: "https://example.com/1.webp",
+          labelText: "答案",
+          isR18: true,
+          is_r18: false,
+        } as QuestionImportItem],
+      }),
+      /is_r18 与 isR18 不一致/,
+    );
+    // JSON/JSONL 文本导入路径同样拒绝冲突。
+    await assert.rejects(
+      createQuestionSetFromUrlText({
+        roomId: room.id,
+        presenterPlayerId: "r18-import-host",
+        title: "R18 文本冲突题库",
+        imageUrlsText: JSON.stringify({
+          image_url: "https://example.com/1.webp",
+          label_text: "答案",
+          is_r18: true,
+          isR18: false,
+        }),
+      }),
+      /is_r18 与 isR18 不一致/,
+    );
+    // 冲突被拒绝后题库不应被创建。
+    const remaining = db.sqlite.prepare("SELECT COUNT(*) AS count FROM question_sets WHERE title LIKE 'R18 %题库'").get() as { count: number };
+    assert.equal(remaining.count, 0);
   });
 });

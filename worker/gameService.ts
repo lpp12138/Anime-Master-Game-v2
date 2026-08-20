@@ -349,6 +349,7 @@ function toQuestion(question: DbQuestion): Question {
     questionSetId: question.question_set_id,
     imageUrl: question.image_url,
     orderIndex: question.order_index,
+    isR18: isDbTruthy(question.is_r18),
     labelText: question.label_text ?? null,
     labelSource: question.label_source ?? null,
     labelSourceAnswerId: question.label_source_answer_id ?? null,
@@ -1822,11 +1823,16 @@ function getSelectableTeamBattleBlocks(session: Pick<GameSession, "revealedBlock
   return getRevealBlocks(revealBlockCount).filter((block) => !revealed.has(block) && !disabled.has(block));
 }
 
+function isDbTruthy(value: unknown) {
+  return value === true || value === 1;
+}
+
 export type QuestionImportItem = {
   imageUrl: string;
   labelText?: string | null;
   animeTags?: BangumiAnimeTag[];
   characterTags?: BangumiCharacterTag[];
+  isR18?: boolean;
 };
 
 function isHttpImageUrl(value: string) {
@@ -1853,18 +1859,22 @@ function normalizeQuestionImportItems(items: QuestionImportItem[]) {
   const seenUrls = new Set<string>();
   const normalizedItems: QuestionImportItem[] = [];
 
-  for (const item of items) {
+  for (const [index, item] of items.entries()) {
     const imageUrl = item.imageUrl.trim();
 
     if (!imageUrl || !isHttpImageUrl(imageUrl) || seenUrls.has(imageUrl)) {
       continue;
     }
 
+    // 直接 questions payload 是未信任输入：isR18/is_r18 只接受 boolean，
+    // null/字符串/数字拒绝，两个字段同时存在且值冲突拒绝。
+    const isR18 = parseImportedIsR18(item as unknown as Record<string, unknown>, `第 ${index + 1} 题`);
     const tags = normalizeBangumiQuestionTags(item.animeTags, item.characterTags);
     seenUrls.add(imageUrl);
     normalizedItems.push({
       imageUrl,
       labelText: item.labelText?.trim() || null,
+      isR18,
       animeTags: tags.animeTags,
       characterTags: tags.characterTags,
     });
@@ -1913,14 +1923,31 @@ export function parseQuestionImportText(importText: string): QuestionImportItem[
     }
 
     const labelText = typeof record.label_text === "string" ? record.label_text : null;
+    const isR18 = parseImportedIsR18(record, `第 ${index + 1} 行`);
 
     items.push({
       imageUrl: record.image_url,
       labelText,
+      isR18,
     });
   }
 
   return normalizeQuestionImportItems(items);
+}
+
+function parseImportedIsR18(record: Record<string, unknown>, location: string) {
+  const legacy = record.is_r18;
+  const camel = record.isR18;
+  if (legacy !== undefined && camel !== undefined && legacy !== camel) {
+    throw new Error(`${location}的 is_r18 与 isR18 不一致。`);
+  }
+  // 两个字段都只接受 boolean；null/字符串/数字一律拒绝，缺省视为 false。
+  // 不能用 legacy ?? camel：is_r18: null 会被当成缺省而静默放过。
+  const raw = legacy !== undefined ? legacy : camel;
+  if (raw !== undefined && typeof raw !== "boolean") {
+    throw new Error(`${location}的 is_r18 必须是布尔值。`);
+  }
+  return raw === true;
 }
 
 function imageUrlsToText(imageUrls: string[]) {
@@ -2606,6 +2633,7 @@ export async function createUploadedQuestionSet(params: {
       question_set_id: questionSetId,
       image_url: item.imageUrl,
       order_index: index,
+      is_r18: item.isR18 === true,
       label_text: labelText,
       label_source: labelText ? "manual" : null,
       label_source_answer_id: null,
@@ -2789,6 +2817,7 @@ function buildHomepageCommunityQuestions(
       question_set_id: questionSetId,
       image_url: item.imageUrl,
       order_index: startOrderIndex + index,
+      is_r18: item.isR18 === true,
       label_text: labelText,
       label_source: labelText ? "manual" : null,
       label_source_answer_id: null,
@@ -2806,6 +2835,7 @@ function buildHomepageImageIndexRows(questions: DbQuestion[], questionItems: Que
     image_url: question.image_url,
     answer_text: question.label_text!,
     order_index: question.order_index,
+    is_r18: question.is_r18 === true ? 1 : 0,
     anime_subject_id: questionItems[index].animeTags?.[0]?.id ?? null,
     anime_tags_json: questionItems[index].animeTags ?? [],
     character_tags_json: questionItems[index].characterTags ?? [],
@@ -2874,9 +2904,9 @@ async function appendHomepageCommunityQuestions(params: {
     ...imageIndexRows.map((row) => ({
       query: `INSERT INTO question_image_index (
           question_id, question_set_id, image_url, answer_text, order_index,
-          anime_subject_id, anime_tags_json, character_tags_json, created_at
+          anime_subject_id, anime_tags_json, character_tags_json, created_at, is_r18
         )
-        SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?
+        SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
         WHERE EXISTS (${guardQuery})
         RETURNING *`,
       bindings: [
@@ -2889,6 +2919,7 @@ async function appendHomepageCommunityQuestions(params: {
         JSON.stringify(row.anime_tags_json),
         JSON.stringify(row.character_tags_json),
         row.created_at,
+        row.is_r18,
         ...guardBindings,
       ],
     })),

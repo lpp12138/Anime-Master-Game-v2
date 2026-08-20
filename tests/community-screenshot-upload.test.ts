@@ -2539,3 +2539,401 @@ test("question-set admin deletion atomically removes D1 dependents and unreferen
   `).get(created.id, created.id, created.id) as { sets: number; image_indexes: number; submissions: number };
   assert.deepEqual({ ...counts }, { sets: 0, image_indexes: 0, submissions: 0 });
 });
+
+test("D1 0032 adds per-question is_r18 to legacy rows and the image index with default false", () => {
+  const sqlite = new DatabaseSync(":memory:");
+  applyMigrations(sqlite, "0031");
+  sqlite.prepare(`INSERT INTO question_sets
+    (id,title,created_by_player_id,is_public,image_count,created_at,updated_at)
+    VALUES (?,?,?,?,?,?,?)`)
+    .run("r18-migration-set", "迁移前题库", "legacy-owner", 1, 1, "2026-01-01T00:00:00.000Z", "2026-01-01T00:00:00.000Z");
+  sqlite.prepare(`INSERT INTO questions
+    (id,question_set_id,image_url,order_index,label_text,label_source,created_at)
+    VALUES (?,?,?,?,?,?,?)`)
+    .run("r18-migration-question", "r18-migration-set", "https://example.com/old.webp", 0, "旧答案", "manual", "2026-01-01T00:00:00.000Z");
+  sqlite.prepare(`INSERT INTO question_image_index
+    (question_id,question_set_id,image_url,answer_text,order_index,anime_tags_json,character_tags_json,created_at)
+    VALUES (?,?,?,?,?,?,?,?)`)
+    .run("r18-migration-question", "r18-migration-set", "https://example.com/old.webp", "旧答案", 0, "[]", "[]", "2026-01-01T00:00:00.000Z");
+
+  const migration = readFileSync(resolve(import.meta.dirname, "..", "d1", "migrations", "0032_question_is_r18.sql"), "utf8");
+  sqlite.exec("BEGIN IMMEDIATE");
+  try {
+    sqlite.exec(migration);
+    throw new Error("injected migration failure");
+  } catch {
+    sqlite.exec("ROLLBACK");
+  }
+  assert.equal(sqlite.prepare("SELECT COUNT(*) count FROM pragma_table_info('questions') WHERE name='is_r18'").get().count, 0);
+  assert.equal(sqlite.prepare("SELECT COUNT(*) count FROM pragma_table_info('question_image_index') WHERE name='is_r18'").get().count, 0);
+
+  sqlite.exec(migration);
+  const legacy = sqlite.prepare("SELECT is_r18 FROM questions WHERE id=?").get("r18-migration-question") as { is_r18: number };
+  const indexed = sqlite.prepare("SELECT is_r18 FROM question_image_index WHERE question_id=?").get("r18-migration-question") as { is_r18: number };
+  assert.deepEqual([legacy.is_r18, indexed.is_r18], [0, 0]);
+  sqlite.prepare("UPDATE questions SET is_r18=1 WHERE id=?").run("r18-migration-question");
+  sqlite.prepare("UPDATE question_image_index SET is_r18=1 WHERE question_id=?").run("r18-migration-question");
+  assert.throws(() => sqlite.prepare("UPDATE questions SET is_r18=2 WHERE id=?").run("r18-migration-question"), /CHECK/);
+  assert.throws(() => sqlite.prepare("UPDATE question_image_index SET is_r18=2 WHERE question_id=?").run("r18-migration-question"), /CHECK/);
+});
+
+test("old manifests without is_r18 decode as false and invalid markers fail closed", () => {
+  const oldManifest = JSON.stringify({
+    schema: 1,
+    questions: [{
+      id: "legacy-manifest-question",
+      image_url: "https://example.com/old.webp",
+      order_index: 0,
+      label_text: "旧答案",
+      label_source: "manual",
+      created_at: "2026-01-01T00:00:00.000Z",
+    }],
+  });
+  const decoded = decodeQuestionSetManifest({
+    id: "old-manifest-set",
+    manifest_version: 1,
+    manifest_json: oldManifest,
+  });
+  assert.equal(decoded?.[0].is_r18, false);
+
+  const badManifest = JSON.stringify({
+    schema: 1,
+    questions: [{
+      id: "bad-marker-question",
+      image_url: "https://example.com/old.webp",
+      order_index: 0,
+      is_r18: "yes",
+      label_text: "旧答案",
+      created_at: "2026-01-01T00:00:00.000Z",
+    }],
+  });
+  assert.throws(
+    () => decodeQuestionSetManifest({ id: "bad-marker-set", manifest_version: 1, manifest_json: badManifest }),
+    /成人内容标记无效/,
+  );
+});
+
+test("question-set finalize persists per-question isR18 to manifest and index and rejects wrong types", async () => {
+  const { db, env } = createTestEnv();
+  const uploadResponse = await worker.fetch(uploadRequest(ONE_PIXEL_PNG), env);
+  assert.equal(uploadResponse.status, 200);
+  const uploaded = await uploadResponse.json() as { key: string };
+
+  const rejectedResponse = await worker.fetch(finalizeRequest({
+    title: "R18 类型错误题库",
+    playerId: "r18-player",
+    nickname: "R18 上传者",
+    questions: [{ r2Key: uploaded.key, labelText: "答案", isR18: "yes" }],
+  }), env);
+  assert.equal(rejectedResponse.status, 400);
+  assert.match(JSON.stringify(await rejectedResponse.json()), /成人内容标记必须是布尔值/);
+
+  const response = await worker.fetch(finalizeRequest({
+    title: "R18 标记题库",
+    playerId: "r18-player",
+    nickname: "R18 上传者",
+    questions: [{
+      r2Key: uploaded.key,
+      labelText: "答案",
+      isR18: true,
+      animeTags: [{ id: 2, name: "伪造番剧名", nameCn: "伪造中文名" }],
+    }],
+  }), env);
+  assert.equal(response.status, 200, await response.clone().text());
+  const result = await response.json() as { id: string };
+
+  const row = db.sqlite.prepare("SELECT * FROM question_sets WHERE id=?").get(result.id) as Record<string, unknown>;
+  assert.equal(decodeQuestionSetManifest(row)?.[0].is_r18, true);
+  const indexed = db.sqlite.prepare("SELECT is_r18 FROM question_image_index WHERE question_set_id=?").get(result.id) as { is_r18: number };
+  assert.equal(indexed.is_r18, 1);
+
+  const indexResponse = await worker.fetch(new Request("https://caicai.lpp.moe/api/community-image-index?animeSubjectId=2", {
+    headers: { "x-community-upload-key": UPLOAD_SECRET },
+  }), env);
+  assert.equal(indexResponse.status, 200);
+  const indexPayload = await indexResponse.json() as { images: Array<Record<string, unknown>> };
+  assert.equal(indexPayload.images[0].isR18, true);
+  assert.equal("answerText" in indexPayload.images[0], false);
+
+  const detailResponse = await worker.fetch(questionSetAdminRequest(`/api/admin/question-sets/${result.id}`), env);
+  const detail = await detailResponse.json() as { questions: Array<{ isR18: boolean }> };
+  assert.equal(detail.questions[0].isR18, true);
+});
+
+test("same-title append keeps per-question R18 flags independent", async () => {
+  const { db, env } = createTestEnv();
+  const firstUpload = await worker.fetch(uploadRequest(ONE_PIXEL_PNG), env);
+  const secondUpload = await worker.fetch(uploadRequest(ONE_PIXEL_WEBP, UPLOAD_SECRET, "image/webp"), env);
+  const firstImage = await firstUpload.json() as { key: string };
+  const secondImage = await secondUpload.json() as { key: string };
+  const createdResponse = await worker.fetch(finalizeRequest({
+    submissionId: "r18-append-first-submission",
+    title: "R18 追加题库",
+    playerId: "r18-player",
+    nickname: "R18 上传者",
+    questions: [{ r2Key: firstImage.key, labelText: "第一题" }],
+  }), env);
+  assert.equal(createdResponse.status, 200, await createdResponse.clone().text());
+  const created = await createdResponse.json() as { id: string };
+  const appendedResponse = await worker.fetch(finalizeRequest({
+    submissionId: "r18-append-second-submission",
+    title: "R18 追加题库",
+    playerId: "r18-player",
+    nickname: "R18 上传者",
+    questions: [{ r2Key: secondImage.key, labelText: "第二题", isR18: true }],
+  }), env);
+  assert.equal(appendedResponse.status, 200, await appendedResponse.clone().text());
+  assert.equal((await appendedResponse.json() as { id: string }).id, created.id);
+
+  const questionSet = db.sqlite.prepare("SELECT * FROM question_sets WHERE id=?").get(created.id) as Record<string, unknown>;
+  assert.deepEqual(
+    decodeQuestionSetManifest(questionSet)?.map((question) => question.is_r18),
+    [false, true],
+  );
+  const indexed = (db.sqlite.prepare(`
+    SELECT order_index,is_r18
+    FROM question_image_index
+    WHERE question_set_id=?
+    ORDER BY order_index
+  `).all(created.id) as Array<{ order_index: number; is_r18: number }>).map((row) => ({ ...row }));
+  assert.deepEqual(indexed, [
+    { order_index: 0, is_r18: 0 },
+    { order_index: 1, is_r18: 1 },
+  ]);
+});
+
+test("question-set admin shows, creates, and toggles per-question isR18 with CAS", async () => {
+  const { db, env } = createTestEnv();
+  const uploadResponse = await worker.fetch(uploadRequest(ONE_PIXEL_PNG), env);
+  const uploaded = await uploadResponse.json() as { key: string };
+  const finalizeResponse = await worker.fetch(finalizeRequest({
+    submissionId: "r18-admin-submission",
+    title: "R18 管理题库",
+    playerId: "r18-player",
+    nickname: "R18 上传者",
+    questions: [{ r2Key: uploaded.key, labelText: "第一题" }],
+  }), env);
+  assert.equal(finalizeResponse.status, 200, await finalizeResponse.clone().text());
+  const created = await finalizeResponse.json() as { id: string };
+  let detailResponse = await worker.fetch(questionSetAdminRequest(`/api/admin/question-sets/${created.id}`), env);
+  let detail = await detailResponse.json() as {
+    updatedAt: string;
+    questions: Array<{ id: string; isR18: boolean }>;
+  };
+  const questionId = detail.questions[0].id;
+  assert.equal(detail.questions[0].isR18, false);
+  const originalUpdatedAt = detail.updatedAt;
+
+  const wrongTypeResponse = await worker.fetch(questionSetAdminRequest(
+    `/api/admin/question-sets/${created.id}/questions/${questionId}`,
+    { method: "PATCH", body: { isR18: 1, expectedUpdatedAt: detail.updatedAt } },
+  ), env);
+  assert.equal(wrongTypeResponse.status, 400);
+  assert.match(JSON.stringify(await wrongTypeResponse.json()), /成人内容标记必须是布尔值/);
+
+  const patchResponse = await worker.fetch(questionSetAdminRequest(
+    `/api/admin/question-sets/${created.id}/questions/${questionId}`,
+    { method: "PATCH", body: { isR18: true, expectedUpdatedAt: detail.updatedAt } },
+  ), env);
+  assert.equal(patchResponse.status, 200, await patchResponse.clone().text());
+  detail = (await patchResponse.json() as { questionSet: typeof detail }).questionSet;
+  assert.equal(detail.questions[0].isR18, true);
+
+  const row = db.sqlite.prepare("SELECT id,manifest_version,manifest_json FROM question_sets WHERE id=?").get(created.id) as Record<string, unknown>;
+  assert.equal(decodeQuestionSetManifest(row)?.[0].is_r18, true);
+  const indexed = db.sqlite.prepare("SELECT is_r18 FROM question_image_index WHERE question_id=?").get(questionId) as { is_r18: number };
+  assert.equal(indexed.is_r18, 1);
+
+  const staleResponse = await worker.fetch(questionSetAdminRequest(
+    `/api/admin/question-sets/${created.id}/questions/${questionId}`,
+    { method: "PATCH", body: { isR18: false, expectedUpdatedAt: originalUpdatedAt } },
+  ), env);
+  assert.equal(staleResponse.status, 409);
+});
+
+test("question-set admin persists isR18 on legacy rows and new questions", async () => {
+  const { db, env } = createTestEnv();
+  const uploadResponse = await worker.fetch(uploadRequest(ONE_PIXEL_WEBP, UPLOAD_SECRET, "image/webp"), env);
+  assert.equal(uploadResponse.status, 200);
+  const uploaded = await uploadResponse.json() as { key: string };
+  db.sqlite.prepare(`INSERT INTO question_sets
+    (id,title,created_by_player_id,is_public,image_count,created_at,updated_at)
+    VALUES (?,?,?,?,?,?,?)`)
+    .run("r18-legacy-set", "旧版 R18 题库", "legacy-owner", 0, 1, "2026-02-01T00:00:00.000Z", "2026-02-01T00:00:00.000Z");
+  db.sqlite.prepare(`INSERT INTO questions
+    (id,question_set_id,image_url,order_index,is_r18,label_text,label_source,created_at)
+    VALUES (?,?,?,?,?,?,?,?)`)
+    .run(
+      "r18-legacy-question",
+      "r18-legacy-set",
+      "https://example.com/legacy-r18.webp",
+      0,
+      1,
+      "旧版答案",
+      "manual",
+      "2026-02-01T00:00:00.000Z",
+    );
+
+  let detailResponse = await worker.fetch(questionSetAdminRequest("/api/admin/question-sets/r18-legacy-set"), env);
+  assert.equal(detailResponse.status, 200, await detailResponse.clone().text());
+  let detail = await detailResponse.json() as {
+    updatedAt: string;
+    storageKind: string;
+    questions: Array<{ id: string; isR18: boolean }>;
+  };
+  assert.equal(detail.storageKind, "rows");
+  assert.equal(detail.questions[0].isR18, true);
+
+  const patchResponse = await worker.fetch(questionSetAdminRequest(
+    `/api/admin/question-sets/r18-legacy-set/questions/r18-legacy-question`,
+    { method: "PATCH", body: { isR18: false, expectedUpdatedAt: detail.updatedAt } },
+  ), env);
+  assert.equal(patchResponse.status, 200, await patchResponse.clone().text());
+  detail = (await patchResponse.json() as { questionSet: typeof detail }).questionSet;
+  assert.equal(detail.questions[0].isR18, false);
+  const legacyRow = db.sqlite.prepare("SELECT is_r18 FROM questions WHERE id='r18-legacy-question'").get() as { is_r18: number };
+  assert.equal(legacyRow.is_r18, 0);
+
+  const addResponse = await worker.fetch(questionSetAdminRequest(
+    "/api/admin/question-sets/r18-legacy-set/questions",
+    {
+      method: "POST",
+      body: {
+        r2Key: uploaded.key,
+        answerText: "新答案",
+        isR18: true,
+        expectedUpdatedAt: detail.updatedAt,
+      },
+    },
+  ), env);
+  assert.equal(addResponse.status, 200, await addResponse.clone().text());
+  const added = (await addResponse.json() as { questionSet: typeof detail }).questionSet;
+  assert.equal(added.questions[1].isR18, true);
+  const newRow = db.sqlite.prepare("SELECT is_r18 FROM questions WHERE question_set_id='r18-legacy-set' AND order_index=1").get() as { is_r18: number };
+  assert.equal(newRow.is_r18, 1);
+});
+
+test("public community question-set detail carries isR18 without changing answer exposure", async () => {
+  const { env } = createTestEnv();
+  const uploadResponse = await worker.fetch(uploadRequest(ONE_PIXEL_PNG), env);
+  const uploaded = await uploadResponse.json() as { key: string };
+  const finalizeResponse = await worker.fetch(finalizeRequest({
+    submissionId: "r18-public-detail-submission",
+    title: "公开 R18 详情题库",
+    playerId: "r18-player",
+    nickname: "R18 上传者",
+    questions: [{ r2Key: uploaded.key, labelText: "公开答案", isR18: true }],
+  }), env);
+  assert.equal(finalizeResponse.status, 200, await finalizeResponse.clone().text());
+  const created = await finalizeResponse.json() as { id: string };
+
+  const rpcResponse = await worker.fetch(new Request("https://caicai.lpp.moe/api/rpc", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ name: "getCommunityQuestionSetDetail", args: [created.id] }),
+  }), env);
+  assert.equal(rpcResponse.status, 200, await rpcResponse.clone().text());
+  const payload = await rpcResponse.json() as { data: { questions: Array<{ isR18: boolean; imageUrl: string }> } };
+  assert.equal(payload.data.questions[0].isR18, true);
+  assert.equal(payload.data.questions[0].imageUrl, uploaded.url);
+});
+
+test("community finalize and admin write reject null or conflicting is_r18 / isR18", async () => {
+  const { env } = createTestEnv();
+  const uploadResponse = await worker.fetch(uploadRequest(ONE_PIXEL_PNG), env);
+  const uploaded = await uploadResponse.json() as { key: string };
+
+  // null 必须拒绝，不能静默当成 false。
+  const nullResponse = await worker.fetch(finalizeRequest({
+    title: "R18 null 题库",
+    playerId: "r18-player",
+    nickname: "R18 上传者",
+    questions: [{ r2Key: uploaded.key, labelText: "答案", isR18: null }],
+  }), env);
+  assert.equal(nullResponse.status, 400);
+  assert.match(JSON.stringify(await nullResponse.json()), /成人内容标记必须是布尔值/);
+
+  // 两个字段同时存在且值冲突必须拒绝。
+  const conflictResponse = await worker.fetch(finalizeRequest({
+    title: "R18 冲突题库",
+    playerId: "r18-player",
+    nickname: "R18 上传者",
+    questions: [{ r2Key: uploaded.key, labelText: "答案", is_r18: true, isR18: false }],
+  }), env);
+  assert.equal(conflictResponse.status, 400);
+  assert.match(JSON.stringify(await conflictResponse.json()), /不一致的 is_r18 与 isR18/);
+
+  // 管理单题写入同样拒绝 null 与冲突。
+  const finalizeResponse = await worker.fetch(finalizeRequest({
+    submissionId: "r18-admin-conflict-submission",
+    title: "R18 管理冲突题库",
+    playerId: "r18-player",
+    nickname: "R18 上传者",
+    questions: [{ r2Key: uploaded.key, labelText: "第一题" }],
+  }), env);
+  assert.equal(finalizeResponse.status, 200, await finalizeResponse.clone().text());
+  const created = await finalizeResponse.json() as { id: string };
+  const detailResponse = await worker.fetch(questionSetAdminRequest(`/api/admin/question-sets/${created.id}`), env);
+  const detail = await detailResponse.json() as {
+    updatedAt: string;
+    questions: Array<{ id: string }>;
+  };
+  const questionId = detail.questions[0].id;
+
+  const adminConflictResponse = await worker.fetch(questionSetAdminRequest(
+    `/api/admin/question-sets/${created.id}/questions/${questionId}`,
+    { method: "PATCH", body: { is_r18: false, isR18: true, expectedUpdatedAt: detail.updatedAt } },
+  ), env);
+  assert.equal(adminConflictResponse.status, 400);
+  assert.match(JSON.stringify(await adminConflictResponse.json()), /不一致的 is_r18 与 isR18/);
+
+  const adminNullResponse = await worker.fetch(questionSetAdminRequest(
+    `/api/admin/question-sets/${created.id}/questions/${questionId}`,
+    { method: "PATCH", body: { is_r18: null, expectedUpdatedAt: detail.updatedAt } },
+  ), env);
+  assert.equal(adminNullResponse.status, 400);
+  assert.match(JSON.stringify(await adminNullResponse.json()), /成人内容标记必须是布尔值/);
+});
+
+test("admin integrity report flags is_r18 index mismatch even without a stored answer", async () => {
+  const { db, env } = createTestEnv();
+  db.sqlite.prepare(`INSERT INTO question_sets
+    (id,title,created_by_player_id,is_public,image_count,created_at,updated_at)
+    VALUES (?,?,?,?,?,?,?)`)
+    .run("r18-no-answer-set", "无答案 R18 题库", "legacy-owner", 0, 1, "2026-02-01T00:00:00.000Z", "2026-02-01T00:00:00.000Z");
+  // legacy 行没有答案，但 is_r18=1；图片索引有答案且 is_r18=0。
+  db.sqlite.prepare(`INSERT INTO questions
+    (id,question_set_id,image_url,order_index,is_r18,label_text,label_source,created_at)
+    VALUES (?,?,?,?,?,?,?,?)`)
+    .run(
+      "r18-no-answer-question",
+      "r18-no-answer-set",
+      "https://example.com/no-answer.webp",
+      0,
+      1,
+      null,
+      null,
+      "2026-02-01T00:00:00.000Z",
+    );
+  db.sqlite.prepare(`INSERT INTO question_image_index
+    (question_id,question_set_id,image_url,answer_text,order_index,is_r18,anime_tags_json,character_tags_json,created_at)
+    VALUES (?,?,?,?,?,?,?,?,?)`)
+    .run(
+      "r18-no-answer-question",
+      "r18-no-answer-set",
+      "https://example.com/no-answer.webp",
+      "索引答案",
+      0,
+      0,
+      "[]",
+      "[]",
+      "2026-02-01T00:00:00.000Z",
+    );
+
+  const detailResponse = await worker.fetch(questionSetAdminRequest("/api/admin/question-sets/r18-no-answer-set"), env);
+  assert.equal(detailResponse.status, 200, await detailResponse.clone().text());
+  const detail = await detailResponse.json() as { integrityIssues: string[]; questions: Array<{ answerText: string | null; isR18: boolean }> };
+  // 存储侧答案缺失（legacy 行 label_text 为 NULL）时，答案仍取索引值，R18 mismatch 独立报告。
+  assert.equal(detail.questions[0].answerText, "索引答案");
+  assert.match(detail.integrityIssues.join("\n"), /成人内容标记与图片索引不一致/);
+});

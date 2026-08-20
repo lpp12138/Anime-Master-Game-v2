@@ -2231,6 +2231,17 @@ async function getAdminQuestionWriteInput(
     }
   }
 
+  // isR18/is_r18 都只接受 boolean；null/字符串/数字拒绝，两字段同时存在且值冲突拒绝。
+  const legacyR18 = payload.is_r18;
+  const camelR18 = payload.isR18;
+  if (legacyR18 !== undefined && camelR18 !== undefined && legacyR18 !== camelR18) {
+    throw new QuestionSetAdminError("成人内容标记冲突，不能同时提交不一致的 is_r18 与 isR18。", 400);
+  }
+  const submittedR18 = legacyR18 !== undefined ? legacyR18 : camelR18;
+  if (submittedR18 !== undefined && typeof submittedR18 !== "boolean") {
+    throw new QuestionSetAdminError("成人内容标记必须是布尔值。", 400);
+  }
+
   const r2Key = typeof payload.r2Key === "string" ? payload.r2Key.trim() : "";
   if (options.requireImage && !r2Key) throw new QuestionSetAdminError("请选择要新增的截图。", 400);
   let imageUrl = "";
@@ -2285,6 +2296,7 @@ async function getAdminQuestionWriteInput(
     ...(canonicalAnimeTags === undefined ? {} : { animeTags: canonicalAnimeTags }),
     ...(canonicalCharacterTags === undefined ? {} : { characterTags: canonicalCharacterTags }),
     ...(imageUrl ? { imageUrl } : {}),
+    ...(submittedR18 === undefined ? {} : { isR18: submittedR18 as boolean }),
     expectedUpdatedAt: payload.expectedUpdatedAt as string,
     ...(payload.orderIndex === undefined ? {} : { orderIndex: payload.orderIndex as number }),
   };
@@ -2499,6 +2511,7 @@ type CommunityImageIndexRow = {
   question_set_id: string;
   image_url: string;
   order_index: number;
+  is_r18: number | boolean | null;
   anime_subject_id: number | null;
   anime_tags_json: string;
   character_tags_json: string;
@@ -2538,6 +2551,7 @@ async function handleCommunityImageIndexSearch(request: Request, env: Env) {
       image_index.question_set_id,
       image_index.image_url,
       image_index.order_index,
+      image_index.is_r18,
       image_index.anime_subject_id,
       image_index.anime_tags_json,
       image_index.character_tags_json,
@@ -2570,6 +2584,7 @@ async function handleCommunityImageIndexSearch(request: Request, env: Env) {
       questionSetId: row.question_set_id,
       imageUrl: row.image_url,
       orderIndex: row.order_index,
+      isR18: row.is_r18 === true || row.is_r18 === 1,
       animeSubjectId: row.anime_subject_id,
       animeTags,
       characterTags,
@@ -2586,14 +2601,15 @@ async function handleCommunityImageIndexSearch(request: Request, env: Env) {
 type SubmittedCommunityQuestion = {
   r2Key: string;
   labelText: string;
+  isR18: boolean;
   animeTags: BangumiAnimeTag[];
   characterTags: BangumiCharacterTag[];
 };
 
-async function canonicalizeSubmittedBangumiTags(
+async function canonicalizeSubmittedBangumiTags<T extends Pick<SubmittedCommunityQuestion, "animeTags" | "characterTags">>(
   cache: Cache,
-  questions: SubmittedCommunityQuestion[],
-): Promise<SubmittedCommunityQuestion[]> {
+  questions: T[],
+): Promise<T[]> {
   const subjectIds = [...new Set(questions.flatMap((question) => question.animeTags.map((tag) => tag.id)))];
   if (subjectIds.length === 0) return questions;
 
@@ -2679,6 +2695,16 @@ async function handleCommunityQuestionSetCreate(request: Request, env: Env, cach
     if (typeof item.labelText !== "string" || !item.labelText.trim()) {
       return json({ error: "每张截图都必须填写正确答案。" }, { status: 400 }, request, env);
     }
+    // isR18/is_r18 都只接受 boolean；null/字符串/数字拒绝，两字段同时存在且值冲突拒绝。
+    const legacyR18 = item.is_r18;
+    const camelR18 = item.isR18;
+    if (legacyR18 !== undefined && camelR18 !== undefined && legacyR18 !== camelR18) {
+      return json({ error: "成人内容标记冲突，不能同时提交不一致的 is_r18 与 isR18。" }, { status: 400 }, request, env);
+    }
+    const submittedR18 = legacyR18 !== undefined ? legacyR18 : camelR18;
+    if (submittedR18 !== undefined && typeof submittedR18 !== "boolean") {
+      return json({ error: "成人内容标记必须是布尔值。" }, { status: 400 }, request, env);
+    }
     let tags;
     try {
       tags = normalizeBangumiQuestionTags(item.animeTags, item.characterTags);
@@ -2690,6 +2716,7 @@ async function handleCommunityQuestionSetCreate(request: Request, env: Env, cach
     submittedQuestions.push({
       r2Key,
       labelText: item.labelText.trim(),
+      isR18: submittedR18 === true,
       animeTags: tags.animeTags,
       characterTags: tags.characterTags,
     });
@@ -2708,6 +2735,7 @@ async function handleCommunityQuestionSetCreate(request: Request, env: Env, cach
     questions: submittedQuestions.map((question) => ({
       r2Key: question.r2Key,
       labelText: question.labelText,
+      isR18: question.isR18,
       animeSubjectId: question.animeTags[0]?.id ?? null,
       characterIds: question.characterTags.map((tag) => tag.id),
     })),
@@ -2763,6 +2791,7 @@ async function handleCommunityQuestionSetCreate(request: Request, env: Env, cach
       questions: canonicalQuestions.map((question) => ({
         imageUrl: getR2PublicUrl(request, env, question.r2Key),
         labelText: question.labelText,
+        isR18: question.isR18,
         animeTags: question.animeTags,
         characterTags: question.characterTags,
       })),

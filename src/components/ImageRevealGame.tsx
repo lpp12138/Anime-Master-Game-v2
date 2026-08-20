@@ -397,6 +397,7 @@ function toQuestion(question: DbQuestion): Question {
     questionSetId: question.question_set_id,
     imageUrl: question.image_url,
     orderIndex: question.order_index,
+    isR18: question.is_r18 === true || question.is_r18 === 1,
     labelText: question.label_text ?? null,
     labelSource: question.label_source ?? null,
     labelSourceAnswerId: question.label_source_answer_id ?? null,
@@ -4388,6 +4389,9 @@ export function ImageRevealGame({
           maxWidth: isPortraitImage ? `min(1280px, calc(78vh * ${imageAspectRatio}))` : "1280px",
         }}
       >
+        {currentQuestion?.isR18 ? (
+          <span className="absolute left-3 top-3 z-20 rounded bg-rose-600 px-2 py-1 text-xs font-black tracking-widest text-white shadow-lg">R18</span>
+        ) : null}
         {isPresenter ? (
           <img
             alt=""
@@ -5387,7 +5391,10 @@ export function ImageRevealGame({
                 </div>
 
                 <div className="min-h-0 overflow-y-auto px-5 py-5">
-                  <div className="grid min-h-48 place-items-center overflow-hidden rounded-md bg-slate-950">
+                  <div className="relative grid min-h-48 place-items-center overflow-hidden rounded-md bg-slate-950">
+                    {reviewedQuestion.isR18 ? (
+                      <span className="absolute left-3 top-3 z-10 rounded bg-rose-600 px-2 py-1 text-xs font-black tracking-widest text-white shadow-lg">R18</span>
+                    ) : null}
                     {reviewImageLoadFailed ? (
                       <div className="px-4 py-16 text-center text-white">
                         <p className="font-semibold">图片加载失败</p>

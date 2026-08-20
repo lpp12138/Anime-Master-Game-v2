@@ -30,6 +30,7 @@ import type {
 export type QuestionImportItem = {
   imageUrl: string;
   labelText?: string | null;
+  isR18?: boolean;
 };
 
 function isHttpImageUrl(value: string) {
@@ -56,16 +57,20 @@ function normalizeQuestionImportItems(items: QuestionImportItem[]) {
   const seenUrls = new Set<string>();
   const normalizedItems: QuestionImportItem[] = [];
 
-  for (const item of items) {
+  for (const [index, item] of items.entries()) {
     const imageUrl = item.imageUrl.trim();
     if (!imageUrl || !isHttpImageUrl(imageUrl) || seenUrls.has(imageUrl)) {
       continue;
     }
 
+    // 直接 questions payload 是未信任输入：isR18/is_r18 只接受 boolean，
+    // null/字符串/数字拒绝，两个字段同时存在且值冲突拒绝。
+    const isR18 = parseImportedIsR18(item as unknown as Record<string, unknown>, `第 ${index + 1} 题`);
     seenUrls.add(imageUrl);
     normalizedItems.push({
       imageUrl,
       labelText: item.labelText?.trim() || null,
+      isR18,
     });
   }
 
@@ -107,13 +112,32 @@ export function parseQuestionImportText(importText: string): QuestionImportItem[
       throw new Error(`第 ${index + 1} 行的 label_text 必须是字符串。`);
     }
 
+    const labelText = typeof record.label_text === "string" ? record.label_text : null;
+    const isR18 = parseImportedIsR18(record, `第 ${index + 1} 行`);
+
     items.push({
       imageUrl: record.image_url,
-      labelText: typeof record.label_text === "string" ? record.label_text : null,
+      labelText,
+      isR18,
     });
   }
 
   return normalizeQuestionImportItems(items);
+}
+
+function parseImportedIsR18(record: Record<string, unknown>, location: string) {
+  const legacy = record.is_r18;
+  const camel = record.isR18;
+  if (legacy !== undefined && camel !== undefined && legacy !== camel) {
+    throw new Error(`${location}的 is_r18 与 isR18 不一致。`);
+  }
+  // 两个字段都只接受 boolean；null/字符串/数字一律拒绝，缺省视为 false。
+  // 不能用 legacy ?? camel：is_r18: null 会被当成缺省而静默放过。
+  const raw = legacy !== undefined ? legacy : camel;
+  if (raw !== undefined && typeof raw !== "boolean") {
+    throw new Error(`${location}的 is_r18 必须是布尔值。`);
+  }
+  return raw === true;
 }
 
 const rpc = <T>(name: string, ...args: unknown[]) => callGameRpc<T>(name, args);

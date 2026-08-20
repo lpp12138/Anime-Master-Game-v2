@@ -156,11 +156,11 @@ export function CommunityImageIndexPreview({
             {images.map((image) => (
               <a
                 key={image.questionId}
-                className="overflow-hidden rounded-md border border-violet-100 bg-white shadow-sm focus:outline-none focus:ring-2 focus:ring-violet-500"
+                className="relative overflow-hidden rounded-md border border-violet-100 bg-white shadow-sm focus:outline-none focus:ring-2 focus:ring-violet-500"
                 href={image.imageUrl}
                 target="_blank"
                 rel="noreferrer"
-                title={`题库 ${image.questionSetId}`}
+                title={`题库 ${image.questionSetId}${image.isR18 ? "（R18）" : ""}`}
               >
                 <img
                   className="aspect-video w-full bg-slate-100 object-cover"
@@ -168,6 +168,9 @@ export function CommunityImageIndexPreview({
                   alt="同标签公开题库截图"
                   loading="lazy"
                 />
+                {image.isR18 ? (
+                  <span className="absolute left-1.5 top-1.5 rounded bg-rose-600 px-1 py-0.5 text-[9px] font-black tracking-wide text-white shadow">R18</span>
+                ) : null}
                 <span className="block truncate px-2 py-1.5 text-[11px] text-violet-900">
                   {image.characterTags.length > 0
                     ? image.characterTags.map(bangumiTagDisplayName).join("、")

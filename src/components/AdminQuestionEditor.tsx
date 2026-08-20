@@ -49,6 +49,7 @@ export function AdminQuestionEditor({
   onSaved,
 }: Props) {
   const [answerText, setAnswerText] = useState(question?.answerText ?? "");
+  const [isR18, setIsR18] = useState(question?.isR18 ?? false);
   const [animeTags, setAnimeTags] = useState<BangumiAnimeTag[]>(question?.animeTags ?? []);
   const [characterTags, setCharacterTags] = useState<BangumiCharacterTag[]>(question?.characterTags ?? []);
   const [file, setFile] = useState<File | null>(null);
@@ -68,11 +69,12 @@ export function AdminQuestionEditor({
     [question?.animeTags, question?.characterTags],
   );
   const isDirty = mode === "create"
-    ? Boolean(file || imageLink.trim() || answerText.trim() || animeTags.length || characterTags.length)
+    ? Boolean(file || imageLink.trim() || answerText.trim() || isR18 || animeTags.length || characterTags.length)
     : Boolean(
       file
       || imageLink.trim()
       || answerText !== (question?.answerText ?? "")
+      || isR18 !== (question?.isR18 ?? false)
       || tagsSignature(animeTags, characterTags) !== originalTags,
     );
 
@@ -249,6 +251,7 @@ export function AdminQuestionEditor({
       }
       const input = {
         answerText: answer,
+        isR18,
         animeTags,
         characterTags,
         expectedUpdatedAt,
@@ -392,6 +395,18 @@ export function AdminQuestionEditor({
           }}
         />
       </div>
+
+      <label className="mt-4 flex w-fit items-center gap-2.5 rounded-md border border-rose-200 bg-rose-50 px-3 py-2.5">
+        <input
+          className="h-4 w-4 shrink-0 accent-rose-600"
+          checked={isR18}
+          disabled={disabled || isSaving}
+          type="checkbox"
+          onChange={(event) => setIsR18(event.target.checked)}
+        />
+        <span className="text-sm font-semibold text-rose-800">标记为 R18（成人内容）</span>
+        <span className="ml-2 text-xs text-rose-500">{isR18 ? "已标记" : "默认关闭"}</span>
+      </label>
 
       {error && <div className="mt-4 rounded-md border border-rose-200 bg-rose-50 px-3 py-2 text-sm text-rose-800" role="alert">{error}</div>}
       <div className="mt-4 flex flex-wrap items-center gap-3">

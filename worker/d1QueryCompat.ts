@@ -28,7 +28,7 @@ const JSON_COLUMNS = new Set([
   "anime_tags_json",
   "character_tags_json",
 ]);
-const BOOLEAN_COLUMNS = new Set(["is_host", "is_public"]);
+const BOOLEAN_COLUMNS = new Set(["is_host", "is_public", "is_r18"]);
 const UPDATED_AT_TABLES = new Set(["rooms", "question_sets", "question_set_ratings"]);
 const CREATED_AT_TABLES = new Set([
   "rooms",

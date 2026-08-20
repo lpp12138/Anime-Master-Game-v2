@@ -45,6 +45,7 @@ type ScreenshotDraft = {
   previewIsObjectUrl: boolean;
   sourceUrl: string | null;
   labelText: string;
+  isR18: boolean;
   animeTags: BangumiAnimeTag[];
   characterTags: BangumiCharacterTag[];
 };
@@ -119,6 +120,7 @@ export default function CommunityUploadPage() {
   const selectedIndex = selectedDraft ? drafts.findIndex((draft) => draft.id === selectedDraft.id) : -1;
   const completedCount = drafts.filter((draft) => draft.labelText.trim()).length;
   const taggedCount = drafts.filter((draft) => draft.animeTags.length > 0).length;
+  const r18Count = drafts.filter((draft) => draft.isR18).length;
   const questionListPreview = useMemo(() => {
     if (!questionListText.trim()) return { count: 0, error: "" };
     try {
@@ -362,6 +364,7 @@ export default function CommunityUploadPage() {
         previewIsObjectUrl: true,
         sourceUrl: null,
         labelText: suggestedLabel(displayName),
+        isR18: false,
         animeTags: [],
         characterTags: [],
       } satisfies ScreenshotDraft;
@@ -490,6 +493,7 @@ export default function CommunityUploadPage() {
               previewIsObjectUrl: false,
               sourceUrl: item.imageUrl,
               labelText: item.labelText,
+              isR18: item.isR18,
               animeTags: [],
               characterTags: [],
             },
@@ -587,6 +591,10 @@ export default function CommunityUploadPage() {
       : draft));
   }
 
+  function updateIsR18(id: string, isR18: boolean) {
+    updateDrafts((current) => current.map((draft) => draft.id === id ? { ...draft, isR18 } : draft));
+  }
+
   function copyPreviousTags(index: number) {
     if (index <= 0) return;
     updateDrafts((current) => {
@@ -596,6 +604,7 @@ export default function CommunityUploadPage() {
       return current.map((draft, draftIndex) => draftIndex === index
         ? {
           ...draft,
+          isR18: previous.isR18,
           animeTags: previous.animeTags.map((tag) => ({ ...tag })),
           characterTags: previous.characterTags.map((tag) => ({ ...tag })),
         }
@@ -722,6 +731,7 @@ export default function CommunityUploadPage() {
       questions: drafts.map((draft) => ({
         draftId: draft.id,
         labelText: draft.labelText.trim(),
+        isR18: draft.isR18,
         animeSubjectId: draft.animeTags[0]?.id ?? null,
         characterIds: draft.characterTags.map((tag) => tag.id),
       })),
@@ -739,6 +749,7 @@ export default function CommunityUploadPage() {
       const questions: Array<{
         r2Key: string;
         labelText: string;
+        isR18: boolean;
         animeTags: BangumiAnimeTag[];
         characterTags: BangumiCharacterTag[];
       }> = [];
@@ -757,6 +768,7 @@ export default function CommunityUploadPage() {
         questions.push({
           r2Key,
           labelText: draft.labelText.trim(),
+          isR18: draft.isR18,
           animeTags: draft.animeTags,
           characterTags: draft.characterTags,
         });
@@ -1120,6 +1132,7 @@ export default function CommunityUploadPage() {
                     <h2 className="text-lg font-bold text-slate-950" id="screenshot-grid-title">截图网格</h2>
                     <p className="mt-1 text-xs text-slate-500">
                       已选 {drafts.length} 张 · 已填答案 {completedCount}/{drafts.length} · Bangumi 标签 {taggedCount}/{drafts.length}
+                      {r18Count > 0 ? ` · R18 ${r18Count}` : ""}
                     </p>
                   </div>
                   <button
@@ -1152,6 +1165,9 @@ export default function CommunityUploadPage() {
                         >
                           <img className="h-full w-full object-contain transition duration-200 group-hover:scale-[1.02]" src={draft.previewUrl} alt="" />
                           <span className="absolute left-2 top-2 rounded-full bg-slate-950/75 px-2 py-1 text-[11px] font-bold text-white">#{index + 1}</span>
+                          {draft.isR18 ? (
+                            <span className="absolute left-2 top-10 rounded bg-rose-600 px-1.5 py-0.5 text-[10px] font-black tracking-wide text-white shadow">R18</span>
+                          ) : null}
                           <span className={`absolute right-2 top-2 rounded-full px-2 py-1 text-[10px] font-bold ${hasAnswer ? "bg-emerald-500 text-white" : "bg-amber-300 text-amber-950"}`}>
                             {hasAnswer ? "答案已填" : "待填写"}
                           </span>
@@ -1204,6 +1220,7 @@ export default function CommunityUploadPage() {
                         <button
                           className="shrink-0 rounded-md border border-slate-200 px-2 py-1.5 text-[11px] font-semibold text-slate-600 hover:bg-slate-50 disabled:opacity-50"
                           disabled={isLocked}
+                          title="复制上一张的 Bangumi 标签、角色标签与 R18 标记"
                           type="button"
                           onClick={() => copyPreviousTags(selectedIndex)}
                         >复制上一张标签</button>
@@ -1219,6 +1236,19 @@ export default function CommunityUploadPage() {
                       onAnswerChange={(answer) => updateLabel(selectedDraft.id, answer)}
                       onChange={(animeTag, characterTags) => updateTags(selectedDraft.id, animeTag, characterTags)}
                     />
+                    <label className="mt-3 flex items-center gap-2.5 rounded-md border border-rose-200 bg-rose-50 px-3 py-2.5">
+                      <input
+                        className="h-4 w-4 shrink-0 accent-rose-600"
+                        checked={selectedDraft.isR18}
+                        disabled={isLocked}
+                        type="checkbox"
+                        onChange={(event) => updateIsR18(selectedDraft.id, event.target.checked)}
+                      />
+                      <span className="text-sm font-semibold text-rose-800">
+                        标记为 R18（成人内容）
+                      </span>
+                      <span className="ml-auto text-xs text-rose-500">{selectedDraft.isR18 ? "已标记" : "默认关闭"}</span>
+                    </label>
                     <p className="mt-4 rounded-md bg-slate-50 px-3 py-2 text-xs leading-5 text-slate-600">
                       输入或选择后，正确答案、Bangumi 作品（动画/游戏）及角色标签会立即显示在对应缩略图上；最终仍由服务器重新规范化并校验角色归属。
                     </p>

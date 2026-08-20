@@ -69,6 +69,7 @@ export type LocalUploadDraftQuestion = {
   key: string;
   imageUrl: string;
   labelText: string | null;
+  isR18: boolean;
 };
 
 export type LocalUploadDropCardRect = {
@@ -87,12 +88,13 @@ export type LocalUploadDropTarget = {
 };
 
 export function buildPreparedUrlImportDraft(
-  questions: Array<{ imageUrl: string; labelText?: string | null; r2Key?: string | null }>,
+  questions: Array<{ imageUrl: string; labelText?: string | null; isR18?: boolean; r2Key?: string | null }>,
 ): LocalUploadDraftQuestion[] {
   return questions.map((question, index) => ({
     key: `url-import:${index}:${question.r2Key ?? question.imageUrl}`,
     imageUrl: question.imageUrl,
     labelText: question.labelText?.trim() || null,
+    isR18: question.isR18 === true,
   }));
 }
 
@@ -206,6 +208,7 @@ export function buildLocalUploadQuestionImport(
       key: result.path,
       imageUrl: result.url,
       labelText: extractCreationToolLabelFromFilename(itemByPath.get(result.path)?.name ?? ""),
+      isR18: false,
     }));
 
   return {

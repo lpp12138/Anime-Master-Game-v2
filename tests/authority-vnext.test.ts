@@ -290,7 +290,7 @@ test("review answer backfill reuses bounded two-answer deltas", () => {
   assert.equal(deltas.every((delta) => JSON.stringify(delta).length < 1024), true);
 });
 
-test("v6 upgrades atomically through v14 and repeated initialization is idempotent", () => {
+test("v6 upgrades atomically through v15 and repeated initialization is idempotent", () => {
   const storage = new StorageAdapter();
   storage.sql.db.exec(`
     CREATE TABLE authority_schema(id INTEGER PRIMARY KEY CHECK(id=1),version INTEGER NOT NULL);
@@ -301,7 +301,7 @@ test("v6 upgrades atomically through v14 and repeated initialization is idempote
   `);
   const authority = new RoomGameAuthority(storage as unknown as DurableObjectStorage, fakeD1);
   authority.initializeSchema();
-  assert.equal(storage.sql.db.prepare("SELECT version FROM authority_schema WHERE id=1").get().version, 14);
+  assert.equal(storage.sql.db.prepare("SELECT version FROM authority_schema WHERE id=1").get().version, 15);
   authority.initializeSchema();
   assert.equal(storage.sql.db.prepare("SELECT COUNT(*) count FROM authority_vnext_active_game").get().count, 0);
   assert.equal(storage.sql.db.prepare("SELECT COUNT(*) count FROM pragma_table_info('question_sets') WHERE name='creation_method'").get().count, 1);
@@ -317,6 +317,7 @@ test("v6 upgrades atomically through v14 and repeated initialization is idempote
   assert.equal(storage.sql.db.prepare("SELECT COUNT(*) count FROM pragma_table_info('rooms') WHERE name='lobby_question_count'").get().count, 1);
   assert.equal(storage.sql.db.prepare("SELECT COUNT(*) count FROM pragma_table_info('rooms') WHERE name='prepared_question_count'").get().count, 1);
   assert.equal(storage.sql.db.prepare("SELECT COUNT(*) count FROM pragma_table_info('game_sessions') WHERE name='selected_question_ids'").get().count, 1);
+  assert.equal(storage.sql.db.prepare("SELECT COUNT(*) count FROM pragma_table_info('questions') WHERE name='is_r18'").get().count, 1);
 });
 
 test("migration failure does not advance production v6", () => {
@@ -328,14 +329,15 @@ test("migration failure does not advance production v6", () => {
   assert.equal(storage.sql.db.prepare("SELECT version FROM authority_schema WHERE id=1").get().version, 6);
 });
 
-test("fresh schema reaches v14", () => {
+test("fresh schema reaches v15", () => {
   const storage = new StorageAdapter();
   new RoomGameAuthority(storage as unknown as DurableObjectStorage, fakeD1).initializeSchema();
-  assert.equal(storage.sql.db.prepare("SELECT version FROM authority_schema WHERE id=1").get().version, 14);
+  assert.equal(storage.sql.db.prepare("SELECT version FROM authority_schema WHERE id=1").get().version, 15);
   assert.equal(storage.sql.db.prepare("SELECT COUNT(*) count FROM pragma_table_info('authority_vnext_projection_outbox') WHERE name='payload_json'").get().count, 1);
   assert.equal(storage.sql.db.prepare("SELECT COUNT(*) count FROM pragma_table_info('question_sets') WHERE name='creation_method'").get().count, 1);
   assert.equal(storage.sql.db.prepare("SELECT COUNT(*) count FROM pragma_table_info('rooms') WHERE name='lobby_question_count'").get().count, 1);
   assert.equal(storage.sql.db.prepare("SELECT COUNT(*) count FROM pragma_table_info('game_sessions') WHERE name='selected_question_ids'").get().count, 1);
+  assert.equal(storage.sql.db.prepare("SELECT COUNT(*) count FROM pragma_table_info('questions') WHERE name='is_r18'").get().count, 1);
 });
 
 test("v7 question-set migration preserves rows and failure does not advance the schema version", () => {
@@ -355,7 +357,7 @@ test("v7 question-set migration preserves rows and failure does not advance the 
 
   storage.sql.failOn = "";
   authority.initializeSchema();
-  assert.equal(storage.sql.db.prepare("SELECT version FROM authority_schema WHERE id=1").get().version, 14);
+  assert.equal(storage.sql.db.prepare("SELECT version FROM authority_schema WHERE id=1").get().version, 15);
   assert.equal(storage.sql.db.prepare("SELECT title FROM question_sets WHERE id='set-1'").get().title, "Legacy");
   assert.equal(storage.sql.db.prepare("SELECT creation_method FROM question_sets WHERE id='set-1'").get().creation_method, null);
 });
@@ -377,7 +379,7 @@ test("v8 team vote duration migration preserves rooms, Alarm, and failure does n
 
   storage.sql.failOn = "";
   authority.initializeSchema();
-  assert.equal(storage.sql.db.prepare("SELECT version FROM authority_schema WHERE id=1").get().version, 14);
+  assert.equal(storage.sql.db.prepare("SELECT version FROM authority_schema WHERE id=1").get().version, 15);
   const room = storage.sql.db.prepare("SELECT * FROM rooms WHERE id='r1'").get();
   assert.equal(room.room_code, "ROOM01");
   assert.equal(room.lobby_team_reveal_vote_seconds, 15);
@@ -402,7 +404,7 @@ test("v9 manual-team migration preserves rooms and Alarm, and failure does not a
   storage.sql.failOn = "";
   authority.initializeSchema();
   const room = storage.sql.db.prepare("SELECT * FROM rooms WHERE id='r1'").get();
-  assert.equal(storage.sql.db.prepare("SELECT version FROM authority_schema WHERE id=1").get().version, 14);
+  assert.equal(storage.sql.db.prepare("SELECT version FROM authority_schema WHERE id=1").get().version, 15);
   assert.equal(room.lobby_team_assignment_mode, "AUTO");
   assert.equal(room.lobby_team_assignments, "{}");
   assert.equal(await storage.getAlarm(), 987_654);
@@ -427,7 +429,7 @@ test("v10 presenter-block migration preserves rooms and Alarm, and failure does 
   storage.sql.failOn = "";
   authority.initializeSchema();
   const room = storage.sql.db.prepare("SELECT * FROM rooms WHERE id='r1'").get();
-  assert.equal(storage.sql.db.prepare("SELECT version FROM authority_schema WHERE id=1").get().version, 14);
+  assert.equal(storage.sql.db.prepare("SELECT version FROM authority_schema WHERE id=1").get().version, 15);
   assert.equal(room.lobby_team_presenter_block_enabled, 0);
   assert.equal(await storage.getAlarm(), 654_321);
 });
@@ -451,7 +453,7 @@ test("v12 spectator visibility migration preserves rooms and Alarm, and failure 
   storage.sql.failOn = "";
   authority.initializeSchema();
   const room = storage.sql.db.prepare("SELECT * FROM rooms WHERE id='r1'").get();
-  assert.equal(storage.sql.db.prepare("SELECT version FROM authority_schema WHERE id=1").get().version, 14);
+  assert.equal(storage.sql.db.prepare("SELECT version FROM authority_schema WHERE id=1").get().version, 15);
   assert.equal(room.lobby_spectator_question_preview_enabled, 1);
   assert.equal(room.lobby_spectator_player_answers_enabled, 1);
   assert.equal(await storage.getAlarm(), 765_432);
@@ -476,7 +478,7 @@ test("v13 role-capacity migration preserves rooms and Alarm, and failure does no
   storage.sql.failOn = "";
   authority.initializeSchema();
   const room = storage.sql.db.prepare("SELECT * FROM rooms WHERE id='r1'").get();
-  assert.equal(storage.sql.db.prepare("SELECT version FROM authority_schema WHERE id=1").get().version, 14);
+  assert.equal(storage.sql.db.prepare("SELECT version FROM authority_schema WHERE id=1").get().version, 15);
   assert.equal(room.lobby_player_capacity, 50);
   assert.equal(room.lobby_spectator_capacity, 50);
   assert.equal(await storage.getAlarm(), 876_543);
@@ -501,7 +503,7 @@ test("v14 question sampling migration preserves rows and Alarm, and failure does
 
   storage.sql.failOn = "";
   authority.initializeSchema();
-  assert.equal(storage.sql.db.prepare("SELECT version FROM authority_schema WHERE id=1").get().version, 14);
+  assert.equal(storage.sql.db.prepare("SELECT version FROM authority_schema WHERE id=1").get().version, 15);
   const room = storage.sql.db.prepare("SELECT * FROM rooms WHERE id='r1'").get();
   const game = storage.sql.db.prepare("SELECT * FROM game_sessions WHERE id='g1'").get();
   assert.equal(room.room_code, "ROOM01");
@@ -509,6 +511,53 @@ test("v14 question sampling migration preserves rows and Alarm, and failure does
   assert.equal(room.prepared_question_count, null);
   assert.equal(game.selected_question_ids, "[]");
   assert.equal(await storage.getAlarm(), 987_123);
+});
+
+test("v15 questions is_r18 migration preserves rows and Alarm, and failure does not advance", async () => {
+  const storage = new StorageAdapter();
+  storage.sql.db.exec(`
+    CREATE TABLE authority_schema(id INTEGER PRIMARY KEY CHECK(id=1),version INTEGER NOT NULL);
+    INSERT INTO authority_schema VALUES(1,14);
+    CREATE TABLE rooms(id TEXT PRIMARY KEY);
+    CREATE TABLE game_sessions(id TEXT PRIMARY KEY);
+    CREATE TABLE questions(
+      id TEXT PRIMARY KEY, question_set_id TEXT NOT NULL, image_url TEXT NOT NULL,
+      order_index INTEGER NOT NULL, label_text TEXT, label_source TEXT, created_at TEXT NOT NULL
+    );
+    INSERT INTO questions VALUES('q1','set-1','https://example.com/1.webp',0,'旧答案','manual','2026-01-01T00:00:00.000Z');
+  `);
+  await storage.setAlarm(555_111);
+  storage.sql.failOn = "ALTER TABLE questions";
+  const authority = new RoomGameAuthority(storage as unknown as DurableObjectStorage, fakeD1);
+  assert.throws(() => authority.initializeSchema(), /injected migration failure/);
+  assert.equal(storage.sql.db.prepare("SELECT version FROM authority_schema WHERE id=1").get().version, 14);
+  assert.equal(storage.sql.db.prepare("SELECT COUNT(*) count FROM pragma_table_info('questions') WHERE name='is_r18'").get().count, 0);
+
+  storage.sql.failOn = "";
+  authority.initializeSchema();
+  assert.equal(storage.sql.db.prepare("SELECT version FROM authority_schema WHERE id=1").get().version, 15);
+  const question = storage.sql.db.prepare("SELECT * FROM questions WHERE id='q1'").get();
+  assert.equal(question.label_text, "旧答案");
+  assert.equal(question.is_r18, 0);
+  storage.sql.db.prepare("UPDATE questions SET is_r18=1 WHERE id='q1'").run();
+  assert.throws(() => storage.sql.db.prepare("UPDATE questions SET is_r18=2 WHERE id='q1'").run(), /CHECK/);
+  assert.equal(await storage.getAlarm(), 555_111);
+  // 重复初始化幂等。
+  authority.initializeSchema();
+  assert.equal(storage.sql.db.prepare("SELECT version FROM authority_schema WHERE id=1").get().version, 15);
+});
+
+test("v15 creates the questions table when an older authority DO lacks it", () => {
+  const storage = new StorageAdapter();
+  storage.sql.db.exec(`
+    CREATE TABLE authority_schema(id INTEGER PRIMARY KEY CHECK(id=1),version INTEGER NOT NULL);
+    INSERT INTO authority_schema VALUES(1,14);
+    CREATE TABLE rooms(id TEXT PRIMARY KEY);
+    CREATE TABLE game_sessions(id TEXT PRIMARY KEY);
+  `);
+  new RoomGameAuthority(storage as unknown as DurableObjectStorage, fakeD1).initializeSchema();
+  assert.equal(storage.sql.db.prepare("SELECT version FROM authority_schema WHERE id=1").get().version, 15);
+  assert.equal(storage.sql.db.prepare("SELECT COUNT(*) count FROM pragma_table_info('questions') WHERE name='is_r18'").get().count, 1);
 });
 
 test("v6 journal and existing business Alarm survive the additive upgrade", async () => {

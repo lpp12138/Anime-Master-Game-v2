@@ -78,6 +78,7 @@ function toImportInputs(items: ReturnType<typeof parseQuestionImportText>): Ques
   return items.map((item, index) => ({
     imageUrl: item.imageUrl,
     labelText: item.labelText ?? null,
+    isR18: item.isR18 ?? false,
     orderIndex: index,
   }));
 }
@@ -111,6 +112,7 @@ function getQuestionSetPreviewItems(questionSet: QuestionSet | null) {
       key: question.id,
       url: question.imageUrl,
       labelText: question.labelText ?? null,
+      isR18: question.isR18,
       index,
     }));
   }
@@ -119,6 +121,7 @@ function getQuestionSetPreviewItems(questionSet: QuestionSet | null) {
     key: `${url}-${index}`,
     url,
     labelText: null,
+    isR18: false,
     index,
   }));
 }
@@ -248,6 +251,7 @@ export function QuestionSetUploader({
       key: question.key,
       url: question.imageUrl,
       labelText: question.labelText,
+      isR18: question.isR18,
       index,
     })) ?? getQuestionSetPreviewItems(detailedQuestionSet),
     [detailedQuestionSet, localUploadDraft],
@@ -846,6 +850,7 @@ export function QuestionSetUploader({
           questions: localUploadDraft.map((question) => ({
             imageUrl: question.imageUrl,
             labelText: question.labelText,
+            isR18: question.isR18,
           })),
           creationMethod: draftCreationMethod,
         });
@@ -1253,8 +1258,11 @@ export function QuestionSetUploader({
             <div className="overflow-y-auto p-5">
               <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-4">
                 {getQuestionSetPreviewItems(previewingCommunitySet).map((item) => (
-                  <figure className="rounded-md border border-[var(--line)] bg-slate-50 p-2" key={item.key}>
+                  <figure className="relative rounded-md border border-[var(--line)] bg-slate-50 p-2" key={item.key}>
                     <img alt="" className="aspect-video w-full rounded bg-black object-contain" src={item.url} />
+                    {item.isR18 ? (
+                      <span className="absolute left-4 top-4 rounded bg-rose-600 px-1.5 py-0.5 text-[10px] font-black tracking-wide text-white shadow">R18</span>
+                    ) : null}
                     <figcaption className="mt-2 text-xs text-[var(--muted)]">
                       第 {item.index + 1} 张
                       <span className="mt-1 block font-medium text-slate-800">{item.labelText?.trim() || "未填写答案"}</span>
@@ -1325,6 +1333,9 @@ export function QuestionSetUploader({
                   ) : null}
                   {draftDropTarget?.cardKey === item.key && draftDropTarget.side === "after" ? (
                     <span aria-hidden="true" className="pointer-events-none absolute -right-2 top-1 z-20 h-[calc(100%-0.5rem)] w-1 rounded-full bg-rose-500 shadow-sm" />
+                  ) : null}
+                  {item.isR18 ? (
+                    <span className="absolute left-3 top-11 z-10 rounded bg-rose-600 px-1.5 py-0.5 text-[10px] font-black tracking-wide text-white shadow">R18</span>
                   ) : null}
                   <span className="absolute left-3 top-3 z-10 rounded bg-slate-950/80 px-2 py-1 text-xs font-bold text-white">
                     {item.index + 1}

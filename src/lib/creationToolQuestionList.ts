@@ -12,6 +12,7 @@ const CREATION_TOOL_IMAGE_HOSTS = new Set([
 export type CreationToolQuestionListItem = {
   imageUrl: string;
   labelText: string;
+  isR18: boolean;
 };
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -70,7 +71,17 @@ function parseRecord(value: unknown, location: string): CreationToolQuestionList
   if (typeof rawLabelText !== "string") throw new Error(`${location}的 label_text 必须是字符串。`);
   const labelText = rawLabelText.replace(/[\r\n]+/g, " ").trim();
   if (labelText.length > 100) throw new Error(`${location}的 label_text 不能超过 100 个字符。`);
-  return { imageUrl: rawImageUrl.trim(), labelText };
+  const legacyR18 = value.is_r18;
+  const camelR18 = value.isR18;
+  if (legacyR18 !== undefined && camelR18 !== undefined && legacyR18 !== camelR18) {
+    throw new Error(`${location}的 is_r18 与 isR18 不一致。`);
+  }
+  // 两个字段都只接受 boolean；null/字符串/数字一律拒绝，缺省视为 false。
+  const rawR18 = legacyR18 !== undefined ? legacyR18 : camelR18;
+  if (rawR18 !== undefined && typeof rawR18 !== "boolean") {
+    throw new Error(`${location}的 is_r18 必须是布尔值。`);
+  }
+  return { imageUrl: rawImageUrl.trim(), labelText, isR18: rawR18 === true };
 }
 
 function parseJsonValue(value: unknown) {

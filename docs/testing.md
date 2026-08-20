@@ -33,6 +33,7 @@ npm run build
 | Worker 本地运行时、重连、并发、D1 热路径或额度模型 | 上述相关测试，再运行 `npm run test:authority-local-runtime` |
 | 公开房间创建、目录、实时人数或题目来源 | `npm run test:public-rooms`、`npm run test:question-set-creation-method`、`npm run test:authority-vnext`、`npm run test:authority-local-runtime` |
 | 首页密钥截图选择/拖放/粘贴、受限直链或 JSON/JSONL 导入、同标题追加、答案/标签、图片索引或投稿幂等 | `npm run test:community-screenshot-upload`、`npm run test:r2-upload`、`npm run test:question-set-creation-method` |
+| 逐题 R18 标记的导入校验（`is_r18`/`isR18` 只接受 boolean、拒绝 null/冲突）、manifest/legacy/图片索引保存与保留、完整性报告 R18 mismatch 或 `0032_question_is_r18.sql` 迁移 | `npm run test:community-screenshot-upload`、`npm run test:community-question-list`、`npm run test:question-set-creation-method`，并按下方 D1 migration 规则覆盖升级与失败不推进 |
 | 题库管理鉴权、检索、详情答案、逐题增删改查/换图/调序、元数据更新、安全删除、D1 引用保护或 R2 引用清理 | `npm run test:community-screenshot-upload`、`npm run test:r2-upload`、`npm run test:question-set-creation-method` |
 | Bangumi 动画/游戏代理、规范化、范围缓存或上游边界 | `npm run test:bangumi-api`、`npm run test:community-screenshot-upload` |
 | 首页 finalize 的 D1 batch/migration | 上述测试外，使用独立 `--persist-to` 状态在真实本地 Wrangler 中验证强制失败整批回滚、同投稿 ID 并发重试及不同投稿同标题并发追加 |
@@ -56,6 +57,10 @@ npm run build
 ### `test:authority-outbox`
 
 覆盖 IndexedDB 序号分配、durable ACK 清理、刷新保留和新旧 gameId 清理。
+
+### `test:community-question-list`
+
+覆盖出题工具 JSON/JSONL 题单解析的边界校验，包括 `is_r18`/`isR18` 布尔类型、null 拒绝、双字段冲突拒绝和缺省 false。
 
 ### `test:game-result-archive`
 

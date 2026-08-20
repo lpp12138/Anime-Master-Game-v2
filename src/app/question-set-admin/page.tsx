@@ -716,8 +716,11 @@ export default function QuestionSetAdminPage() {
                         <div className="mt-4 grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-3">
                           {detail.questions.map((question) => (
                             <article className={`min-w-0 overflow-hidden rounded-lg border bg-white ${editingQuestionId === question.id ? "border-sky-400 ring-2 ring-sky-100" : question.answerMismatch ? "border-amber-300" : "border-slate-200"}`} key={question.id}>
-                              <div className="aspect-video w-full bg-slate-950">
+                              <div className="relative aspect-video w-full bg-slate-950">
                                 <img alt={`第 ${question.orderIndex + 1} 题截图`} className="h-full w-full object-contain" loading="lazy" referrerPolicy="no-referrer" src={question.imageUrl} />
+                                {question.isR18 ? (
+                                  <span className="absolute left-2 top-2 rounded bg-rose-600 px-1.5 py-0.5 text-[10px] font-black tracking-wide text-white shadow">R18</span>
+                                ) : null}
                               </div>
                               <div className="p-4">
                                 <div className="flex items-start justify-between gap-3">

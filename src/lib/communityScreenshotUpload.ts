@@ -28,6 +28,7 @@ export type CommunityQuestionSetUploadInput = {
   questions: Array<{
     r2Key: string;
     labelText: string;
+    isR18: boolean;
     animeTags: BangumiAnimeTag[];
     characterTags: BangumiCharacterTag[];
   }>;
@@ -46,6 +47,7 @@ export type CommunityIndexedImage = {
   questionSetId: string;
   imageUrl: string;
   orderIndex: number;
+  isR18: boolean;
   animeSubjectId: number;
   animeTags: BangumiAnimeTag[];
   characterTags: BangumiCharacterTag[];
