@@ -33,6 +33,7 @@ const CREATED_AT_TABLES = new Set([
   "rooms",
   "question_sets",
   "question_image_index",
+  "community_question_set_submissions",
   "questions",
   "game_sessions",
   "question_set_ratings",
@@ -200,6 +201,38 @@ type AtomicInsertOperation = {
   table: string;
   records: Record<string, unknown>[];
 };
+
+export type AtomicStatement = {
+  query: string;
+  bindings?: readonly unknown[];
+};
+
+async function executeAtomicStatements(
+  db: GameDatabase | null,
+  operations: readonly AtomicStatement[],
+  mutationTracker?: GameDatabaseMutationTracker,
+): Promise<QueryResult<Record<string, unknown>[][]>> {
+  if (!db) {
+    return { data: null, error: { message: "游戏数据库绑定不可用，请检查本地开发服务配置。" } };
+  }
+
+  try {
+    const statements = operations.map((operation) => {
+      if (!operation.query.trim()) throw new Error("原子 SQL 语句不能为空。");
+      return db.prepare(operation.query).bind(...(operation.bindings ?? []));
+    });
+    const results = statements.length > 0
+      ? await db.batch<Record<string, unknown>>(statements)
+      : [];
+    const rowsByOperation = results.map((result) => (result.results ?? []).map((row) => denormalizeRow(row)));
+    if (mutationTracker) {
+      mutationTracker.successfulWrites += rowsByOperation.reduce((total, rows) => total + rows.length, 0);
+    }
+    return { data: rowsByOperation, error: null };
+  } catch (error) {
+    return { data: null, error: uniqueError(error) };
+  }
+}
 
 async function executeAtomicInserts(
   db: GameDatabase | null,
@@ -619,6 +652,9 @@ export function createD1QueryClient(db: GameDatabase | null, mutationTracker?: G
     },
     insertAtomically(operations: AtomicInsertOperation[]) {
       return executeAtomicInserts(db, operations, mutationTracker);
+    },
+    executeAtomically(operations: readonly AtomicStatement[]) {
+      return executeAtomicStatements(db, operations, mutationTracker);
     },
   };
 }

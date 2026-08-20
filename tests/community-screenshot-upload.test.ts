@@ -10,7 +10,7 @@ import {
 } from "../src/lib/communityScreenshotPolicy";
 import type { GameDatabase, GamePreparedStatement } from "../worker/d1QueryCompat";
 import worker, { type Env } from "../worker/index";
-import { decodeQuestionSetManifest } from "../worker/questionSetManifest";
+import { decodeQuestionSetManifest, encodeQuestionSetManifest } from "../worker/questionSetManifest";
 
 const UPLOAD_SECRET = "test-community-upload-key-32-characters";
 const ONE_PIXEL_PNG = Uint8Array.from(Buffer.from(
@@ -42,9 +42,23 @@ Object.defineProperty(globalThis, "caches", {
 });
 const nativeFetch = globalThis.fetch;
 let bangumiUpstreamRequestCount = 0;
+let communityRemoteImageRequestCount = 0;
 globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
   const url = input instanceof Request ? input.url : String(input);
   if (url.startsWith("https://api.bgm.tv/")) bangumiUpstreamRequestCount += 1;
+  if (url === "https://cdni.fancaps.net/file/test-community-import.png") {
+    communityRemoteImageRequestCount += 1;
+    return new Response(ONE_PIXEL_PNG, {
+      headers: {
+        "content-type": "image/png",
+        "content-length": String(ONE_PIXEL_PNG.byteLength),
+      },
+    });
+  }
+  if (url === "https://cdni.fancaps.net/file/test-community-redirect.png") {
+    communityRemoteImageRequestCount += 1;
+    return new Response(null, { status: 302, headers: { location: "https://example.com/private.png" } });
+  }
   if (url.startsWith("https://api.bgm.tv/v0/search/subjects")) {
     return new Response(JSON.stringify({ data: [{
       id: 2,
@@ -91,6 +105,7 @@ class PreparedStatementAdapter implements GamePreparedStatement {
 
 class DatabaseAdapter implements GameDatabase {
   readonly sqlite = new DatabaseSync(":memory:");
+  beforeNextBatch: (() => void) | null = null;
 
   prepare(query: string) {
     return new PreparedStatementAdapter(this.sqlite.prepare(query));
@@ -98,6 +113,9 @@ class DatabaseAdapter implements GameDatabase {
 
   async batch<T>(statements: GamePreparedStatement[]) {
     const results: Array<{ results?: T[] }> = [];
+    const beforeBatch = this.beforeNextBatch;
+    this.beforeNextBatch = null;
+    beforeBatch?.();
     this.sqlite.exec("BEGIN IMMEDIATE");
     try {
       for (const statement of statements) results.push(await statement.all<T>());
@@ -110,9 +128,10 @@ class DatabaseAdapter implements GameDatabase {
   }
 }
 
-function applyMigrations(sqlite: DatabaseSync) {
+function applyMigrations(sqlite: DatabaseSync, through = "9999") {
   const directory = resolve(import.meta.dirname, "..", "d1", "migrations");
   for (const name of readdirSync(directory).filter((file) => /^\d{4}_.+\.sql$/.test(file)).sort()) {
+    if (name.slice(0, 4) > through) break;
     sqlite.exec(readFileSync(join(directory, name), "utf8"));
   }
 }
@@ -183,6 +202,73 @@ function finalizeRequest(payload: unknown, key = UPLOAD_SECRET) {
   });
 }
 
+test("D1 0027 claims one canonical same-title set and backfills submission history", () => {
+  const sqlite = new DatabaseSync(":memory:");
+  applyMigrations(sqlite, "0026");
+  const insertHistoricalSet = (id: string, submissionId: string, createdAt: string) => {
+    const manifest = encodeQuestionSetManifest([{
+      id: `${id}-question`,
+      questionSetId: id,
+      imageUrl: `https://example.com/${id}.webp`,
+      orderIndex: 0,
+      labelText: "答案",
+      labelSource: "manual",
+      createdAt,
+    }]);
+    sqlite.prepare(`INSERT INTO question_sets (
+      id,title,created_by_player_id,is_public,image_count,
+      manifest_version,manifest_revision,manifest_json,
+      community_submission_id,community_submission_fingerprint,created_at,updated_at
+    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`).run(
+      id,
+      "迁移同名题库",
+      "test-player",
+      1,
+      1,
+      1,
+      0,
+      manifest,
+      submissionId,
+      "a".repeat(64),
+      createdAt,
+      createdAt,
+    );
+  };
+  insertHistoricalSet("older-set", "migration-older-submission", "2026-08-18T00:00:00.000Z");
+  insertHistoricalSet("newer-set", "migration-newer-submission", "2026-08-19T00:00:00.000Z");
+
+  sqlite.exec(readFileSync(resolve(import.meta.dirname, "..", "d1", "migrations", "0027_homepage_question_set_appends.sql"), "utf8"));
+  const sets = (sqlite.prepare(`SELECT id,community_collection_title FROM question_sets ORDER BY created_at`).all() as Array<Record<string, unknown>>)
+    .map((row) => ({ ...row }));
+  assert.deepEqual(sets, [
+    { id: "older-set", community_collection_title: null },
+    { id: "newer-set", community_collection_title: "迁移同名题库" },
+  ]);
+  const submissions = (sqlite.prepare(`
+    SELECT submission_id,question_set_id,start_order_index,added_image_count
+    FROM community_question_set_submissions
+    ORDER BY submission_id
+  `).all() as Array<Record<string, unknown>>).map((row) => ({ ...row }));
+  assert.deepEqual(submissions, [
+    {
+      submission_id: "migration-newer-submission",
+      question_set_id: "newer-set",
+      start_order_index: 0,
+      added_image_count: 1,
+    },
+    {
+      submission_id: "migration-older-submission",
+      question_set_id: "older-set",
+      start_order_index: 0,
+      added_image_count: 1,
+    },
+  ]);
+  assert.throws(
+    () => sqlite.prepare("UPDATE question_sets SET community_collection_title=title WHERE id='older-set'").run(),
+    /UNIQUE constraint failed/,
+  );
+});
+
 test("1080p policy constrains landscape, portrait, and square images without enlarging", () => {
   assert.deepEqual(constrainCommunityScreenshotDimensions(3840, 2160), { width: 1920, height: 1080 });
   assert.deepEqual(constrainCommunityScreenshotDimensions(2160, 3840), { width: 1080, height: 1920 });
@@ -210,6 +296,39 @@ test("homepage screenshot upload reports missing configuration and rejects non-i
   const wrongContentType = await worker.fetch(uploadRequest(ONE_PIXEL_PNG, UPLOAD_SECRET, "application/octet-stream"), env);
   assert.equal(wrongContentType.status, 415);
   assert.equal(getPutCount(), 0);
+});
+
+test("community question-list image proxy is keyed, allowlisted, and redirect-safe", async () => {
+  const { env } = createTestEnv();
+  const endpoint = "https://caicai.lpp.moe/api/community-remote-image-source";
+  const makeRequest = (imageUrl: string, key?: string) => new Request(endpoint, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      ...(key ? { "x-community-upload-key": key } : {}),
+    },
+    body: JSON.stringify({ imageUrl }),
+  });
+  const before = communityRemoteImageRequestCount;
+  const unauthorized = await worker.fetch(makeRequest("https://cdni.fancaps.net/file/test-community-import.png"), env);
+  assert.equal(unauthorized.status, 401);
+  assert.equal(communityRemoteImageRequestCount, before);
+
+  const unsupported = await worker.fetch(makeRequest("https://example.com/image.png", UPLOAD_SECRET), env);
+  assert.equal(unsupported.status, 400);
+  assert.match(JSON.stringify(await unsupported.json()), /FanCaps.*Bangumi/);
+  assert.equal(communityRemoteImageRequestCount, before);
+
+  const imported = await worker.fetch(makeRequest("https://cdni.fancaps.net/file/test-community-import.png", UPLOAD_SECRET), env);
+  assert.equal(imported.status, 200, await imported.clone().text());
+  assert.equal(imported.headers.get("content-type"), "image/png");
+  assert.deepEqual(new Uint8Array(await imported.arrayBuffer()), ONE_PIXEL_PNG);
+  assert.equal(communityRemoteImageRequestCount, before + 1);
+
+  const redirected = await worker.fetch(makeRequest("https://cdni.fancaps.net/file/test-community-redirect.png", UPLOAD_SECRET), env);
+  assert.equal(redirected.status, 400);
+  assert.match(JSON.stringify(await redirected.json()), /重定向.*不允许/);
+  assert.equal(communityRemoteImageRequestCount, before + 2);
 });
 
 test("Bangumi helper routes require the upload key and proxy normalized official data", async () => {
@@ -310,6 +429,166 @@ test("browser-style WebP uploads can be finalized as a public manifest question 
   assert.equal("answer_text" in indexPayload.images[0], false);
 });
 
+test("same-title homepage submissions append atomically to one ordered question set", async () => {
+  const { db, env } = createTestEnv();
+  const firstUpload = await worker.fetch(uploadRequest(ONE_PIXEL_PNG), env);
+  const secondUpload = await worker.fetch(uploadRequest(ONE_PIXEL_WEBP, UPLOAD_SECRET, "image/webp"), env);
+  const firstImage = await firstUpload.json() as { key: string };
+  const secondImage = await secondUpload.json() as { key: string };
+  const firstPayload = {
+    submissionId: "same-title-first-submission",
+    title: "同名追加题库",
+    description: "首次创建时的说明",
+    playerId: "first-player",
+    nickname: "首位上传者",
+    questions: [{ r2Key: firstImage.key, labelText: "第一题" }],
+  };
+  const secondPayload = {
+    submissionId: "same-title-second-submission",
+    title: "同名追加题库",
+    description: "追加时不覆盖原说明",
+    playerId: "second-player",
+    nickname: "第二位上传者",
+    questions: [{ r2Key: secondImage.key, labelText: "第二题" }],
+  };
+
+  const createdResponse = await worker.fetch(finalizeRequest(firstPayload), env);
+  const appendedResponse = await worker.fetch(finalizeRequest(secondPayload), env);
+  assert.equal(createdResponse.status, 200, await createdResponse.clone().text());
+  assert.equal(appendedResponse.status, 200, await appendedResponse.clone().text());
+  const created = await createdResponse.json() as Record<string, unknown>;
+  const appended = await appendedResponse.json() as Record<string, unknown>;
+  assert.equal(created.appended, false);
+  assert.equal(created.addedImageCount, 1);
+  assert.equal(appended.id, created.id);
+  assert.equal(appended.appended, true);
+  assert.equal(appended.addedImageCount, 1);
+  assert.equal(appended.imageCount, 2);
+
+  const questionSet = db.sqlite.prepare("SELECT * FROM question_sets WHERE id=?").get(created.id) as Record<string, unknown>;
+  assert.equal(questionSet.community_collection_title, "同名追加题库");
+  assert.equal(questionSet.description, "首次创建时的说明");
+  assert.equal(questionSet.created_by_nickname, "首位上传者");
+  assert.equal(questionSet.image_count, 2);
+  assert.equal(questionSet.manifest_revision, 1);
+  assert.deepEqual(
+    decodeQuestionSetManifest(questionSet)?.map((question) => [question.order_index, question.label_text]),
+    [[0, "第一题"], [1, "第二题"]],
+  );
+
+  const indexed = (db.sqlite.prepare(`
+    SELECT order_index,answer_text
+    FROM question_image_index
+    WHERE question_set_id=?
+    ORDER BY order_index
+  `).all(created.id) as Array<{ order_index: number; answer_text: string }>).map((row) => ({ ...row }));
+  assert.deepEqual(indexed, [
+    { order_index: 0, answer_text: "第一题" },
+    { order_index: 1, answer_text: "第二题" },
+  ]);
+  const submissions = (db.sqlite.prepare(`
+    SELECT submission_id,start_order_index,added_image_count
+    FROM community_question_set_submissions
+    WHERE question_set_id=?
+    ORDER BY start_order_index
+  `).all(created.id) as Array<Record<string, unknown>>).map((row) => ({ ...row }));
+  assert.deepEqual(submissions, [
+    { submission_id: firstPayload.submissionId, start_order_index: 0, added_image_count: 1 },
+    { submission_id: secondPayload.submissionId, start_order_index: 1, added_image_count: 1 },
+  ]);
+
+  const retryResponse = await worker.fetch(finalizeRequest(secondPayload), env);
+  assert.equal(retryResponse.status, 200);
+  assert.deepEqual(await retryResponse.json(), appended);
+  const setCount = db.sqlite.prepare("SELECT COUNT(*) AS count FROM question_sets WHERE title=?")
+    .get(firstPayload.title) as { count: number };
+  const submissionCount = db.sqlite.prepare("SELECT COUNT(*) AS count FROM community_question_set_submissions WHERE question_set_id=?")
+    .get(created.id) as { count: number };
+  assert.equal(setCount.count, 1);
+  assert.equal(submissionCount.count, 2);
+});
+
+test("same-title append retries a lost manifest revision CAS without duplicating rows", async () => {
+  const { db, env } = createTestEnv();
+  const firstUpload = await worker.fetch(uploadRequest(ONE_PIXEL_PNG), env);
+  const secondUpload = await worker.fetch(uploadRequest(ONE_PIXEL_WEBP, UPLOAD_SECRET, "image/webp"), env);
+  const firstImage = await firstUpload.json() as { key: string };
+  const secondImage = await secondUpload.json() as { key: string };
+  const createdResponse = await worker.fetch(finalizeRequest({
+    submissionId: "cas-retry-initial-submission",
+    title: "CAS 重试题库",
+    playerId: "test-player",
+    nickname: "测试者",
+    questions: [{ r2Key: firstImage.key, labelText: "原题" }],
+  }), env);
+  assert.equal(createdResponse.status, 200);
+  const created = await createdResponse.json() as { id: string };
+
+  db.beforeNextBatch = () => {
+    db.sqlite.prepare("UPDATE question_sets SET manifest_revision=manifest_revision+1 WHERE id=?").run(created.id);
+  };
+  const appendedResponse = await worker.fetch(finalizeRequest({
+    submissionId: "cas-retry-appended-submission",
+    title: "CAS 重试题库",
+    playerId: "test-player",
+    nickname: "测试者",
+    questions: [{ r2Key: secondImage.key, labelText: "追加题" }],
+  }), env);
+  assert.equal(appendedResponse.status, 200, await appendedResponse.clone().text());
+  const appended = await appendedResponse.json() as { id: string; imageCount: number; appended: boolean };
+  assert.equal(appended.id, created.id);
+  assert.equal(appended.imageCount, 2);
+  assert.equal(appended.appended, true);
+  const row = db.sqlite.prepare("SELECT * FROM question_sets WHERE id=?").get(created.id) as Record<string, unknown>;
+  assert.equal(row.manifest_revision, 2);
+  assert.deepEqual(decodeQuestionSetManifest(row)?.map((question) => question.label_text), ["原题", "追加题"]);
+  const counts = db.sqlite.prepare(`SELECT
+    (SELECT COUNT(*) FROM question_image_index WHERE question_set_id=?) AS images,
+    (SELECT COUNT(*) FROM community_question_set_submissions WHERE question_set_id=?) AS submissions
+  `).get(created.id, created.id) as { images: number; submissions: number };
+  assert.equal(counts.images, 2);
+  assert.equal(counts.submissions, 2);
+});
+
+test("same-title append rejects a submission that would exceed the 30-question set limit", async () => {
+  const { db, env, objects } = createTestEnv();
+  const makeStoredKey = (index: number) => {
+    const key = `question-images/community/2026/08/20/00000000-0000-4000-8000-${String(index).padStart(12, "0")}-screenshot.png`;
+    objects.set(key, {
+      key,
+      customMetadata: { uploadSource: "homepage-community" },
+    } as R2Object);
+    return key;
+  };
+  const initialKeys = Array.from({ length: 29 }, (_, index) => makeStoredKey(index));
+  const overflowKeys = [makeStoredKey(29), makeStoredKey(30)];
+  const createdResponse = await worker.fetch(finalizeRequest({
+    submissionId: "capacity-initial-submission",
+    title: "容量边界题库",
+    playerId: "test-player",
+    nickname: "测试者",
+    questions: initialKeys.map((r2Key, index) => ({ r2Key, labelText: `答案 ${index + 1}` })),
+  }), env);
+  assert.equal(createdResponse.status, 200, await createdResponse.clone().text());
+  const created = await createdResponse.json() as { id: string };
+
+  const overflowResponse = await worker.fetch(finalizeRequest({
+    submissionId: "capacity-overflow-submission",
+    title: "容量边界题库",
+    playerId: "test-player",
+    nickname: "测试者",
+    questions: overflowKeys.map((r2Key, index) => ({ r2Key, labelText: `溢出 ${index + 1}` })),
+  }), env);
+  assert.equal(overflowResponse.status, 409);
+  assert.match(JSON.stringify(await overflowResponse.json()), /已有 29 道题.*超过 30 道上限/);
+  const questionSet = db.sqlite.prepare("SELECT image_count,manifest_revision FROM question_sets WHERE id=?")
+    .get(created.id) as { image_count: number; manifest_revision: number };
+  assert.deepEqual({ ...questionSet }, { image_count: 29, manifest_revision: 0 });
+  const overflowSubmission = db.sqlite.prepare("SELECT submission_id FROM community_question_set_submissions WHERE submission_id=?")
+    .get("capacity-overflow-submission");
+  assert.equal(overflowSubmission, undefined);
+});
+
 test("question-set finalization rejects key tampering, duplicate objects, and unvalidated metadata", async () => {
   const { env, objects } = createTestEnv();
   const uploadResponse = await worker.fetch(uploadRequest(ONE_PIXEL_PNG), env);
@@ -397,6 +676,57 @@ test("question-set creation is atomic when image indexing fails", async () => {
   assert.equal(response.status, 500);
   const remaining = db.sqlite.prepare("SELECT COUNT(*) AS count FROM question_sets WHERE title=?").get("索引回滚测试") as { count: number };
   assert.equal(remaining.count, 0);
+});
+
+test("same-title append rolls back its manifest, index, and submission when indexing fails", async () => {
+  const { db, env } = createTestEnv();
+  const firstUpload = await worker.fetch(uploadRequest(ONE_PIXEL_PNG), env);
+  const secondUpload = await worker.fetch(uploadRequest(ONE_PIXEL_WEBP, UPLOAD_SECRET, "image/webp"), env);
+  const firstImage = await firstUpload.json() as { key: string };
+  const secondImage = await secondUpload.json() as { key: string };
+  const firstResponse = await worker.fetch(finalizeRequest({
+    submissionId: "append-rollback-initial",
+    title: "追加回滚题库",
+    playerId: "test-player",
+    nickname: "测试者",
+    questions: [{ r2Key: firstImage.key, labelText: "原题" }],
+  }), env);
+  assert.equal(firstResponse.status, 200);
+  const created = await firstResponse.json() as { id: string };
+  db.sqlite.exec(`
+    CREATE TRIGGER reject_appended_image_index
+    BEFORE INSERT ON question_image_index
+    WHEN NEW.order_index > 0
+    BEGIN
+      SELECT RAISE(ABORT, 'forced append index failure');
+    END;
+  `);
+
+  const appendPayload = {
+    submissionId: "append-rollback-second",
+    title: "追加回滚题库",
+    playerId: "test-player",
+    nickname: "测试者",
+    questions: [{ r2Key: secondImage.key, labelText: "追加题" }],
+  };
+  const failedResponse = await worker.fetch(finalizeRequest(appendPayload), env);
+  assert.equal(failedResponse.status, 500);
+  const unchanged = db.sqlite.prepare("SELECT * FROM question_sets WHERE id=?").get(created.id) as Record<string, unknown>;
+  assert.equal(unchanged.image_count, 1);
+  assert.equal(unchanged.manifest_revision, 0);
+  assert.deepEqual(decodeQuestionSetManifest(unchanged)?.map((question) => question.label_text), ["原题"]);
+  const indexCount = db.sqlite.prepare("SELECT COUNT(*) AS count FROM question_image_index WHERE question_set_id=?")
+    .get(created.id) as { count: number };
+  const submissionCount = db.sqlite.prepare("SELECT COUNT(*) AS count FROM community_question_set_submissions WHERE question_set_id=?")
+    .get(created.id) as { count: number };
+  assert.equal(indexCount.count, 1);
+  assert.equal(submissionCount.count, 1);
+
+  db.sqlite.exec("DROP TRIGGER reject_appended_image_index");
+  const retryResponse = await worker.fetch(finalizeRequest(appendPayload), env);
+  assert.equal(retryResponse.status, 200, await retryResponse.clone().text());
+  const retried = await retryResponse.json() as { id: string; imageCount: number; appended: boolean };
+  assert.deepEqual(retried, { id: created.id, title: "追加回滚题库", imageCount: 2, appended: true, addedImageCount: 1 });
 });
 
 test("question-set finalization enforces count, label, and request-body limits", async () => {

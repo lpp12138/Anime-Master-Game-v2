@@ -479,6 +479,7 @@ export type DbQuestionSet = {
   manifest_json?: string | null;
   community_submission_id?: string | null;
   community_submission_fingerprint?: string | null;
+  community_collection_title?: string | null;
   created_at: string;
   updated_at?: string | null;
 };

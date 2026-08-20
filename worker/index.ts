@@ -29,6 +29,7 @@ import {
   COMMUNITY_SCREENSHOT_MAX_QUESTIONS,
   isCommunityScreenshotWithin1080p,
 } from "../src/lib/communityScreenshotPolicy";
+import { isSupportedCreationToolImageUrl } from "../src/lib/creationToolQuestionList";
 import { InvalidImageError, validateRasterImage } from "./imageValidation";
 import { normalizeBangumiQuestionTags } from "../src/lib/bangumiTags";
 import {
@@ -256,6 +257,7 @@ const TEAM_BATTLE_VOTE_ALARM_MAX_ATTEMPTS = 3;
 const BUSINESS_ALARM_RECOVERY_RETRY_DELAY_MS = 30_000;
 const BUSINESS_ALARM_MIN_SCHEDULE_DELAY_MS = 1000;
 const REMOTE_IMAGE_FETCH_MAX_BYTES = 20 * 1024 * 1024;
+const REMOTE_IMAGE_FETCH_TIMEOUT_MS = 15_000;
 const R2_IMAGE_ROUTE_PREFIX = "/api/r2-images/";
 const COMMUNITY_QUESTION_SET_BODY_MAX_BYTES = 512 * 1024;
 const COMMUNITY_UPLOAD_KEY_HEADER = "x-community-upload-key";
@@ -1792,7 +1794,7 @@ function getSourceFetchHeaders(url: URL) {
     "Accept-Language": "en-US,en;q=0.9,zh-CN;q=0.8,zh;q=0.7",
   });
 
-  if (url.hostname === "cdni.fancaps.net" || url.hostname === "fancaps.net") {
+  if (url.hostname === "fancaps.net" || url.hostname.endsWith(".fancaps.net")) {
     headers.set("Referer", "https://fancaps.net/");
   } else if (url.hostname === "lain.bgm.tv") {
     headers.set("Referer", "https://bgm.tv/");
@@ -1801,21 +1803,26 @@ function getSourceFetchHeaders(url: URL) {
   return headers;
 }
 
-async function fetchRemoteImage(rawUrl: string, env: Env): Promise<RemoteFetchResult> {
+async function fetchRemoteImage(
+  rawUrl: string,
+  env: Env,
+  options: { allowedTarget?: (url: URL) => boolean; useProxyFallbacks?: boolean } = {},
+): Promise<RemoteFetchResult> {
   const targetUrl = new URL(rawUrl);
   if (targetUrl.protocol !== "http:" && targetUrl.protocol !== "https:") {
     throw new Error("只支持 http/https 图片链接。");
   }
-  if (isBlockedRemoteHost(targetUrl.hostname)) {
-    throw new RemoteImageTargetBlockedError("不允许导入本地或私有网络图片。");
+  if (isBlockedRemoteHost(targetUrl.hostname) || (options.allowedTarget && !options.allowedTarget(targetUrl))) {
+    throw new RemoteImageTargetBlockedError("不允许导入该图片地址。");
   }
 
   const attempts = [
-    { url: targetUrl.toString(), headers: getSourceFetchHeaders(targetUrl) },
-    ...getRemoteProxyCandidates(env).map((prefix) => ({
+    { url: targetUrl.toString(), headers: getSourceFetchHeaders(targetUrl), enforceTargetPolicy: true },
+    ...(options.useProxyFallbacks === false ? [] : getRemoteProxyCandidates(env).map((prefix) => ({
       url: `${prefix}${encodeURIComponent(targetUrl.toString())}`,
       headers: new Headers({ Accept: "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8" }),
-    })),
+      enforceTargetPolicy: false,
+    }))),
   ];
   let lastError = "远端图片请求失败。";
 
@@ -1825,10 +1832,19 @@ async function fetchRemoteImage(rawUrl: string, env: Env): Promise<RemoteFetchRe
       let response: Response | null = null;
       for (let redirectCount = 0; redirectCount <= 3; redirectCount += 1) {
         const parsedAttemptUrl = new URL(currentUrl);
-        if (!["http:", "https:"].includes(parsedAttemptUrl.protocol) || isBlockedRemoteHost(parsedAttemptUrl.hostname)) {
+        if (
+          !["http:", "https:"].includes(parsedAttemptUrl.protocol)
+          || isBlockedRemoteHost(parsedAttemptUrl.hostname)
+          || (attempt.enforceTargetPolicy && options.allowedTarget && !options.allowedTarget(parsedAttemptUrl))
+        ) {
           throw new RemoteImageTargetBlockedError("远端图片重定向到了不允许的地址。");
         }
-        response = await fetch(currentUrl, { method: "GET", headers: attempt.headers, redirect: "manual" });
+        response = await fetch(currentUrl, {
+          method: "GET",
+          headers: attempt.headers,
+          redirect: "manual",
+          signal: AbortSignal.timeout(REMOTE_IMAGE_FETCH_TIMEOUT_MS),
+        });
         if (![301, 302, 303, 307, 308].includes(response.status)) break;
         const location = response.headers.get("location");
         if (!location || redirectCount === 3) throw new Error("远端图片重定向次数过多。");
@@ -1848,7 +1864,7 @@ async function fetchRemoteImage(rawUrl: string, env: Env): Promise<RemoteFetchRe
 
       const contentLength = Number(response.headers.get("content-length"));
       if (Number.isFinite(contentLength) && contentLength > REMOTE_IMAGE_FETCH_MAX_BYTES) {
-        throw new Error("远端原图不能超过 20 MB。");
+        throw new ImageBodyTooLargeError("远端原图不能超过 20 MB。");
       }
 
       const body = await readBodyWithLimit(response.body, REMOTE_IMAGE_FETCH_MAX_BYTES, "远端原图不能超过 20 MB。");
@@ -1860,7 +1876,9 @@ async function fetchRemoteImage(rawUrl: string, env: Env): Promise<RemoteFetchRe
       return { body, contentType };
     } catch (error) {
       if (error instanceof RemoteImageTargetBlockedError || error instanceof ImageBodyTooLargeError) throw error;
-      lastError = error instanceof Error ? error.message : String(error);
+      lastError = error instanceof Error && error.name === "TimeoutError"
+        ? "远端图片请求超时。"
+        : error instanceof Error ? error.message : String(error);
     }
   }
 
@@ -1922,6 +1940,59 @@ async function handleRemoteImageSource(request: Request, env: Env) {
   });
   for (const [name, value] of Object.entries(corsHeaders(request, env))) headers.set(name, value);
   return new Response(remote.body, { status: 200, headers });
+}
+
+async function handleCommunityRemoteImageSource(request: Request, env: Env) {
+  const authError = await authorizeCommunityUpload(request, env);
+  if (authError) return authError;
+
+  let payload: unknown;
+  try {
+    payload = JSON.parse(await readLimitedRequestText(request, 4096));
+  } catch {
+    return json({ error: "远端图片请求参数无效。" }, { status: 400 }, request, env);
+  }
+  const imageUrl = isRecord(payload) && typeof payload.imageUrl === "string" ? payload.imageUrl.trim() : "";
+  let parsedImageUrl: URL;
+  try {
+    parsedImageUrl = new URL(imageUrl);
+  } catch {
+    return json({ error: "题单中的 image_url 无效。" }, { status: 400 }, request, env);
+  }
+  if (!isSupportedCreationToolImageUrl(parsedImageUrl)) {
+    return json(
+      { error: "只支持动画截图工具导出的 FanCaps 或 Bangumi 图片地址。" },
+      { status: 400 },
+      request,
+      env,
+    );
+  }
+
+  try {
+    const remote = await fetchRemoteImage(imageUrl, env, {
+      allowedTarget: isSupportedCreationToolImageUrl,
+      useProxyFallbacks: false,
+    });
+    const headers = new Headers({
+      "content-type": remote.contentType,
+      "content-length": String(remote.body.byteLength),
+      "cache-control": "no-store",
+      "x-content-type-options": "nosniff",
+    });
+    for (const [name, value] of Object.entries(corsHeaders(request, env))) headers.set(name, value);
+    return new Response(remote.body, { status: 200, headers });
+  } catch (error) {
+    const message = error instanceof Error && error.name !== "TimeoutError"
+      ? error.message
+      : "远端图片下载超时，请稍后重试。";
+    if (error instanceof ImageBodyTooLargeError) {
+      return json({ error: message }, { status: 413 }, request, env);
+    }
+    if (error instanceof RemoteImageTargetBlockedError) {
+      return json({ error: message }, { status: 400 }, request, env);
+    }
+    return json({ error: message }, { status: 502 }, request, env);
+  }
 }
 
 async function hasValidCommunityUploadKey(request: Request, env: Env) {
@@ -2280,7 +2351,13 @@ async function handleCommunityQuestionSetCreate(request: Request, env: Env, cach
         return json({ error: "投稿内容已发生变化，请作为一次新投稿重试。" }, { status: 409 }, request, env);
       }
       const questionSet = existing.questionSet;
-      return json({ id: questionSet.id, title: questionSet.title, imageCount: questionSet.imageCount }, {}, request, env);
+      return json({
+        id: questionSet.id,
+        title: questionSet.title,
+        imageCount: questionSet.imageCount,
+        appended: existing.appended,
+        addedImageCount: existing.addedImageCount,
+      }, {}, request, env);
     }
   } catch (error) {
     if (error instanceof gameService.HomepageCommunityQuestionSetPersistenceError) {
@@ -2305,9 +2382,9 @@ async function handleCommunityQuestionSetCreate(request: Request, env: Env, cach
     throw error;
   }
 
-  let questionSet;
+  let savedQuestionSet;
   try {
-    questionSet = await runWithGameDatabase(env, () => gameService.createHomepageCommunityQuestionSet({
+    savedQuestionSet = await runWithGameDatabase(env, () => gameService.createHomepageCommunityQuestionSet({
       submissionId,
       submissionFingerprint,
       playerId,
@@ -2322,7 +2399,10 @@ async function handleCommunityQuestionSetCreate(request: Request, env: Env, cach
       })),
     }));
   } catch (error) {
-    if (error instanceof gameService.HomepageCommunityQuestionSetConflictError) {
+    if (
+      error instanceof gameService.HomepageCommunityQuestionSetConflictError
+      || error instanceof gameService.HomepageCommunityQuestionSetCapacityError
+    ) {
       return json({ error: error.message }, { status: 409 }, request, env);
     }
     if (error instanceof gameService.HomepageCommunityQuestionSetPersistenceError) {
@@ -2332,7 +2412,14 @@ async function handleCommunityQuestionSetCreate(request: Request, env: Env, cach
     throw error;
   }
 
-  return json({ id: questionSet.id, title: questionSet.title, imageCount: questionSet.imageCount }, {}, request, env);
+  const questionSet = savedQuestionSet.questionSet;
+  return json({
+    id: questionSet.id,
+    title: questionSet.title,
+    imageCount: questionSet.imageCount,
+    appended: savedQuestionSet.appended,
+    addedImageCount: savedQuestionSet.addedImageCount,
+  }, {}, request, env);
 }
 
 async function handleR2Upload(request: Request, env: Env) {
@@ -5846,6 +5933,10 @@ export default {
 
       if (url.pathname === "/api/r2-upload" && request.method === "POST") {
         return await handleR2Upload(request, env);
+      }
+
+      if (url.pathname === "/api/community-remote-image-source" && request.method === "POST") {
+        return await handleCommunityRemoteImageSource(request, env);
       }
 
       if (url.pathname === "/api/community-screenshot-upload" && request.method === "POST") {

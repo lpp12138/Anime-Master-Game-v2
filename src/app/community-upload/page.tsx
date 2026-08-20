@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState, type ChangeEvent, type FormEvent } from "react";
+import { useEffect, useMemo, useRef, useState, type ChangeEvent, type FormEvent } from "react";
 import { BangumiQuestionTagEditor } from "@/components/BangumiQuestionTagEditor";
 import { Button } from "@/components/Button";
 import { CommunityImageIndexPreview } from "@/components/CommunityImageIndexPreview";
@@ -8,8 +8,13 @@ import { searchBangumiAnime } from "@/lib/bangumiClient";
 import { bangumiTagDisplayName, normalizeBangumiSearchText } from "@/lib/bangumiTags";
 import {
   createUploadedCommunityQuestionSet,
+  importCommunityScreenshotFromUrl,
   uploadCommunityScreenshot,
 } from "@/lib/communityScreenshotUpload";
+import {
+  CREATION_TOOL_QUESTION_LIST_MAX_BYTES,
+  parseCreationToolQuestionList,
+} from "@/lib/creationToolQuestionList";
 import { COMMUNITY_SCREENSHOT_MAX_QUESTIONS } from "@/lib/communityScreenshotPolicy";
 import { getLocalSession } from "@/lib/localSession";
 import {
@@ -25,8 +30,11 @@ const ACCEPTED_IMAGE_TYPES = new Set(["image/jpeg", "image/png", "image/webp", "
 
 type ScreenshotDraft = {
   id: string;
-  file: File;
+  file: File | null;
+  displayName: string;
   previewUrl: string;
+  previewIsObjectUrl: boolean;
+  sourceUrl: string | null;
   labelText: string;
   animeTags: BangumiAnimeTag[];
   characterTags: BangumiCharacterTag[];
@@ -36,6 +44,8 @@ type UploadSuccess = {
   id: string;
   title: string;
   imageCount: number;
+  appended: boolean;
+  addedImageCount: number;
 };
 
 function suggestedLabel(filename: string) {
@@ -47,12 +57,17 @@ function fileIdentity(file: File) {
   return `${file.name}:${file.size}:${file.lastModified}`;
 }
 
+function revokeDraftPreview(draft: ScreenshotDraft) {
+  if (draft.previewIsObjectUrl) URL.revokeObjectURL(draft.previewUrl);
+}
+
 export default function CommunityUploadPage() {
   const router = useRouter();
   const [uploadKey, setUploadKey] = useState("");
   const [title, setTitle] = useState(DEFAULT_QUESTION_SET_TITLE);
   const [description, setDescription] = useState("");
   const [uploaderNickname, setUploaderNickname] = useState("");
+  const [questionListText, setQuestionListText] = useState("");
   const [drafts, setDrafts] = useState<ScreenshotDraft[]>([]);
   const [selectedDraftId, setSelectedDraftId] = useState<string | null>(null);
   const [error, setError] = useState("");
@@ -60,8 +75,10 @@ export default function CommunityUploadPage() {
   const [success, setSuccess] = useState<UploadSuccess | null>(null);
   const [isUploading, setIsUploading] = useState(false);
   const [isAutoTagging, setIsAutoTagging] = useState(false);
-  const isBusy = isUploading || isAutoTagging;
+  const [isImportingQuestionList, setIsImportingQuestionList] = useState(false);
+  const isBusy = isUploading || isAutoTagging || isImportingQuestionList;
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const questionListInputRef = useRef<HTMLInputElement>(null);
   const uploadKeyInputRef = useRef<HTMLInputElement>(null);
   const editorRef = useRef<HTMLElement>(null);
   const draftsRef = useRef<ScreenshotDraft[]>([]);
@@ -72,6 +89,15 @@ export default function CommunityUploadPage() {
   const selectedIndex = selectedDraft ? drafts.findIndex((draft) => draft.id === selectedDraft.id) : -1;
   const completedCount = drafts.filter((draft) => draft.labelText.trim()).length;
   const taggedCount = drafts.filter((draft) => draft.animeTags.length > 0).length;
+  const questionListPreview = useMemo(() => {
+    if (!questionListText.trim()) return { count: 0, error: "" };
+    try {
+      return { count: parseCreationToolQuestionList(questionListText).length, error: "" };
+    } catch (previewError) {
+      return { count: 0, error: previewError instanceof Error ? previewError.message : "题单格式无效。" };
+    }
+  }, [questionListText]);
+  const hasUnsubmittedWork = drafts.length > 0 || Boolean(questionListText.trim()) || isBusy;
 
   useEffect(() => {
     setUploaderNickname(getLocalSession().nickname);
@@ -84,11 +110,11 @@ export default function CommunityUploadPage() {
 
   useEffect(() => () => {
     operationAbortRef.current?.abort();
-    draftsRef.current.forEach((draft) => URL.revokeObjectURL(draft.previewUrl));
+    draftsRef.current.forEach(revokeDraftPreview);
   }, []);
 
   useEffect(() => {
-    if (drafts.length === 0) return;
+    if (!hasUnsubmittedWork) return;
     const confirmRouteExit = (event: Event) => {
       const routeEvent = event as CustomEvent<AppBeforeRouteChangeDetail>;
       if (routeEvent.detail?.path === "/community-upload") return;
@@ -99,17 +125,17 @@ export default function CommunityUploadPage() {
     };
     window.addEventListener(APP_BEFORE_ROUTE_CHANGE_EVENT, confirmRouteExit);
     return () => window.removeEventListener(APP_BEFORE_ROUTE_CHANGE_EVENT, confirmRouteExit);
-  }, [drafts.length, isBusy]);
+  }, [hasUnsubmittedWork, isBusy]);
 
   useEffect(() => {
-    if (drafts.length === 0) return;
+    if (!hasUnsubmittedWork) return;
     const warnBeforeUnload = (event: BeforeUnloadEvent) => {
       event.preventDefault();
       event.returnValue = "";
     };
     window.addEventListener("beforeunload", warnBeforeUnload);
     return () => window.removeEventListener("beforeunload", warnBeforeUnload);
-  }, [drafts.length]);
+  }, [hasUnsubmittedWork]);
 
   function goHome() {
     if (isBusy) return;
@@ -141,7 +167,7 @@ export default function CommunityUploadPage() {
       setError(`${invalid.name} 不是支持的图片文件；现有截图和标签不会被清空。`);
       return;
     }
-    const existingFiles = new Set(drafts.map((draft) => fileIdentity(draft.file)));
+    const existingFiles = new Set(drafts.flatMap((draft) => draft.file ? [fileIdentity(draft.file)] : []));
     const files = selectedFiles.filter((file, index) => {
       const identity = fileIdentity(file);
       return !existingFiles.has(identity) && selectedFiles.findIndex((candidate) => fileIdentity(candidate) === identity) === index;
@@ -151,19 +177,145 @@ export default function CommunityUploadPage() {
       return;
     }
     if (drafts.length + files.length > COMMUNITY_SCREENSHOT_MAX_QUESTIONS) {
-      setError(`当前已有 ${drafts.length} 张；每个题库最多上传 ${COMMUNITY_SCREENSHOT_MAX_QUESTIONS} 张图片。`);
+      setError(`本次已有 ${drafts.length} 张；单次最多选择 ${COMMUNITY_SCREENSHOT_MAX_QUESTIONS} 张图片。`);
       return;
     }
     const additions = files.map((file) => ({
       id: `${fileIdentity(file)}:${crypto.randomUUID()}`,
       file,
+      displayName: file.name,
       previewUrl: URL.createObjectURL(file),
+      previewIsObjectUrl: true,
+      sourceUrl: null,
       labelText: suggestedLabel(file.name),
       animeTags: [],
       characterTags: [],
     } satisfies ScreenshotDraft));
     setDrafts((current) => [...current, ...additions]);
     setSelectedDraftId((current) => current ?? additions[0]?.id ?? null);
+  }
+
+  async function importQuestionList(text = questionListText) {
+    if (isBusy || operationAbortRef.current) return;
+    setError("");
+    setStatus("");
+    setSuccess(null);
+
+    const normalizedUploadKey = uploadKey.trim();
+    if (!normalizedUploadKey) return setError("请先填写上传密钥，再导入出题工具题单。");
+    let items;
+    try {
+      items = parseCreationToolQuestionList(text);
+    } catch (importError) {
+      return setError(importError instanceof Error ? importError.message : "题单格式无效。");
+    }
+    const existingSourceUrls = new Set(drafts.flatMap((draft) => draft.sourceUrl ? [draft.sourceUrl] : []));
+    const pendingItems = items.filter((item) => !existingSourceUrls.has(item.imageUrl));
+    if (pendingItems.length === 0) {
+      setStatus("题单中的图片都已在当前截图网格中。");
+      return;
+    }
+    if (drafts.length + pendingItems.length > COMMUNITY_SCREENSHOT_MAX_QUESTIONS) {
+      return setError(`当前已有 ${drafts.length} 张，再导入 ${pendingItems.length} 张会超过 ${COMMUNITY_SCREENSHOT_MAX_QUESTIONS} 张上限。`);
+    }
+
+    const controller = new AbortController();
+    operationAbortRef.current = controller;
+    setIsImportingQuestionList(true);
+    const additions: Array<{ order: number; draft: ScreenshotDraft }> = [];
+    const failures: Array<{ order: number; message: string }> = [];
+    let fatalError = "";
+    let nextIndex = 0;
+    let completed = 0;
+    const workers = Array.from({ length: Math.min(2, pendingItems.length) }, async () => {
+      while (nextIndex < pendingItems.length && !controller.signal.aborted) {
+        const order = nextIndex;
+        nextIndex += 1;
+        const item = pendingItems[order];
+        setStatus(`正在下载、压缩并上传题单图片 ${completed + 1} / ${pendingItems.length}……`);
+        try {
+          const uploaded = await importCommunityScreenshotFromUrl(
+            item.imageUrl,
+            normalizedUploadKey,
+            controller.signal,
+          );
+          const id = `question-list:${crypto.randomUUID()}`;
+          uploadedKeysRef.current.set(id, uploaded.key);
+          additions.push({
+            order,
+            draft: {
+              id,
+              file: null,
+              displayName: uploaded.fileName,
+              previewUrl: uploaded.url,
+              previewIsObjectUrl: false,
+              sourceUrl: item.imageUrl,
+              labelText: item.labelText,
+              animeTags: [],
+              characterTags: [],
+            },
+          });
+        } catch (itemError) {
+          if (!controller.signal.aborted) {
+            const message = itemError instanceof Error ? itemError.message : "图片导入失败。";
+            failures.push({ order, message });
+            if (/上传密钥无效|截图上传功能尚未配置/.test(message)) {
+              fatalError = message;
+              controller.abort();
+            }
+          }
+        } finally {
+          completed += 1;
+        }
+      }
+    });
+
+    try {
+      await Promise.all(workers);
+      const orderedAdditions = additions.sort((left, right) => left.order - right.order).map(({ draft }) => draft);
+      if (orderedAdditions.length > 0) {
+        setDrafts((current) => [...current, ...orderedAdditions]);
+        setSelectedDraftId((current) => current ?? orderedAdditions[0].id);
+      }
+      if (fatalError) {
+        setStatus(orderedAdditions.length > 0 ? `已保留成功导入的 ${orderedAdditions.length} 张图片。` : "");
+        setError(fatalError);
+      } else if (controller.signal.aborted) {
+        setStatus(orderedAdditions.length > 0 ? `已保留成功导入的 ${orderedAdditions.length} 张图片。` : "");
+        setError("已取消题单导入；服务器已接收的图片会保留供本次提交复用。");
+      } else if (failures.length > 0) {
+        failures.sort((left, right) => left.order - right.order);
+        setStatus(`成功导入 ${orderedAdditions.length} 张，${failures.length} 张失败；再次导入只会重试失败图片。`);
+        setError(`第 ${failures[0].order + 1} 张导入失败：${failures[0].message}`);
+      } else {
+        setQuestionListText("");
+        setStatus(`已从出题工具题单导入 ${orderedAdditions.length} 张图片，可继续编辑答案和 BGM 标签。`);
+      }
+    } finally {
+      if (operationAbortRef.current === controller) operationAbortRef.current = null;
+      setIsImportingQuestionList(false);
+    }
+  }
+
+  async function handleQuestionListFile(event: ChangeEvent<HTMLInputElement>) {
+    const file = event.target.files?.[0];
+    event.target.value = "";
+    if (!file) return;
+    if (!/\.(?:json|jsonl|ndjson)$/i.test(file.name) && !/^(?:application\/(?:json|x-ndjson)|text\/plain)$/i.test(file.type)) {
+      setError("请选择出题工具导出的 .jsonl 或 .json 文件。");
+      return;
+    }
+    if (file.size > CREATION_TOOL_QUESTION_LIST_MAX_BYTES) {
+      setError("题单文件不能超过 256 KiB。");
+      return;
+    }
+    try {
+      const text = await file.text();
+      setQuestionListText(text);
+      await importQuestionList(text);
+    } catch {
+      setError("题单文件读取失败，请重试。");
+    }
   }
 
   function updateLabel(id: string, labelText: string) {
@@ -197,7 +349,7 @@ export default function CommunityUploadPage() {
     const index = drafts.findIndex((draft) => draft.id === id);
     const removed = drafts[index];
     if (!removed) return;
-    URL.revokeObjectURL(removed.previewUrl);
+    revokeDraftPreview(removed);
     uploadedKeysRef.current.delete(id);
     const nextDrafts = drafts.filter((draft) => draft.id !== id);
     setDrafts(nextDrafts);
@@ -322,13 +474,14 @@ export default function CommunityUploadPage() {
       for (const [index, draft] of drafts.entries()) {
         let r2Key = uploadedKeysRef.current.get(draft.id);
         if (!r2Key) {
-          setStatus(`正在压缩并上传第 ${index + 1} / ${drafts.length} 张：${draft.file.name}`);
+          if (!draft.file) throw new Error(`第 ${index + 1} 张导入图片缺少可复用的服务器对象，请重新导入题单。`);
+          setStatus(`正在压缩并上传第 ${index + 1} / ${drafts.length} 张：${draft.displayName}`);
           const uploaded = await uploadCommunityScreenshot(draft.file, normalizedUploadKey, controller.signal);
           r2Key = uploaded.key;
           uploadedKeysRef.current.set(draft.id, r2Key);
           hasStoredUploads = true;
         } else {
-          setStatus(`正在复用已上传的第 ${index + 1} / ${drafts.length} 张：${draft.file.name}`);
+          setStatus(`正在复用已上传的第 ${index + 1} / ${drafts.length} 张：${draft.displayName}`);
         }
         questions.push({
           r2Key,
@@ -338,7 +491,7 @@ export default function CommunityUploadPage() {
         });
       }
 
-      setStatus("图片上传完成，正在原子写入社区题库……");
+      setStatus("图片上传完成，正在原子创建或追加社区题库……");
       const result = await createUploadedCommunityQuestionSet({
         submissionId,
         title: normalizedTitle,
@@ -347,12 +500,13 @@ export default function CommunityUploadPage() {
         nickname: normalizedNickname,
         questions,
       }, normalizedUploadKey, controller.signal);
-      drafts.forEach((draft) => URL.revokeObjectURL(draft.previewUrl));
+      drafts.forEach(revokeDraftPreview);
       setSuccess(result);
       setStatus("");
       setUploadKey("");
       setTitle(DEFAULT_QUESTION_SET_TITLE);
       setDescription("");
+      setQuestionListText("");
       setDrafts([]);
       setSelectedDraftId(null);
       submissionRef.current = null;
@@ -386,7 +540,7 @@ export default function CommunityUploadPage() {
             </button>
             <h1 className="text-3xl font-bold text-slate-950 sm:text-4xl">密钥上传截图</h1>
             <p className="mt-2 max-w-3xl text-sm leading-6 text-slate-600 sm:text-base">
-              选择截图后会以自适应网格展示。点击任意缩略图，在编辑区填写正确答案并搜索 BGM（Bangumi）番剧与角色标签。
+              可选择本地截图，或上传/粘贴动画截图工具的 JSON 题单。图片会进入自适应网格，点击任意缩略图即可填写答案并搜索 BGM（Bangumi）番剧与角色标签。
             </p>
           </div>
           <div className="rounded-full border border-sky-200 bg-sky-50 px-3 py-1.5 text-xs font-semibold text-sky-800">
@@ -438,6 +592,7 @@ export default function CommunityUploadPage() {
                   value={title}
                   onChange={(event) => setTitle(event.target.value)}
                 />
+                <span className="mt-1 block text-xs leading-5 text-slate-500">若存在标题完全相同的社区截图题库，本次图片会按顺序追加；整套题库仍最多 30 题。</span>
               </label>
               <label className="block">
                 <span className="mb-1 block text-sm font-semibold text-slate-900">上传者昵称</span>
@@ -474,13 +629,66 @@ export default function CommunityUploadPage() {
                 />
                 <span className="mt-1 block text-xs leading-5 text-slate-500">支持 JPEG、PNG、WebP、GIF、AVIF；GIF/AVIF 会转为静态图，单个原文件不超过 30 MB。</span>
               </label>
+              <section className="space-y-3 rounded-xl border border-sky-200 bg-sky-50/60 p-4 md:col-span-2" aria-labelledby="question-list-import-title">
+                <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+                  <div>
+                    <h3 className="text-sm font-bold text-slate-950" id="question-list-import-title">导入动画截图工具题单</h3>
+                    <p className="mt-1 text-xs leading-5 text-slate-600">可上传工具导出的 JSONL / JSON 文件，或直接粘贴题单内容；图片会从 FanCaps / Bangumi 下载、压缩并加入下方网格。</p>
+                  </div>
+                  <button
+                    className="shrink-0 rounded-md border border-sky-300 bg-white px-3 py-2 text-xs font-semibold text-sky-800 hover:bg-sky-100 disabled:opacity-50"
+                    disabled={isBusy}
+                    type="button"
+                    onClick={() => questionListInputRef.current?.click()}
+                  >选择题单文件</button>
+                  <input
+                    ref={questionListInputRef}
+                    accept=".json,.jsonl,.ndjson,application/json,application/x-ndjson,text/plain"
+                    className="hidden"
+                    disabled={isBusy}
+                    type="file"
+                    onChange={(event) => void handleQuestionListFile(event)}
+                  />
+                </div>
+                <textarea
+                  aria-label="出题工具 JSON 题单内容"
+                  className="min-h-32 w-full resize-y rounded-md border border-sky-200 bg-white px-3 py-2 font-mono text-xs leading-5 outline-none transition focus:border-[var(--primary)] focus:ring-4 focus:ring-rose-100 disabled:bg-slate-100"
+                  disabled={isBusy}
+                  placeholder={'{"image_url":"https://cdni.fancaps.net/file/...jpg","label_text":"动画名"}'}
+                  value={questionListText}
+                  onChange={(event) => {
+                    setQuestionListText(event.target.value);
+                    setError("");
+                    setSuccess(null);
+                  }}
+                />
+                <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+                  <p className={`text-xs leading-5 ${questionListPreview.error ? "text-rose-700" : "text-slate-600"}`}>
+                    {questionListPreview.error
+                      ? questionListPreview.error
+                      : questionListPreview.count > 0
+                        ? `已识别 ${questionListPreview.count} 道题；空答案可在导入后逐题补充。`
+                        : "兼容截图工具复制或导出的 image_url / label_text 格式，最多 30 题。"}
+                  </p>
+                  <button
+                    className="shrink-0 rounded-md bg-sky-700 px-4 py-2 text-sm font-semibold text-white hover:bg-sky-800 disabled:opacity-50"
+                    disabled={isBusy || !questionListText.trim() || Boolean(questionListPreview.error)}
+                    type="button"
+                    onClick={() => void importQuestionList()}
+                  >{isImportingQuestionList ? "正在导入…" : "导入粘贴题单"}</button>
+                </div>
+              </section>
             </div>
           </section>
 
           {success ? (
             <section className="rounded-xl border border-emerald-200 bg-emerald-50 p-5 text-emerald-800" role="status">
               <h2 className="font-bold">上传成功</h2>
-              <p className="mt-1 text-sm leading-6">“{success.title}”已保存为包含 {success.imageCount} 道题的公开社区题库。</p>
+              <p className="mt-1 text-sm leading-6">
+                {success.appended
+                  ? `本次已向“${success.title}”追加 ${success.addedImageCount} 道题；题库目前共 ${success.imageCount} 道题。`
+                  : `“${success.title}”已创建为包含 ${success.imageCount} 道题的公开社区题库。`}
+              </p>
             </section>
           ) : null}
 
@@ -489,7 +697,7 @@ export default function CommunityUploadPage() {
               <div>
                 <div className="mx-auto grid h-14 w-14 place-items-center rounded-full bg-slate-100 text-2xl" aria-hidden="true">▧</div>
                 <h2 className="mt-4 text-lg font-bold text-slate-900">尚未选择截图</h2>
-                <p className="mt-2 text-sm text-slate-500">通过上方文件框选择图片后，这里会显示可点击编辑的缩略图网格。</p>
+                <p className="mt-2 text-sm text-slate-500">通过上方文件框选择图片，或导入出题工具 JSON 题单后，这里会显示可点击编辑的缩略图网格。</p>
               </div>
             </section>
           ) : (
@@ -557,9 +765,9 @@ export default function CommunityUploadPage() {
                           </span>
                         </button>
                         <div className="flex items-center gap-2 px-3 py-2">
-                          <p className="min-w-0 flex-1 truncate text-xs font-medium text-slate-600" title={draft.file.name}>{draft.file.name}</p>
+                          <p className="min-w-0 flex-1 truncate text-xs font-medium text-slate-600" title={draft.displayName}>{draft.displayName}</p>
                           <button
-                            aria-label={`移除第 ${index + 1} 张截图：${draft.file.name}`}
+                            aria-label={`移除第 ${index + 1} 张截图：${draft.displayName}`}
                             className="shrink-0 text-xs font-semibold text-slate-500 hover:text-rose-700 disabled:opacity-50"
                             disabled={isBusy}
                             type="button"
@@ -578,7 +786,7 @@ export default function CommunityUploadPage() {
                     <div className="mb-4 flex items-start justify-between gap-3 border-b border-slate-200 pb-4">
                       <div className="min-w-0">
                         <h2 className="text-lg font-bold text-slate-950" id="selected-screenshot-editor-title">编辑第 {selectedIndex + 1} 张</h2>
-                        <p className="mt-1 truncate text-xs text-slate-500" title={selectedDraft.file.name}>{selectedDraft.file.name}</p>
+                        <p className="mt-1 truncate text-xs text-slate-500" title={selectedDraft.displayName}>{selectedDraft.displayName}</p>
                       </div>
                       {selectedIndex > 0 ? (
                         <button
@@ -629,7 +837,13 @@ export default function CommunityUploadPage() {
                 <Button type="button" variant="secondary" onClick={cancelCurrentOperation}>取消当前操作</Button>
               ) : null}
               <Button disabled={isBusy || drafts.length === 0} type="submit">
-                {isUploading ? "正在上传…" : isAutoTagging ? "正在匹配 BGM…" : `上传并创建题库${drafts.length ? `（${drafts.length} 张）` : ""}`}
+                {isUploading
+                  ? "正在上传…"
+                  : isAutoTagging
+                    ? "正在匹配 BGM…"
+                    : isImportingQuestionList
+                      ? "正在导入题单…"
+                      : `上传并保存题库${drafts.length ? `（${drafts.length} 张）` : ""}`}
               </Button>
             </div>
           </div>

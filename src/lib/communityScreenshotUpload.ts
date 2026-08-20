@@ -15,6 +15,10 @@ export type CommunityScreenshotUploadResult = {
   size: number;
 };
 
+export type CommunityRemoteScreenshotUploadResult = CommunityScreenshotUploadResult & {
+  fileName: string;
+};
+
 export type CommunityQuestionSetUploadInput = {
   submissionId: string;
   title: string;
@@ -33,6 +37,8 @@ export type CommunityQuestionSetUploadResult = {
   id: string;
   title: string;
   imageCount: number;
+  appended: boolean;
+  addedImageCount: number;
 };
 
 export type CommunityIndexedImage = {
@@ -195,6 +201,56 @@ export async function uploadCommunityScreenshot(
   return result as CommunityScreenshotUploadResult;
 }
 
+function remoteScreenshotFileName(rawUrl: string, contentType: string) {
+  const fallbackExtension = contentType === "image/png" ? ".png"
+    : contentType === "image/webp" ? ".webp"
+      : contentType === "image/gif" ? ".gif"
+        : contentType === "image/avif" ? ".avif" : ".jpg";
+  try {
+    const lastSegment = decodeURIComponent(new URL(rawUrl).pathname.split("/").filter(Boolean).at(-1) ?? "screenshot");
+    const safeName = lastSegment.replace(/[^a-zA-Z0-9._-]+/g, "-").slice(-120) || "screenshot";
+    return /\.(?:avif|gif|jpe?g|png|webp)$/i.test(safeName) ? safeName : `${safeName}${fallbackExtension}`;
+  } catch {
+    return `screenshot${fallbackExtension}`;
+  }
+}
+
+export async function importCommunityScreenshotFromUrl(
+  imageUrl: string,
+  uploadKey: string,
+  signal?: AbortSignal,
+): Promise<CommunityRemoteScreenshotUploadResult> {
+  const response = await fetchWithTimeout(apiUrl("/api/community-remote-image-source"), {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "x-community-upload-key": uploadKey.trim(),
+    },
+    body: JSON.stringify({ imageUrl }),
+  }, 60_000, signal, "远端图片下载超时，请稍后重试。");
+  if (!response.ok) {
+    const payload = await response.json().catch(() => ({})) as { error?: string };
+    throw new Error(payload.error || "远端图片下载失败，请稍后重试。");
+  }
+  const contentType = (response.headers.get("content-type") ?? "").split(";")[0].trim().toLowerCase();
+  if (!contentType.startsWith("image/") || contentType === "image/svg+xml") {
+    throw new Error("远端返回的不是受支持的位图图片。");
+  }
+  const contentLength = Number(response.headers.get("content-length"));
+  const maxRemoteBytes = 20 * 1024 * 1024;
+  if (Number.isFinite(contentLength) && contentLength > maxRemoteBytes) throw new Error("远端原图不能超过 20 MB。");
+  const blob = await response.blob();
+  assertNotAborted(signal);
+  if (blob.size === 0) throw new Error("远端图片内容为空。");
+  if (blob.size > maxRemoteBytes) throw new Error("远端原图不能超过 20 MB。");
+  const fileName = remoteScreenshotFileName(imageUrl, contentType);
+  const file = new File([blob], fileName, { type: contentType, lastModified: Date.now() });
+  return {
+    ...await uploadCommunityScreenshot(file, uploadKey, signal),
+    fileName,
+  };
+}
+
 export async function searchCommunityImageIndex(
   animeSubjectId: number,
   characterId: number | null,
@@ -234,7 +290,13 @@ export async function createUploadedCommunityQuestionSet(
     response,
     "题库保存失败，请稍后重试。",
   );
-  if (!result.id || !result.title || typeof result.imageCount !== "number") {
+  if (
+    !result.id
+    || !result.title
+    || typeof result.imageCount !== "number"
+    || typeof result.appended !== "boolean"
+    || typeof result.addedImageCount !== "number"
+  ) {
     throw new Error("题库服务返回了无效结果。");
   }
   return result as CommunityQuestionSetUploadResult;
