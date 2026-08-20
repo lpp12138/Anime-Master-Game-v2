@@ -2717,6 +2717,8 @@ function getAppendableHomepageQuestions(questionSet: DbQuestionSet, title: strin
     || questionSet.title !== title
     || questionSet.community_collection_title !== title
     || !questionSet.community_submission_id
+    || questionSet.community_structure_edited === 1
+    || questionSet.community_structure_edited === true
     || questionSet.manifest_version !== QUESTION_SET_MANIFEST_VERSION
   ) {
     throw new HomepageCommunityQuestionSetPersistenceError(`同名题库“${title}”不是可追加的社区截图题库。`);
@@ -2751,6 +2753,8 @@ async function findOrClaimHomepageCommunityCollection(title: string) {
     if (
       candidate.community_collection_title != null
       || !candidate.community_submission_id
+      || candidate.community_structure_edited === 1
+      || candidate.community_structure_edited === true
       || candidate.manifest_version !== QUESTION_SET_MANIFEST_VERSION
     ) continue;
     try {
@@ -2765,6 +2769,7 @@ async function findOrClaimHomepageCommunityCollection(title: string) {
       .update({ community_collection_title: title })
       .eq("id", candidate.id)
       .is("community_collection_title", null)
+      .eq("community_structure_edited", 0)
       .select()
       .maybeSingle<DbQuestionSet>();
     if (claimed) return claimed;
@@ -3022,6 +3027,7 @@ export async function createHomepageCommunityQuestionSet(params: {
       community_submission_id: submissionId,
       community_submission_fingerprint: submissionFingerprint,
       community_collection_title: title,
+      community_structure_edited: 0,
       created_at: createdAt,
       updated_at: createdAt,
     };

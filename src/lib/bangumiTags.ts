@@ -1,4 +1,4 @@
-import type { BangumiAnimeTag, BangumiCharacterTag } from "../types/game";
+import type { BangumiAnimeTag, BangumiCharacterTag, BangumiSubjectType } from "../types/game";
 
 export const MAX_BANGUMI_ANIME_TAGS_PER_QUESTION = 1;
 export const MAX_BANGUMI_CHARACTER_TAGS_PER_QUESTION = 8;
@@ -42,15 +42,23 @@ function readOptionalRelation(value: unknown): string | null {
   return relation;
 }
 
+function readOptionalSubjectType(value: unknown): BangumiSubjectType | undefined {
+  if (value == null) return undefined;
+  if (value === 2 || value === 4) return value;
+  throw new Error("作品类型仅支持动画（2）或游戏（4）。");
+}
+
 function normalizeAnimeTag(value: unknown): BangumiAnimeTag {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
-    throw new Error("番剧标签格式无效。");
+    throw new Error("作品标签格式无效。");
   }
   const record = value as Record<string, unknown>;
+  const subjectType = readOptionalSubjectType(record.subjectType);
   return {
-    id: readPositiveBangumiId(record.id, "番剧"),
-    name: readRequiredName(record.name, "番剧名称"),
-    nameCn: readOptionalName(record.nameCn, "番剧中文名"),
+    id: readPositiveBangumiId(record.id, "作品"),
+    name: readRequiredName(record.name, "作品名称"),
+    nameCn: readOptionalName(record.nameCn, "作品中文名"),
+    ...(subjectType === undefined ? {} : { subjectType }),
   };
 }
 
@@ -61,7 +69,7 @@ function normalizeCharacterTag(value: unknown): BangumiCharacterTag {
   const record = value as Record<string, unknown>;
   return {
     id: readPositiveBangumiId(record.id, "角色"),
-    subjectId: readPositiveBangumiId(record.subjectId, "角色所属番剧"),
+    subjectId: readPositiveBangumiId(record.subjectId, "角色所属作品"),
     name: readRequiredName(record.name, "角色名称"),
     nameCn: readOptionalName(record.nameCn, "角色中文名"),
     relation: readOptionalRelation(record.relation),
@@ -78,7 +86,7 @@ export function normalizeBangumiQuestionTags(
     throw new Error("Bangumi 标签必须为数组。");
   }
   if (animeValues.length > MAX_BANGUMI_ANIME_TAGS_PER_QUESTION) {
-    throw new Error(`每张图片最多可关联 ${MAX_BANGUMI_ANIME_TAGS_PER_QUESTION} 部番剧。`);
+    throw new Error(`每张图片最多可关联 ${MAX_BANGUMI_ANIME_TAGS_PER_QUESTION} 部作品。`);
   }
   if (characterValues.length > MAX_BANGUMI_CHARACTER_TAGS_PER_QUESTION) {
     throw new Error(`每张图片最多可关联 ${MAX_BANGUMI_CHARACTER_TAGS_PER_QUESTION} 个角色。`);
@@ -87,7 +95,7 @@ export function normalizeBangumiQuestionTags(
   const animeTags = animeValues.map(normalizeAnimeTag);
   const characterTags = characterValues.map(normalizeCharacterTag);
   if (new Set(animeTags.map((tag) => tag.id)).size !== animeTags.length) {
-    throw new Error("番剧标签不能重复。");
+    throw new Error("作品标签不能重复。");
   }
   if (new Set(characterTags.map((tag) => tag.id)).size !== characterTags.length) {
     throw new Error("角色标签不能重复。");
@@ -95,7 +103,7 @@ export function normalizeBangumiQuestionTags(
 
   const subjectIds = new Set(animeTags.map((tag) => tag.id));
   if (characterTags.some((tag) => !subjectIds.has(tag.subjectId))) {
-    throw new Error("角色标签必须属于该图片已选择的番剧。");
+    throw new Error("角色标签必须属于该图片已选择的作品。");
   }
   return { animeTags, characterTags };
 }

@@ -1,4 +1,4 @@
-import type { BangumiAnimeTag } from "../src/types/game";
+import type { BangumiAnimeTag, BangumiSubjectScope, BangumiSubjectType } from "../src/types/game";
 import { normalizeBangumiSearchText } from "../src/lib/bangumiTags";
 
 const BANGUMI_API_BASE_URL = "https://api.bgm.tv";
@@ -11,11 +11,23 @@ const BANGUMI_SUBJECT_CACHE_SECONDS = 30 * 24 * 60 * 60;
 const BANGUMI_CHARACTER_LIST_CACHE_SECONDS = 7 * 24 * 60 * 60;
 const BANGUMI_SEARCH_LIMIT = 12;
 const BANGUMI_CHARACTER_LIST_LIMIT = 1_200;
-const BANGUMI_CACHE_VERSION = "v1";
+// v2 separates animation/game search payloads and adds subjectType to cached
+// search/detail records. Do not reuse v1 entries whose shape lacks that field.
+const BANGUMI_CACHE_VERSION = "v2";
 const CACHE_ORIGIN = "https://bangumi-cache.anime-master-game.invalid";
 
 export const BANGUMI_SEARCH_QUERY_MIN_LENGTH = 2;
 export const BANGUMI_SEARCH_QUERY_MAX_LENGTH = 80;
+
+const BANGUMI_SCOPE_TYPE_FILTER: Record<BangumiSubjectScope, BangumiSubjectType[]> = {
+  anime: [2],
+  game: [4],
+  all: [2, 4],
+};
+
+export function isBangumiSubjectScope(value: unknown): value is BangumiSubjectScope {
+  return value === "anime" || value === "game" || value === "all";
+}
 
 export type BangumiAnimeSearchResult = BangumiAnimeTag & {
   imageUrl: string | null;
@@ -23,7 +35,9 @@ export type BangumiAnimeSearchResult = BangumiAnimeTag & {
   score: number | null;
 };
 
-export type BangumiAnimeSubject = BangumiAnimeTag;
+export type BangumiAnimeSubject = BangumiAnimeTag & {
+  subjectType: BangumiSubjectType;
+};
 
 export type BangumiSubjectCharacter = {
   id: number;
@@ -199,7 +213,8 @@ function normalizeSearchResult(value: unknown): BangumiAnimeSearchResult | null 
   const record = asRecord(value);
   const id = positiveInteger(record?.id);
   const name = cleanString(record?.name, 120);
-  if (!record || id == null || !name || Number(record.type) !== 2) return null;
+  const type = Number(record?.type);
+  if (!record || id == null || !name || (type !== 2 && type !== 4)) return null;
   const nameCn = cleanString(record.name_cn, 120);
   const rating = asRecord(record.rating);
   const scoreValue = Number(rating?.score);
@@ -207,6 +222,7 @@ function normalizeSearchResult(value: unknown): BangumiAnimeSearchResult | null 
     id,
     name,
     nameCn,
+    subjectType: type as BangumiSubjectType,
     imageUrl: imageFromRecord(record.images),
     date: cleanString(record.date, 20),
     score: Number.isFinite(scoreValue) && scoreValue > 0 ? scoreValue : null,
@@ -216,21 +232,23 @@ function normalizeSearchResult(value: unknown): BangumiAnimeSearchResult | null 
 export async function searchBangumiAnime(
   cache: Cache,
   queryValue: string,
+  scope: BangumiSubjectScope = "anime",
   fetcher: Fetcher = fetch,
   timeoutMs = BANGUMI_REQUEST_TIMEOUT_MS,
 ): Promise<BangumiAnimeSearchResult[]> {
+  if (!isBangumiSubjectScope(scope)) throw new BangumiApiError("搜索范围无效。", 400);
   const query = queryValue.trim();
   if (query.length < BANGUMI_SEARCH_QUERY_MIN_LENGTH || query.length > BANGUMI_SEARCH_QUERY_MAX_LENGTH) {
     throw new BangumiApiError(
-      `番剧搜索词长度必须为 ${BANGUMI_SEARCH_QUERY_MIN_LENGTH}-${BANGUMI_SEARCH_QUERY_MAX_LENGTH} 个字符。`,
+      `作品搜索词长度必须为 ${BANGUMI_SEARCH_QUERY_MIN_LENGTH}-${BANGUMI_SEARCH_QUERY_MAX_LENGTH} 个字符。`,
       400,
     );
   }
   const normalizedQuery = normalizeBangumiSearchText(query);
-  if (!normalizedQuery) throw new BangumiApiError("番剧搜索词必须包含文字或数字。", 400);
+  if (!normalizedQuery) throw new BangumiApiError("作品搜索词必须包含文字或数字。", 400);
   return cachedLoad(
     cache,
-    `search/anime/${encodeURIComponent(normalizedQuery)}`,
+    `search/${scope}/${encodeURIComponent(normalizedQuery)}`,
     BANGUMI_SEARCH_CACHE_SECONDS,
     async () => {
       const payload = await fetchBangumiJson(
@@ -241,7 +259,7 @@ export async function searchBangumiAnime(
           body: JSON.stringify({
             keyword: query,
             sort: "match",
-            filter: { type: [2] },
+            filter: { type: BANGUMI_SCOPE_TYPE_FILTER[scope] },
           }),
         },
         fetcher,
@@ -249,7 +267,12 @@ export async function searchBangumiAnime(
       );
       const record = asRecord(payload);
       const data = Array.isArray(record?.data) ? record.data : [];
-      const results = data.map(normalizeSearchResult).filter((item): item is BangumiAnimeSearchResult => item != null);
+      const expectedTypes = BANGUMI_SCOPE_TYPE_FILTER[scope];
+      const results = data
+        .map(normalizeSearchResult)
+        .filter((item): item is BangumiAnimeSearchResult => (
+          item != null && expectedTypes.includes(item.subjectType)
+        ));
       return results.slice(0, BANGUMI_SEARCH_LIMIT);
     },
   );
@@ -275,7 +298,7 @@ export async function getBangumiAnimeSubject(
   timeoutMs = BANGUMI_REQUEST_TIMEOUT_MS,
 ): Promise<BangumiAnimeSubject> {
   const subjectId = positiveInteger(subjectIdValue);
-  if (subjectId == null) throw new BangumiApiError("番剧 ID 无效。", 400);
+  if (subjectId == null) throw new BangumiApiError("Bangumi 条目 ID 无效。", 400);
   return cachedLoad(
     cache,
     `subject/${subjectId}`,
@@ -285,16 +308,18 @@ export async function getBangumiAnimeSubject(
       const record = asRecord(payload);
       const id = positiveInteger(record?.id);
       const name = cleanString(record?.name, 120);
+      const type = Number(record?.type);
       if (!record || id !== subjectId || !name) {
-        throw new BangumiApiError("Bangumi 返回了无法识别的动画条目。");
+        throw new BangumiApiError("Bangumi 返回了无法识别的作品条目。");
       }
-      if (Number(record.type) !== 2) {
-        throw new BangumiApiError("所选 Bangumi 条目不是动画。", 400);
+      if (type !== 2 && type !== 4) {
+        throw new BangumiApiError("所选 Bangumi 条目不是动画或游戏。", 400);
       }
       return {
         id,
         name,
         nameCn: cleanString(record.name_cn, 120),
+        subjectType: type as BangumiSubjectType,
       };
     },
   );
@@ -307,7 +332,7 @@ export async function getBangumiSubjectCharacters(
   timeoutMs = BANGUMI_REQUEST_TIMEOUT_MS,
 ): Promise<BangumiSubjectCharacter[]> {
   const subjectId = positiveInteger(subjectIdValue);
-  if (subjectId == null) throw new BangumiApiError("番剧 ID 无效。", 400);
+  if (subjectId == null) throw new BangumiApiError("Bangumi 条目 ID 无效。", 400);
   return cachedLoad(
     cache,
     `subject/${subjectId}/characters`,

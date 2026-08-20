@@ -353,14 +353,32 @@ test("remote source fetch rejects unauthorized presenters before contacting the 
 });
 
 test("remote source fetch blocks private hosts and SVG responses", async () => {
-  const privateResponse = await worker.fetch(new Request("https://api.example.com/api/remote-image-source", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ roomId: "room", presenterPlayerId: "host", imageUrl: "http://127.0.0.1/a.jpg" }),
-  }), createRemoteSourceEnv());
-  assert.equal(privateResponse.status, 400);
-
   const originalFetch = globalThis.fetch;
+  let blockedFetchCalls = 0;
+  globalThis.fetch = async () => {
+    blockedFetchCalls += 1;
+    return new Response(new Uint8Array([1]), { headers: { "content-type": "image/jpeg" } });
+  };
+  try {
+    for (const imageUrl of [
+      "http://127.0.0.1/a.jpg",
+      "http://localhost./a.jpg",
+      "http://[::1]/a.jpg",
+      "http://[fd00::1]/a.jpg",
+      "http://[::ffff:127.0.0.1]/a.jpg",
+    ]) {
+      const privateResponse = await worker.fetch(new Request("https://api.example.com/api/remote-image-source", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ roomId: "room", presenterPlayerId: "host", imageUrl }),
+      }), createRemoteSourceEnv());
+      assert.equal(privateResponse.status, 400, imageUrl);
+    }
+    assert.equal(blockedFetchCalls, 0);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+
   globalThis.fetch = async () => new Response("<svg/>", { headers: { "content-type": "image/svg+xml" } });
   try {
     const svgResponse = await worker.fetch(new Request("https://api.example.com/api/remote-image-source", {
@@ -372,6 +390,26 @@ test("remote source fetch blocks private hosts and SVG responses", async () => {
   } finally {
     globalThis.fetch = originalFetch;
   }
+});
+
+test("R2 image responses prevent content sniffing and sandbox direct navigation", async () => {
+  const body = new Uint8Array([1, 2, 3]);
+  const env = {
+    IMAGE_BUCKET: {
+      async get() {
+        return {
+          body,
+          size: body.byteLength,
+          httpEtag: '"etag"',
+          writeHttpMetadata(headers: Headers) { headers.set("content-type", "image/svg+xml"); },
+        };
+      },
+    },
+  } as unknown as Env;
+  const response = await worker.fetch(new Request("https://api.example.com/api/r2-images/question-images/test.svg"), env);
+  assert.equal(response.status, 200);
+  assert.equal(response.headers.get("x-content-type-options"), "nosniff");
+  assert.equal(response.headers.get("content-security-policy"), "sandbox; default-src 'none'");
 });
 
 test("remote source fetch rejects redirects to private hosts", async () => {

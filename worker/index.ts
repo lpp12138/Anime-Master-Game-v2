@@ -20,11 +20,15 @@ import { getRoomNoticeUpdatedDelta } from "./roomNotice";
 import type { GameDatabase, GameDatabaseMutationTracker } from "./d1QueryCompat";
 import { getManifestImageUrls } from "./questionSetManifest";
 import {
+  createAdminQuestionSetQuestion,
   deleteAdminQuestionSet,
+  deleteAdminQuestionSetQuestion,
   getAdminQuestionSetDetail,
+  getAdminQuestionSetQuestion,
   listAdminQuestionSets,
   QuestionSetAdminError,
   updateAdminQuestionSet,
+  updateAdminQuestionSetQuestion,
 } from "./questionSetAdmin";
 import { buildRoomChatTeamAudience, RoomChatRateLimiter, tryHandleRoomChatMessage } from "./roomChat";
 import {
@@ -43,6 +47,7 @@ import {
   BangumiApiError,
   getBangumiAnimeSubject,
   getBangumiSubjectCharacters,
+  isBangumiSubjectScope,
   searchBangumiAnime,
 } from "./bangumiApi";
 
@@ -1782,7 +1787,13 @@ function getRemoteProxyCandidates(env: Env) {
 }
 
 function isBlockedRemoteHost(hostname: string) {
-  const host = hostname.toLowerCase();
+  // URL.hostname keeps brackets around IPv6 literals and preserves a trailing
+  // dot on DNS names. Normalize both forms before applying the private-host
+  // policy. Literal IPv6 targets are rejected fail-closed because Workers do
+  // not expose a portable DNS/IP classification API for all IPv6 ranges.
+  const rawHost = hostname.toLowerCase().replace(/\.+$/, "");
+  if (rawHost.startsWith("[") && rawHost.endsWith("]")) return true;
+  const host = rawHost;
   if (host === "localhost" || host.endsWith(".localhost") || host === "::1" || host === "0.0.0.0") {
     return true;
   }
@@ -2186,6 +2197,203 @@ async function handleQuestionSetAdminItem(request: Request, env: Env, encodedQue
   }
 }
 
+async function getAdminQuestionWriteInput(
+  request: Request,
+  env: Env,
+  cache: Cache,
+  options: {
+    requireImage: boolean;
+    loadCurrentTags?: () => Promise<{ animeTags: BangumiAnimeTag[]; characterTags: BangumiCharacterTag[] }>;
+  },
+) {
+  const payload = await readQuestionSetAdminBody(request);
+  if (!isRecord(payload)) throw new QuestionSetAdminError("题目保存请求无效。", 400);
+
+  let answerText: string | undefined;
+  if (payload.answerText !== undefined) {
+    if (typeof payload.answerText !== "string" || !payload.answerText.trim()) {
+      throw new QuestionSetAdminError("正确答案不能为空。", 400);
+    }
+    if (payload.answerText.trim().length > 100) {
+      throw new QuestionSetAdminError("正确答案最多 100 个字符。", 400);
+    }
+    answerText = payload.answerText.trim();
+  } else if (options.requireImage) {
+    throw new QuestionSetAdminError("正确答案不能为空。", 400);
+  }
+
+  let tags: { animeTags: BangumiAnimeTag[]; characterTags: BangumiCharacterTag[] } | null = null;
+  if (payload.animeTags !== undefined || payload.characterTags !== undefined) {
+    try {
+      tags = normalizeBangumiQuestionTags(payload.animeTags ?? [], payload.characterTags ?? []);
+    } catch (error) {
+      throw new QuestionSetAdminError(error instanceof Error ? error.message : "Bangumi 标签无效。", 400);
+    }
+  }
+
+  const r2Key = typeof payload.r2Key === "string" ? payload.r2Key.trim() : "";
+  if (options.requireImage && !r2Key) throw new QuestionSetAdminError("请选择要新增的截图。", 400);
+  let imageUrl = "";
+  if (r2Key) {
+    if (!env.IMAGE_BUCKET) throw new QuestionSetAdminError("服务器图片存储尚未配置。", 500);
+    const prefix = getR2ImagePrefix(env);
+    const requiredKeyPrefix = [prefix, "community"].filter(Boolean).join("/") + "/";
+    if (!r2Key.startsWith(requiredKeyPrefix) || r2Key.includes("..")) {
+      throw new QuestionSetAdminError("题目图片标识无效。", 400);
+    }
+    const object = await env.IMAGE_BUCKET.head(r2Key);
+    if (!object || object.customMetadata?.uploadSource !== "homepage-community") {
+      throw new QuestionSetAdminError("服务器图片不存在或未通过校验，请重新上传。", 400);
+    }
+    imageUrl = getR2PublicUrl(request, env, r2Key);
+  }
+
+  // Order-only and unchanged-tag PATCHes never depend on Bangumi upstream: the
+  // server reuses the already-canonical stored tags. Only explicitly submitted
+  // tags that differ from the current index are canonicalized, so forged tag
+  // names still cannot bypass upstream verification.
+  let canonicalAnimeTags: BangumiAnimeTag[] | undefined;
+  let canonicalCharacterTags: BangumiCharacterTag[] | undefined;
+  if (tags) {
+    const current = options.loadCurrentTags ? await options.loadCurrentTags() : null;
+    const unchanged = current != null
+      && JSON.stringify(normalizeBangumiQuestionTags(current.animeTags, current.characterTags))
+        === JSON.stringify(tags);
+    if (unchanged) {
+      canonicalAnimeTags = current.animeTags;
+      canonicalCharacterTags = current.characterTags;
+    } else {
+      let canonical;
+      try {
+        [canonical] = await canonicalizeSubmittedBangumiTags(cache, [{
+          r2Key,
+          labelText: answerText ?? "",
+          animeTags: tags.animeTags,
+          characterTags: tags.characterTags,
+        }]);
+      } catch (error) {
+        if (error instanceof BangumiApiError) throw new QuestionSetAdminError(error.message, error.status);
+        throw error;
+      }
+      canonicalAnimeTags = canonical.animeTags;
+      canonicalCharacterTags = canonical.characterTags;
+    }
+  }
+
+  return {
+    ...(answerText === undefined ? {} : { answerText }),
+    ...(canonicalAnimeTags === undefined ? {} : { animeTags: canonicalAnimeTags }),
+    ...(canonicalCharacterTags === undefined ? {} : { characterTags: canonicalCharacterTags }),
+    ...(imageUrl ? { imageUrl } : {}),
+    expectedUpdatedAt: payload.expectedUpdatedAt as string,
+    ...(payload.orderIndex === undefined ? {} : { orderIndex: payload.orderIndex as number }),
+  };
+}
+
+async function handleQuestionSetAdminQuestionCollection(
+  request: Request,
+  env: Env,
+  cache: Cache,
+  encodedQuestionSetId: string,
+) {
+  const authError = await authorizeCommunityUpload(request, env);
+  if (authError) return authError;
+  if (!env.DB) return json({ error: "服务器题库存储尚未配置。" }, { status: 500 }, request, env);
+  let questionSetId: string;
+  try {
+    questionSetId = decodeURIComponent(encodedQuestionSetId);
+  } catch {
+    return json({ error: "题库标识无效。" }, { status: 400 }, request, env);
+  }
+  if (request.method !== "POST") {
+    return json(
+      { error: "题目集合接口只支持 POST。" },
+      { status: 405, headers: { Allow: "POST" } },
+      request,
+      env,
+    );
+  }
+  try {
+    const mutation = await createAdminQuestionSetQuestion(
+      env.DB,
+      questionSetId,
+      await getAdminQuestionWriteInput(request, env, cache, { requireImage: true }),
+    );
+    return json({
+      questionSet: mutation.questionSet,
+      imageCleanup: await cleanupDeletedAdminQuestionSetImages(env, mutation.removedImageUrls),
+    }, {}, request, env);
+  } catch (error) {
+    return questionSetAdminErrorResponse(error, request, env);
+  }
+}
+
+async function handleQuestionSetAdminQuestionItem(
+  request: Request,
+  env: Env,
+  cache: Cache,
+  encodedQuestionSetId: string,
+  encodedQuestionId: string,
+) {
+  const authError = await authorizeCommunityUpload(request, env);
+  if (authError) return authError;
+  if (!env.DB) return json({ error: "服务器题库存储尚未配置。" }, { status: 500 }, request, env);
+  let questionSetId: string;
+  let questionId: string;
+  try {
+    questionSetId = decodeURIComponent(encodedQuestionSetId);
+    questionId = decodeURIComponent(encodedQuestionId);
+  } catch {
+    return json({ error: "题库或题目标识无效。" }, { status: 400 }, request, env);
+  }
+  try {
+    if (request.method === "GET") {
+      return json(await getAdminQuestionSetQuestion(env.DB, questionSetId, questionId), {}, request, env);
+    }
+    if (request.method === "PATCH") {
+      const mutation = await updateAdminQuestionSetQuestion(
+        env.DB,
+        questionSetId,
+        questionId,
+        await getAdminQuestionWriteInput(request, env, cache, {
+          requireImage: false,
+          loadCurrentTags: async () => {
+            const current = await getAdminQuestionSetQuestion(env.DB, questionSetId, questionId);
+            return {
+              animeTags: current.question.animeTags,
+              characterTags: current.question.characterTags,
+            };
+          },
+        }),
+      );
+      return json({
+        questionSet: mutation.questionSet,
+        imageCleanup: await cleanupDeletedAdminQuestionSetImages(env, mutation.removedImageUrls),
+      }, {}, request, env);
+    }
+    if (request.method === "DELETE") {
+      const mutation = await deleteAdminQuestionSetQuestion(
+        env.DB,
+        questionSetId,
+        questionId,
+        await readQuestionSetAdminBody(request),
+      );
+      return json({
+        questionSet: mutation.questionSet,
+        imageCleanup: await cleanupDeletedAdminQuestionSetImages(env, mutation.removedImageUrls),
+      }, {}, request, env);
+    }
+    return json(
+      { error: "单题管理接口只支持 GET、PATCH 或 DELETE。" },
+      { status: 405, headers: { Allow: "GET, PATCH, DELETE" } },
+      request,
+      env,
+    );
+  } catch (error) {
+    return questionSetAdminErrorResponse(error, request, env);
+  }
+}
+
 async function handleCommunityScreenshotUpload(request: Request, env: Env) {
   const authError = await authorizeCommunityUpload(request, env);
   if (authError) return authError;
@@ -2255,9 +2463,14 @@ async function handleCommunityScreenshotUpload(request: Request, env: Env) {
 async function handleBangumiAnimeSearch(request: Request, env: Env, cache: Cache) {
   const authError = await authorizeCommunityUpload(request, env);
   if (authError) return authError;
-  const query = new URL(request.url).searchParams.get("query") ?? "";
+  const url = new URL(request.url);
+  const query = url.searchParams.get("query") ?? "";
+  const scope = url.searchParams.get("scope") ?? "anime";
+  if (!isBangumiSubjectScope(scope)) {
+    return json({ error: "搜索范围仅支持 anime、game 或 all。" }, { status: 400 }, request, env);
+  }
   try {
-    const results = await searchBangumiAnime(cache, query);
+    const results = await searchBangumiAnime(cache, query, scope);
     return json({ results }, { headers: { "cache-control": "no-store" } }, request, env);
   } catch (error) {
     if (error instanceof BangumiApiError) {
@@ -2302,7 +2515,7 @@ async function handleCommunityImageIndexSearch(request: Request, env: Env) {
   const characterIdValue = url.searchParams.get("characterId");
   const characterId = characterIdValue == null || characterIdValue === "" ? null : Number(characterIdValue);
   if (!Number.isInteger(animeSubjectId) || animeSubjectId < 1 || animeSubjectId > 2_147_483_647) {
-    return json({ error: "必须提供有效的番剧 ID。" }, { status: 400 }, request, env);
+    return json({ error: "必须提供有效的 BGM 作品 ID。" }, { status: 400 }, request, env);
   }
   if (characterId != null && (!Number.isInteger(characterId) || characterId < 1 || characterId > 2_147_483_647)) {
     return json({ error: "角色 ID 无效。" }, { status: 400 }, request, env);
@@ -2400,12 +2613,12 @@ async function canonicalizeSubmittedBangumiTags(
     const submittedAnime = question.animeTags[0];
     if (!submittedAnime) return question;
     const anime = subjects.get(submittedAnime.id);
-    if (!anime) throw new BangumiApiError("所选 Bangumi 番剧不存在。", 400);
+    if (!anime) throw new BangumiApiError("所选 Bangumi 作品不存在。", 400);
     const cast = casts.get(anime.id);
     const characterTags = question.characterTags.map((submittedCharacter) => {
       const character = cast?.get(submittedCharacter.id);
       if (!character) {
-        throw new BangumiApiError(`角色“${submittedCharacter.name}”不属于所选 Bangumi 番剧。`, 400);
+        throw new BangumiApiError(`角色“${submittedCharacter.name}”不属于所选 Bangumi 作品。`, 400);
       }
       return {
         id: character.id,
@@ -2417,7 +2630,7 @@ async function canonicalizeSubmittedBangumiTags(
     });
     return {
       ...question,
-      animeTags: [{ id: anime.id, name: anime.name, nameCn: anime.nameCn }],
+      animeTags: [{ id: anime.id, name: anime.name, nameCn: anime.nameCn, subjectType: anime.subjectType }],
       characterTags,
     };
   });
@@ -2660,6 +2873,8 @@ async function handleR2Image(request: Request, env: Env, key: string) {
   const headers = new Headers(corsHeaders(request, env));
   object.writeHttpMetadata(headers);
   headers.set("etag", object.httpEtag);
+  headers.set("x-content-type-options", "nosniff");
+  headers.set("content-security-policy", "sandbox; default-src 'none'");
   if (!headers.has("cache-control")) {
     headers.set("cache-control", "public, max-age=31536000, immutable");
   }
@@ -6126,6 +6341,27 @@ export default {
 
       if (url.pathname === "/api/community-image-index" && request.method === "GET") {
         return await handleCommunityImageIndexSearch(request, env);
+      }
+
+      const adminQuestionItemMatch = url.pathname.match(/^\/api\/admin\/question-sets\/([^/]+)\/questions\/([^/]+)$/);
+      if (adminQuestionItemMatch) {
+        return await handleQuestionSetAdminQuestionItem(
+          request,
+          env,
+          caches.default,
+          adminQuestionItemMatch[1],
+          adminQuestionItemMatch[2],
+        );
+      }
+
+      const adminQuestionCollectionMatch = url.pathname.match(/^\/api\/admin\/question-sets\/([^/]+)\/questions$/);
+      if (adminQuestionCollectionMatch) {
+        return await handleQuestionSetAdminQuestionCollection(
+          request,
+          env,
+          caches.default,
+          adminQuestionCollectionMatch[1],
+        );
       }
 
       if (url.pathname === "/api/admin/question-sets") {

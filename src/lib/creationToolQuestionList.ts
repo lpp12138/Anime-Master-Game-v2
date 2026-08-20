@@ -26,12 +26,32 @@ function parseUrl(value: string) {
   }
 }
 
+export function parseScreenshotLinkList(rawText: string): string[] {
+  const links = rawText
+    .split(/\r?\n/)
+    .map((item) => item.trim())
+    .filter((item) => item && !item.startsWith("#"));
+  if (links.length === 0) throw new Error("请粘贴至少一个截图链接，每行一个。");
+  if (links.length > CREATION_TOOL_QUESTION_LIST_MAX_ITEMS) {
+    throw new Error(`一次最多导入 ${CREATION_TOOL_QUESTION_LIST_MAX_ITEMS} 个截图链接。`);
+  }
+  const invalidIndex = links.findIndex((link) => link.length > 2048 || !isSupportedCreationToolImageUrl(link));
+  if (invalidIndex >= 0) {
+    throw new Error(`第 ${invalidIndex + 1} 个链接不受支持；仅允许 FanCaps 或 Bangumi 的 HTTPS 图片直链。`);
+  }
+  const duplicateIndex = links.findIndex((link, index) => links.indexOf(link) !== index);
+  if (duplicateIndex >= 0) throw new Error(`第 ${duplicateIndex + 1} 个截图链接重复。`);
+  return links;
+}
+
 export function isSupportedCreationToolImageUrl(value: string | URL) {
   const url = value instanceof URL ? value : parseUrl(value);
   return Boolean(
     url
     && url.protocol === "https:"
     && (!url.port || url.port === "443")
+    && !url.username
+    && !url.password
     && CREATION_TOOL_IMAGE_HOSTS.has(url.hostname.toLowerCase()),
   );
 }

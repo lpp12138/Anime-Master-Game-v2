@@ -8,7 +8,7 @@ import {
   type BangumiSubjectCharacter,
 } from "../lib/bangumiClient";
 import { bangumiTagDisplayName, MAX_BANGUMI_CHARACTER_TAGS_PER_QUESTION } from "../lib/bangumiTags";
-import type { BangumiAnimeTag, BangumiCharacterTag } from "../types/game";
+import type { BangumiAnimeTag, BangumiCharacterTag, BangumiSubjectScope } from "../types/game";
 
 type Props = {
   uploadKey: string;
@@ -26,6 +26,16 @@ function matchesCharacter(character: BangumiSubjectCharacter, query: string) {
   return `${character.name} ${character.relation ?? ""}`.normalize("NFKC").toLocaleLowerCase().includes(normalized);
 }
 
+const SUBJECT_SCOPE_OPTIONS: Array<{ value: BangumiSubjectScope; label: string }> = [
+  { value: "anime", label: "动画" },
+  { value: "game", label: "游戏" },
+  { value: "all", label: "全部" },
+];
+
+function subjectTypeLabel(subjectType: 2 | 4 | null | undefined): string {
+  return subjectType === 4 ? "游戏" : subjectType === 2 ? "动画" : "作品";
+}
+
 export function BangumiQuestionTagEditor({
   uploadKey,
   answer,
@@ -36,6 +46,9 @@ export function BangumiQuestionTagEditor({
   onChange,
 }: Props) {
   const [animeResults, setAnimeResults] = useState<BangumiAnimeSearchResult[]>([]);
+  const [subjectScope, setSubjectScope] = useState<BangumiSubjectScope>(() => (
+    animeTag?.subjectType === 4 ? "game" : animeTag?.subjectType === 2 ? "anime" : "all"
+  ));
   const [animeSearching, setAnimeSearching] = useState(false);
   const [animeError, setAnimeError] = useState("");
   const [activeAnimeIndex, setActiveAnimeIndex] = useState(-1);
@@ -63,7 +76,7 @@ export function BangumiQuestionTagEditor({
     setAnimeSearching(false);
     setActiveAnimeIndex(-1);
     setAnimeResultsOpen(false);
-  }, [answer, normalizedUploadKey]);
+  }, [answer, normalizedUploadKey, subjectScope]);
 
   useEffect(() => () => animeSearchAbortRef.current?.abort(), []);
 
@@ -138,15 +151,15 @@ export function BangumiQuestionTagEditor({
     setAnimeSearching(true);
     setAnimeError("");
     try {
-      const results = await searchBangumiAnime(query, normalizedUploadKey, controller.signal);
+      const results = await searchBangumiAnime(query, normalizedUploadKey, subjectScope, controller.signal);
       if (searchSequence !== animeSearchSequenceRef.current) return;
       setAnimeResults(results);
       setActiveAnimeIndex(results.length > 0 ? 0 : -1);
       setAnimeResultsOpen(results.length > 0);
-      if (results.length === 0) setAnimeError("BGM 中没有找到匹配的动画条目，请尝试中文名或日文原名。");
+      if (results.length === 0) setAnimeError("BGM 中没有找到匹配的条目，请尝试中文名、日文原名或作品名。");
     } catch (error) {
       if (searchSequence === animeSearchSequenceRef.current && !controller.signal.aborted) {
-        setAnimeError(error instanceof Error ? error.message : "BGM 番剧搜索失败。");
+        setAnimeError(error instanceof Error ? error.message : "BGM 作品搜索失败。");
       }
     } finally {
       if (animeSearchAbortRef.current === controller) animeSearchAbortRef.current = null;
@@ -158,7 +171,12 @@ export function BangumiQuestionTagEditor({
     animeSearchSequenceRef.current += 1;
     animeSearchAbortRef.current?.abort();
     animeSearchAbortRef.current = null;
-    const selected: BangumiAnimeTag = { id: result.id, name: result.name, nameCn: result.nameCn };
+    const selected: BangumiAnimeTag = {
+      id: result.id,
+      name: result.name,
+      nameCn: result.nameCn,
+      subjectType: result.subjectType ?? 2,
+    };
     onChange(selected, []);
     setAnimeResults([]);
     setAnimeResultsOpen(false);
@@ -198,7 +216,7 @@ export function BangumiQuestionTagEditor({
       <div className="space-y-2">
         <div className="flex flex-wrap items-center justify-between gap-2">
           <label className="text-sm font-semibold text-slate-900" htmlFor={`${animeListId}-answer`}>
-            正确答案 / BGM 番剧搜索 <span className="text-rose-600">*</span>
+            正确答案 / BGM 作品搜索（动画/游戏） <span className="text-rose-600">*</span>
           </label>
           <a
             className="text-xs text-sky-700 underline decoration-dotted"
@@ -209,7 +227,21 @@ export function BangumiQuestionTagEditor({
             BGM 即 Bangumi
           </a>
         </div>
-        <div className="flex gap-2">
+        <div className="flex flex-wrap items-center gap-2">
+          <div className="flex shrink-0 items-center gap-1 rounded-md border border-slate-200 bg-slate-50 p-0.5" role="group" aria-label="BGM 搜索范围">
+            {SUBJECT_SCOPE_OPTIONS.map((option) => (
+              <button
+                key={option.value}
+                type="button"
+                aria-pressed={subjectScope === option.value}
+                disabled={disabled}
+                className={`rounded px-2 py-1 text-xs font-semibold transition disabled:opacity-50 ${subjectScope === option.value ? "bg-sky-700 text-white" : "text-slate-600 hover:bg-slate-100"}`}
+                onClick={() => setSubjectScope(option.value)}
+              >
+                {option.label}
+              </button>
+            ))}
+          </div>
           <input
             id={`${animeListId}-answer`}
             aria-activedescendant={animeResultsOpen && animeResults[activeAnimeIndex]
@@ -224,7 +256,7 @@ export function BangumiQuestionTagEditor({
             value={answer}
             disabled={disabled}
             maxLength={100}
-            placeholder="输入正确答案，再搜索并关联 BGM 番剧"
+            placeholder="输入正确答案，再搜索并关联 BGM 作品（动画/游戏）"
             onChange={(event) => onAnswerChange(event.target.value)}
             onKeyDown={(event) => {
               if (event.key === "ArrowDown" && animeResults.length > 0) {
@@ -258,13 +290,13 @@ export function BangumiQuestionTagEditor({
         {animeTag ? (
           <div className="flex flex-wrap items-center gap-2">
             <a
-              className="rounded-full bg-sky-700 px-2.5 py-1 text-xs font-semibold text-white hover:bg-sky-800"
+              className="max-w-full break-all rounded-full bg-sky-700 px-2.5 py-1 text-xs font-semibold text-white hover:bg-sky-800"
               href={`https://bgm.tv/subject/${animeTag.id}`}
               target="_blank"
               rel="noreferrer"
               title={animeTag.name}
             >
-              BGM · {bangumiTagDisplayName(animeTag)} · #{animeTag.id}
+              BGM · {subjectTypeLabel(animeTag.subjectType)} · {bangumiTagDisplayName(animeTag)} · #{animeTag.id}
             </a>
             <button
               type="button"
@@ -272,15 +304,15 @@ export function BangumiQuestionTagEditor({
               disabled={disabled}
               onClick={() => onChange(null, [])}
             >
-              移除番剧标签
+              移除作品标签
             </button>
           </div>
         ) : (
-          <p className="text-xs text-slate-500">答案可以单独保存；选择搜索结果后会同时加入规范 BGM 番剧标签。</p>
+          <p className="text-xs text-slate-500">答案可以单独保存；选择搜索结果后会同时加入规范 BGM 作品（动画/游戏）标签。</p>
         )}
 
         {animeResultsOpen && animeResults.length > 0 ? (
-          <div id={animeListId} role="listbox" aria-label="BGM 番剧搜索结果" className="max-h-64 space-y-1 overflow-y-auto rounded-md border border-sky-200 bg-white p-1 shadow-lg">
+          <div id={animeListId} role="listbox" aria-label="BGM 作品搜索结果" className="max-h-64 space-y-1 overflow-y-auto rounded-md border border-sky-200 bg-white p-1 shadow-lg">
             {animeResults.map((result, index) => (
               <button
                 id={`${animeListId}-${result.id}`}
@@ -300,7 +332,7 @@ export function BangumiQuestionTagEditor({
                 <span className="min-w-0 flex-1">
                   <span className="block truncate text-sm font-semibold text-slate-900">{result.nameCn || result.name}</span>
                   {result.nameCn ? <span className="block truncate text-xs text-slate-500">{result.name}</span> : null}
-                  <span className="block text-[11px] text-slate-500">#{result.id}{result.date ? ` · ${result.date}` : ""}{result.score ? ` · ${result.score.toFixed(1)} 分` : ""}</span>
+                  <span className="block text-[11px] text-slate-500">#{result.id} · {subjectTypeLabel(result.subjectType)}{result.date ? ` · ${result.date}` : ""}{result.score ? ` · ${result.score.toFixed(1)} 分` : ""}</span>
                 </span>
               </button>
             ))}
@@ -314,7 +346,7 @@ export function BangumiQuestionTagEditor({
           角色名（可选）
         </label>
         <p className="text-xs leading-5 text-slate-500">
-          先选择番剧，再从该番剧的官方 BGM 角色列表搜索并添加画面中实际出现的角色。
+          先选择作品，再从该作品的官方 BGM 角色列表搜索并添加画面中实际出现的角色。
         </p>
 
         <div className="flex flex-wrap gap-1.5">
@@ -350,7 +382,7 @@ export function BangumiQuestionTagEditor({
               value={characterQuery}
               disabled={disabled || !animeTag || !normalizedUploadKey}
               placeholder={!animeTag
-                ? "请先通过上方搜索选择 BGM 番剧"
+                ? "请先通过上方搜索选择 BGM 作品"
                 : !normalizedUploadKey
                   ? "请先填写上传密钥"
                   : charactersLoading ? "正在加载 BGM 角色列表…" : "输入角色名搜索并添加"}
@@ -369,9 +401,13 @@ export function BangumiQuestionTagEditor({
                   event.preventDefault();
                   setCharacterPickerOpen(true);
                   setActiveCharacterIndex((current) => current <= 0 ? filteredCharacters.length - 1 : current - 1);
-                } else if (event.key === "Enter" && characterPickerOpen && filteredCharacters[activeCharacterIndex]) {
+                } else if (event.key === "Enter") {
+                  // Character search is never a form-submit action. Select the
+                  // active option when available; otherwise keep the draft open.
                   event.preventDefault();
-                  selectCharacter(filteredCharacters[activeCharacterIndex]);
+                  if (characterPickerOpen && filteredCharacters[activeCharacterIndex]) {
+                    selectCharacter(filteredCharacters[activeCharacterIndex]);
+                  }
                 }
               }}
             />

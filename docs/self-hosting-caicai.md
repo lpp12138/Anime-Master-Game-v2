@@ -66,9 +66,9 @@ chown -R www-data:www-data /var/www/caicai.lpp.moe
 
 若 migration 或启动检查失败，不要切换前端；停止服务后从同一 `$backup` 恢复运行源码和整份 Wrangler 状态，再启动旧版。
 
-`0026_question_image_bangumi_tags.sql` 会增加首份投稿 ID 及逐图片 Bangumi 标签索引；`0027_homepage_question_set_appends.sql` 会为同标题社区截图题库选择一个规范集合，并把历史首份投稿回填到多投稿幂等表；`0028_game_question_sampling.sql` 会增加房间题数设置、已准备题数和每局固定抽题顺序；`0029_question_set_admin_integrity.sql` 会增加历史归档题库索引，并用 trigger 防止房间准备一个不存在或正在被删除的题库。四项 migration 都必须在启动对应新版 Worker 前完成；旧 game session 的空抽题快照继续按全题库原顺序读取。finalize 请求体限制为 512 KiB；新建时 manifest、图片索引与投稿记录原子提交，追加时通过 manifest 修订号比较原子更新题目、计数、图片索引与投稿记录。失败不留下半次追加，成功响应丢失后的同内容重试通过投稿 ID 返回原记录，服务端内容指纹会拒绝同一 ID 下被修改的投稿；整套题库仍最多 30 题。番剧搜索、finalize 使用的番剧详情和整份番剧角色列表分别通过 Worker Cache API 缓存 12 小时、30 天和 7 天；选择角色直接复用列表结果，不发送逐角色详情请求，finalize 会按官方 ID 重写名称并校验角色归属。上游请求使用项目专属 User-Agent，不需要 Bangumi access token。缓存不可用时只影响标签搜索，不会把上传密钥发送给 Bangumi。
+`0026_question_image_bangumi_tags.sql` 会增加首份投稿 ID 及逐图片 Bangumi 标签索引；`0027_homepage_question_set_appends.sql` 会为同标题社区截图题库选择一个规范集合，并把历史首份投稿回填到多投稿幂等表；`0028_game_question_sampling.sql` 会增加房间题数设置、已准备题数和每局固定抽题顺序；`0029_question_set_admin_integrity.sql` 会增加历史归档题库索引，并用 trigger 防止房间准备一个不存在或正在被删除的题库；`0030_question_set_item_admin.sql` 会增加结构编辑标记，使管理员新增、删除或调序后的题库不再接收同标题自动追加。五项 migration 都必须在启动对应新版 Worker 前完成；旧 game session 的空抽题快照继续按全题库原顺序读取。finalize 请求体限制为 512 KiB；新建时 manifest、图片索引与投稿记录原子提交，追加时通过 manifest 修订号比较原子更新题目、计数、图片索引与投稿记录。失败不留下半次追加，成功响应丢失后的同内容重试通过投稿 ID 返回原记录，服务端内容指纹会拒绝同一 ID 下被修改的投稿；整套题库仍最多 30 题。BGM 搜索支持动画、游戏和全部范围；搜索、finalize 使用的作品详情和整份角色列表分别通过 Worker Cache API 缓存 12 小时、30 天和 7 天。选择角色直接复用列表结果，不发送逐角色详情请求，finalize 会按官方 ID 重写类型/名称并校验角色归属。上游请求使用项目专属 User-Agent，不需要 Bangumi access token。缓存不可用时只影响标签搜索，不会把上传密钥发送给 Bangumi。
 
-受密钥保护的 `/api/community-image-index` 可按必填番剧 ID 和可选角色 ID 查询最多 50 张公开题库图片，只返回图片及规范标签，不读取或返回答案。`POST /api/community-remote-image-source` 用于上传或粘贴动画截图工具 JSON/JSONL 后下载 FanCaps/Bangumi 图片；它必须保留密钥校验、HTTPS 域名白名单、20 MiB 响应限制、重定向限制和上游超时。`/question-set-admin` 的列表、详情、PATCH 和 DELETE 同样必须保留密钥校验，mutation 请求体不得超过 16 KiB。
+受密钥保护的 `/api/community-image-index` 可按必填作品 ID 和可选角色 ID 查询最多 50 张公开题库图片，只返回图片及规范标签，不读取或返回答案。上传页支持选择、拖放、粘贴剪贴板位图，以及粘贴 JSON/JSONL 或每行一个截图直链。`POST /api/community-remote-image-source` 负责下载 FanCaps/Bangumi 图片；它必须保留密钥校验、HTTPS 域名白名单、20 MiB 响应限制、重定向限制和上游超时，不能改成任意 URL 代理。`/question-set-admin` 的列表、详情、单题 POST/GET/PATCH/DELETE 和整库 PATCH/DELETE 同样必须保留密钥校验，mutation 请求体不得超过 16 KiB。
 
 当前 Nginx 应为图片上传设置 5 次/秒（burst 10），为题单远端图片设置 5 次/秒（burst 10），为 finalize 设置 10 次/分钟（burst 5、`client_max_body_size 512k`），为 Bangumi helper 和图片索引设置 3 次/秒（burst 10；浏览器自动匹配最多并发 3 个请求），并为 `/api/admin/question-sets` 前缀单独设置 5 次/秒（burst 10、`client_max_body_size 16k`）；限流响应统一为 429。修改配置后执行 `nginx -t && systemctl reload nginx`。
 
@@ -138,7 +138,7 @@ systemctl restart anime-master-game.service
 sudo sed -n 's/^COMMUNITY_UPLOAD_SECRET=//p' /etc/anime-master-game/worker.env
 ```
 
-管理页可检索题库、检查答案与 Bangumi 标签，并修改标题、说明和公开状态。取消公开会立即从社区目录下架；规范同标题集合同时释放，之后的新投稿可能建立另一个规范集合。修改和删除都使用页面刚读取的 `updatedAt` 做乐观并发控制，遇到 409 必须刷新后重新确认，不能绕过版本条件。
+管理页可检索题库、检查答案与 Bangumi 标签，修改标题、说明和公开状态，并逐题新增、查询、编辑答案/标签、拖放或粘贴换图、调序及删除。取消公开会立即从社区目录下架；规范同标题集合同时释放，之后的新投稿可能建立另一个规范集合。单题新增、删除或调序也会永久释放该题库的规范集合绑定，避免历史投稿范围失真。所有修改和删除都使用页面刚读取的 `updatedAt` 做乐观并发控制，遇到 409 必须刷新后重新确认，不能绕过版本条件；活动游戏或已准备房间引用时不能修改题目。
 
 永久删除还要求输入完整题库标题。Worker 会拒绝活动游戏、已准备房间或损坏 manifest 的题库；历史结算归档是自包含快照，删除题库后仍保留。题库及题目、图片索引、投稿记录和评分先在 D1 中级联删除，成功后才重新扫描所有剩余题库引用并清理不再共享的本站 R2 对象。引用扫描或 R2 删除失败会在页面显示待重试数量，且不会把失败伪报成已清理；损坏的剩余 manifest 会让清理失败关闭。每日 72 小时孤儿对账继续处理普通待清理对象。
 

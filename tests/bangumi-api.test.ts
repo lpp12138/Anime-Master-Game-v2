@@ -48,8 +48,8 @@ test("Bangumi anime search uses the official v0 API, compliant User-Agent, and s
     }), { headers: { "content-type": "application/json" } });
   };
 
-  const first = await searchBangumiAnime(cache, "你的名字", fetcher as typeof fetch);
-  const second = await searchBangumiAnime(cache, "你的名字", async () => {
+  const first = await searchBangumiAnime(cache, "你的名字", "anime", fetcher as typeof fetch);
+  const second = await searchBangumiAnime(cache, "你的名字", "anime", async () => {
     throw new Error("cache miss");
   });
 
@@ -58,6 +58,7 @@ test("Bangumi anime search uses the official v0 API, compliant User-Agent, and s
     id: 160209,
     name: "君の名は。",
     nameCn: "你的名字。",
+    subjectType: 2,
     imageUrl: "https://lain.bgm.tv/pic/cover/g/test.jpg",
     date: "2016-08-26",
     score: 8.1,
@@ -73,7 +74,79 @@ test("Bangumi anime search uses the official v0 API, compliant User-Agent, and s
   });
 });
 
-test("Bangumi subject detail is canonicalized and cached by numeric ID", async () => {
+test("Bangumi search supports anime/game/all scopes with strict type filters and isolated caches", async () => {
+  const cache = asCache();
+  const requests: Request[] = [];
+  const fetcher = async (input: RequestInfo | URL, init?: RequestInit) => {
+    requests.push(new Request(input, init));
+    return new Response(JSON.stringify({
+      data: [
+        { id: 101, type: 2, name: "动画作品", name_cn: "动画中文名" },
+        { id: 102, type: 4, name: "游戏作品", name_cn: "游戏中文名" },
+        { id: 103, type: 3, name: "音乐作品", name_cn: "音乐中文名" },
+        { id: 104, type: 2, name: "另一部动画" },
+      ],
+    }), { headers: { "content-type": "application/json" } });
+  };
+
+  const anime = await searchBangumiAnime(cache, "隔离测试", "anime", fetcher as typeof fetch);
+  assert.deepEqual(anime, [
+    { id: 101, name: "动画作品", nameCn: "动画中文名", subjectType: 2, imageUrl: null, date: null, score: null },
+    { id: 104, name: "另一部动画", nameCn: null, subjectType: 2, imageUrl: null, date: null, score: null },
+  ]);
+  assert.deepEqual(await requests[0].json(), {
+    keyword: "隔离测试",
+    sort: "match",
+    filter: { type: [2] },
+  });
+
+  const game = await searchBangumiAnime(cache, "隔离测试", "game", fetcher as typeof fetch);
+  assert.deepEqual(game, [
+    { id: 102, name: "游戏作品", nameCn: "游戏中文名", subjectType: 4, imageUrl: null, date: null, score: null },
+  ]);
+  assert.deepEqual(await requests[1].json(), {
+    keyword: "隔离测试",
+    sort: "match",
+    filter: { type: [4] },
+  });
+
+  const all = await searchBangumiAnime(cache, "隔离测试", "all", fetcher as typeof fetch);
+  assert.deepEqual(all, [
+    { id: 101, name: "动画作品", nameCn: "动画中文名", subjectType: 2, imageUrl: null, date: null, score: null },
+    { id: 102, name: "游戏作品", nameCn: "游戏中文名", subjectType: 4, imageUrl: null, date: null, score: null },
+    { id: 104, name: "另一部动画", nameCn: null, subjectType: 2, imageUrl: null, date: null, score: null },
+  ]);
+  assert.deepEqual(await requests[2].json(), {
+    keyword: "隔离测试",
+    sort: "match",
+    filter: { type: [2, 4] },
+  });
+  assert.equal(requests.length, 3);
+
+  // 每个范围各自的缓存键互不串用；重复查询不再访问上游。
+  const missFetcher = async () => { throw new Error("cache miss"); };
+  assert.deepEqual(
+    await searchBangumiAnime(cache, "隔离测试", "anime", missFetcher as typeof fetch),
+    anime,
+  );
+  assert.deepEqual(
+    await searchBangumiAnime(cache, "隔离测试", "game", missFetcher as typeof fetch),
+    game,
+  );
+  assert.deepEqual(
+    await searchBangumiAnime(cache, "隔离测试", "all", missFetcher as typeof fetch),
+    all,
+  );
+  assert.equal(requests.length, 3);
+
+  await assert.rejects(
+    searchBangumiAnime(cache, "隔离测试", "book" as never, fetcher as typeof fetch),
+    (error: unknown) => error instanceof BangumiApiError && error.status === 400 && /搜索范围无效/.test(error.message),
+  );
+  assert.equal(requests.length, 3);
+});
+
+test("Bangumi subject detail is canonicalized, carries subjectType, and allows type 2 or 4", async () => {
   const cache = asCache();
   let calls = 0;
   const fetcher = async (input: RequestInfo | URL) => {
@@ -83,11 +156,33 @@ test("Bangumi subject detail is canonicalized and cached by numeric ID", async (
   };
 
   const subject = await getBangumiAnimeSubject(cache, 160209, fetcher as typeof fetch);
-  assert.deepEqual(subject, { id: 160209, name: "君の名は。", nameCn: "你的名字。" });
+  assert.deepEqual(subject, { id: 160209, name: "君の名は。", nameCn: "你的名字。", subjectType: 2 });
   assert.deepEqual(await getBangumiAnimeSubject(cache, 160209, async () => {
     throw new Error("cache miss");
   }), subject);
   assert.equal(calls, 1);
+
+  const gameSubject = await getBangumiAnimeSubject(asCache(), 114514, (async () => new Response(JSON.stringify({
+    id: 114514,
+    type: 4,
+    name: "Steins;Gate 游戏",
+    name_cn: "命运石之门（游戏）",
+  }))) as typeof fetch);
+  assert.deepEqual(gameSubject, {
+    id: 114514,
+    name: "Steins;Gate 游戏",
+    nameCn: "命运石之门（游戏）",
+    subjectType: 4,
+  });
+
+  await assert.rejects(
+    getBangumiAnimeSubject(asCache(), 114515, (async () => new Response(JSON.stringify({
+      id: 114515,
+      type: 1,
+      name: "不是作品",
+    }))) as typeof fetch),
+    (error: unknown) => error instanceof BangumiApiError && error.status === 400 && /不是动画或游戏/.test(error.message),
+  );
 });
 
 test("Bangumi subject characters are normalized, relation-sorted, and cached as one list", async () => {
@@ -143,7 +238,7 @@ test("Bangumi subject characters are normalized, relation-sorted, and cached as 
 test("Bangumi search rejects punctuation-only cache keys before contacting upstream", async () => {
   let calls = 0;
   await assert.rejects(
-    searchBangumiAnime(asCache(), "！！", (async () => {
+    searchBangumiAnime(asCache(), "！！", "anime", (async () => {
       calls += 1;
       return new Response(JSON.stringify({ data: [] }));
     }) as typeof fetch),
@@ -157,7 +252,7 @@ test("Bangumi upstream timeout and HTTP failures are normalized", async () => {
     init?.signal?.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")), { once: true });
   })) as typeof fetch;
   await assert.rejects(
-    searchBangumiAnime(asCache(), "超时测试", timeoutFetcher, 5),
+    searchBangumiAnime(asCache(), "超时测试", "anime", timeoutFetcher, 5),
     (error: unknown) => error instanceof BangumiApiError && error.status === 504 && /超时/.test(error.message),
   );
 

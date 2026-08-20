@@ -18,6 +18,7 @@ export type AdminQuestionSetSummary = {
   manifestVersion: number | null;
   manifestRevision: number;
   isCanonicalCollection: boolean;
+  isStructureEdited: boolean;
   createdAt: string;
   updatedAt: string;
   gameSessionCount: number;
@@ -44,6 +45,7 @@ export type AdminQuestionSetDetail = AdminQuestionSetSummary & {
   questions: AdminQuestionSetQuestion[];
   integrityIssues: string[];
   canDelete: boolean;
+  canEditQuestions: boolean;
 };
 
 export type AdminQuestionSetPage = {
@@ -63,16 +65,23 @@ export type AdminQuestionSetFilters = {
   offset?: number;
 };
 
+export type AdminQuestionImageCleanup = {
+  candidateCount: number;
+  deletedCount: number;
+  preservedSharedCount: number;
+  pendingCount: number;
+};
+
+export type AdminQuestionMutationResult = {
+  questionSet: AdminQuestionSetDetail;
+  imageCleanup: AdminQuestionImageCleanup;
+};
+
 export type AdminQuestionSetDeleteResult = {
   deleted: true;
   questionSetId: string;
   title: string;
-  imageCleanup: {
-    candidateCount: number;
-    deletedCount: number;
-    preservedSharedCount: number;
-    pendingCount: number;
-  };
+  imageCleanup: AdminQuestionImageCleanup;
 };
 
 export class QuestionSetAdminApiError extends Error {
@@ -167,6 +176,92 @@ export function updateAdminQuestionSet(
       method: "PATCH",
       headers: { "content-type": "application/json" },
       body: JSON.stringify(input),
+    },
+    signal,
+  );
+}
+
+export function getAdminQuestionSetQuestion(
+  questionSetId: string,
+  questionId: string,
+  uploadKey: string,
+  signal?: AbortSignal,
+) {
+  return adminFetch<{
+    questionSetId: string;
+    updatedAt: string;
+    canEdit: boolean;
+    question: AdminQuestionSetQuestion;
+  }>(
+    `/api/admin/question-sets/${encodeURIComponent(questionSetId)}/questions/${encodeURIComponent(questionId)}`,
+    uploadKey,
+    {},
+    signal,
+  );
+}
+
+export type AdminQuestionWriteInput = {
+  /** 仅 PATCH 可省略；省略时服务端复用现有答案（legacy 空答案题目纯调序无需补答）。 */
+  answerText?: string;
+  /** 仅 PATCH 可省略；省略时服务端复用已规范化的现有标签。 */
+  animeTags?: BangumiAnimeTag[];
+  characterTags?: BangumiCharacterTag[];
+  expectedUpdatedAt: string;
+  r2Key?: string;
+  orderIndex?: number;
+};
+
+export function createAdminQuestionSetQuestion(
+  questionSetId: string,
+  input: AdminQuestionWriteInput & { r2Key: string },
+  uploadKey: string,
+  signal?: AbortSignal,
+) {
+  return adminFetch<AdminQuestionMutationResult>(
+    `/api/admin/question-sets/${encodeURIComponent(questionSetId)}/questions`,
+    uploadKey,
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(input),
+    },
+    signal,
+  );
+}
+
+export function updateAdminQuestionSetQuestion(
+  questionSetId: string,
+  questionId: string,
+  input: AdminQuestionWriteInput,
+  uploadKey: string,
+  signal?: AbortSignal,
+) {
+  return adminFetch<AdminQuestionMutationResult>(
+    `/api/admin/question-sets/${encodeURIComponent(questionSetId)}/questions/${encodeURIComponent(questionId)}`,
+    uploadKey,
+    {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(input),
+    },
+    signal,
+  );
+}
+
+export function deleteAdminQuestionSetQuestion(
+  questionSetId: string,
+  questionId: string,
+  expectedUpdatedAt: string,
+  uploadKey: string,
+  signal?: AbortSignal,
+) {
+  return adminFetch<AdminQuestionMutationResult>(
+    `/api/admin/question-sets/${encodeURIComponent(questionSetId)}/questions/${encodeURIComponent(questionId)}`,
+    uploadKey,
+    {
+      method: "DELETE",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ confirmQuestionId: questionId, expectedUpdatedAt }),
     },
     signal,
   );

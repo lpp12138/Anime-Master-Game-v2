@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState, type ChangeEvent, type FormEvent } from "react";
+import { useEffect, useMemo, useRef, useState, type ChangeEvent, type DragEvent as ReactDragEvent, type FormEvent } from "react";
 import { BangumiQuestionTagEditor } from "@/components/BangumiQuestionTagEditor";
 import { Button } from "@/components/Button";
 import { CommunityImageIndexPreview } from "@/components/CommunityImageIndexPreview";
@@ -13,7 +13,9 @@ import {
 } from "@/lib/communityScreenshotUpload";
 import {
   CREATION_TOOL_QUESTION_LIST_MAX_BYTES,
+  isSupportedCreationToolImageUrl,
   parseCreationToolQuestionList,
+  parseScreenshotLinkList,
 } from "@/lib/creationToolQuestionList";
 import { COMMUNITY_SCREENSHOT_MAX_QUESTIONS } from "@/lib/communityScreenshotPolicy";
 import { getLocalSession } from "@/lib/localSession";
@@ -68,6 +70,8 @@ export default function CommunityUploadPage() {
   const [description, setDescription] = useState("");
   const [uploaderNickname, setUploaderNickname] = useState("");
   const [questionListText, setQuestionListText] = useState("");
+  const [imageUrlText, setImageUrlText] = useState("");
+  const [isDraggingImages, setIsDraggingImages] = useState(false);
   const [drafts, setDrafts] = useState<ScreenshotDraft[]>([]);
   const [selectedDraftId, setSelectedDraftId] = useState<string | null>(null);
   const [error, setError] = useState("");
@@ -81,6 +85,7 @@ export default function CommunityUploadPage() {
   const questionListInputRef = useRef<HTMLInputElement>(null);
   const uploadKeyInputRef = useRef<HTMLInputElement>(null);
   const editorRef = useRef<HTMLElement>(null);
+  const dragDepthRef = useRef(0);
   const draftsRef = useRef<ScreenshotDraft[]>([]);
   const submissionRef = useRef<{ id: string; signature: string } | null>(null);
   const uploadedKeysRef = useRef(new Map<string, string>());
@@ -97,7 +102,7 @@ export default function CommunityUploadPage() {
       return { count: 0, error: previewError instanceof Error ? previewError.message : "题单格式无效。" };
     }
   }, [questionListText]);
-  const hasUnsubmittedWork = drafts.length > 0 || Boolean(questionListText.trim()) || isBusy;
+  const hasUnsubmittedWork = drafts.length > 0 || Boolean(questionListText.trim()) || Boolean(imageUrlText.trim()) || isBusy;
 
   useEffect(() => {
     setUploaderNickname(getLocalSession().nickname);
@@ -107,6 +112,38 @@ export default function CommunityUploadPage() {
   useEffect(() => {
     draftsRef.current = drafts;
   }, [drafts]);
+
+  useEffect(() => {
+    const handleClipboardPaste = (event: ClipboardEvent) => {
+      if (isBusy) return;
+      const target = event.target;
+      const isEditable = target instanceof HTMLInputElement
+        || target instanceof HTMLTextAreaElement
+        || (target instanceof HTMLElement && target.isContentEditable);
+      const pastedText = event.clipboardData?.getData("text/plain").trim() ?? "";
+      // Some browsers expose both an image and text when copying from a web
+      // page. Never swallow the user's text paste inside an editable field.
+      if (isEditable && pastedText) return;
+      const imageFiles = Array.from(event.clipboardData?.items ?? [])
+        .filter((item) => item.kind === "file" && item.type.startsWith("image/"))
+        .map((item) => item.getAsFile())
+        .filter((file): file is File => file != null);
+      if (imageFiles.length > 0) {
+        event.preventDefault();
+        addLocalFiles(imageFiles, "已从剪贴板粘贴");
+        return;
+      }
+      if (isEditable) return;
+      const pastedUrls = pastedText.split(/\r?\n/).map((item) => item.trim()).filter(Boolean);
+      if (pastedUrls.length > 0 && pastedUrls.every((item) => isSupportedCreationToolImageUrl(item))) {
+        event.preventDefault();
+        setImageUrlText((current) => [current.trim(), ...pastedUrls].filter(Boolean).join("\n"));
+        setStatus(`已粘贴 ${pastedUrls.length} 个截图链接；请点击“导入截图链接”。`);
+      }
+    };
+    window.addEventListener("paste", handleClipboardPaste);
+    return () => window.removeEventListener("paste", handleClipboardPaste);
+  }, [isBusy]);
 
   useEffect(() => () => {
     operationAbortRef.current?.abort();
@@ -155,68 +192,138 @@ export default function CommunityUploadPage() {
     }
   }
 
-  function handleFiles(event: ChangeEvent<HTMLInputElement>) {
+  function updateDrafts(updater: (current: ScreenshotDraft[]) => ScreenshotDraft[]) {
+    setDrafts((current) => {
+      const next = updater(current);
+      draftsRef.current = next;
+      return next;
+    });
+  }
+
+  function addLocalFiles(selectedFiles: File[], sourceLabel = "已选择") {
     setError("");
     setStatus("");
     setSuccess(null);
-    const selectedFiles = Array.from(event.target.files ?? []);
-    event.target.value = "";
     if (selectedFiles.length === 0) return;
     const invalid = selectedFiles.find((file) => !ACCEPTED_IMAGE_TYPES.has(file.type.toLowerCase()) && !ACCEPTED_IMAGE_EXTENSION.test(file.name));
     if (invalid) {
-      setError(`${invalid.name} 不是支持的图片文件；现有截图和标签不会被清空。`);
+      setError(`${invalid.name || "剪贴板内容"} 不是支持的图片文件；现有截图和标签不会被清空。`);
       return;
     }
-    const existingFiles = new Set(drafts.flatMap((draft) => draft.file ? [fileIdentity(draft.file)] : []));
+    const currentDrafts = draftsRef.current;
+    const existingFiles = new Set(currentDrafts.flatMap((draft) => draft.file ? [fileIdentity(draft.file)] : []));
     const files = selectedFiles.filter((file, index) => {
       const identity = fileIdentity(file);
       return !existingFiles.has(identity) && selectedFiles.findIndex((candidate) => fileIdentity(candidate) === identity) === index;
     });
     if (files.length === 0) {
-      setError("所选图片已在当前题库中。");
+      setError("这些图片已在当前题库中。");
       return;
     }
-    if (drafts.length + files.length > COMMUNITY_SCREENSHOT_MAX_QUESTIONS) {
-      setError(`本次已有 ${drafts.length} 张；单次最多选择 ${COMMUNITY_SCREENSHOT_MAX_QUESTIONS} 张图片。`);
+    if (currentDrafts.length + files.length > COMMUNITY_SCREENSHOT_MAX_QUESTIONS) {
+      setError(`本次已有 ${currentDrafts.length} 张；再加入 ${files.length} 张会超过 ${COMMUNITY_SCREENSHOT_MAX_QUESTIONS} 张上限。`);
       return;
     }
-    const additions = files.map((file) => ({
-      id: `${fileIdentity(file)}:${crypto.randomUUID()}`,
-      file,
-      displayName: file.name,
-      previewUrl: URL.createObjectURL(file),
-      previewIsObjectUrl: true,
-      sourceUrl: null,
-      labelText: suggestedLabel(file.name),
-      animeTags: [],
-      characterTags: [],
-    } satisfies ScreenshotDraft));
-    setDrafts((current) => [...current, ...additions]);
+    const additions = files.map((file, index) => {
+      const displayName = file.name || `clipboard-${Date.now()}-${index + 1}.png`;
+      return {
+        id: `${fileIdentity(file)}:${crypto.randomUUID()}`,
+        file,
+        displayName,
+        previewUrl: URL.createObjectURL(file),
+        previewIsObjectUrl: true,
+        sourceUrl: null,
+        labelText: suggestedLabel(displayName),
+        animeTags: [],
+        characterTags: [],
+      } satisfies ScreenshotDraft;
+    });
+    const nextDrafts = [...currentDrafts, ...additions];
+    draftsRef.current = nextDrafts;
+    setDrafts(nextDrafts);
     setSelectedDraftId((current) => current ?? additions[0]?.id ?? null);
+    setStatus(`${sourceLabel} ${additions.length} 张截图，可继续拖放、粘贴或选择图片。`);
   }
 
-  async function importQuestionList(text = questionListText) {
-    if (isBusy || operationAbortRef.current) return;
+  function handleFiles(event: ChangeEvent<HTMLInputElement>) {
+    const selectedFiles = Array.from(event.target.files ?? []);
+    event.target.value = "";
+    addLocalFiles(selectedFiles);
+  }
+
+  function handleDragEnter(event: ReactDragEvent<HTMLElement>) {
+    event.preventDefault();
+    dragDepthRef.current += 1;
+    setIsDraggingImages(true);
+  }
+
+  function handleDragOver(event: ReactDragEvent<HTMLElement>) {
+    event.preventDefault();
+    event.dataTransfer.dropEffect = "copy";
+  }
+
+  function handleDragLeave(event: ReactDragEvent<HTMLElement>) {
+    dragDepthRef.current = Math.max(0, dragDepthRef.current - 1);
+    if (dragDepthRef.current === 0) setIsDraggingImages(false);
+  }
+
+  function handleImageDrop(event: ReactDragEvent<HTMLElement>) {
+    event.preventDefault();
+    event.stopPropagation();
+    dragDepthRef.current = 0;
+    setIsDraggingImages(false);
+    if (isBusy) return;
+    const files = Array.from(event.dataTransfer.files).filter((file) => file.type.startsWith("image/") || ACCEPTED_IMAGE_EXTENSION.test(file.name));
+    if (files.length > 0) {
+      addLocalFiles(files, "已拖放");
+      return;
+    }
+    const droppedText = event.dataTransfer.getData("text/uri-list") || event.dataTransfer.getData("text/plain");
+    if (!droppedText.trim()) {
+      setError("没有从拖放内容中识别到图片文件或链接。");
+      return;
+    }
+    try {
+      const links = parseScreenshotLinkList(droppedText);
+      setImageUrlText((current) => [current.trim(), ...links].filter(Boolean).join("\n"));
+      setStatus(`已接收拖放的 ${links.length} 个截图链接；请检查后点击“导入截图链接”。`);
+    } catch (dropError) {
+      setError(dropError instanceof Error ? dropError.message : "拖放内容不是受支持的截图链接。");
+    }
+  }
+
+  async function importQuestionList(
+    text = questionListText,
+    options: { clearQuestionList?: boolean; sourceName?: string } = {},
+  ): Promise<boolean> {
+    if (isBusy || operationAbortRef.current) return false;
+    const sourceName = options.sourceName ?? "题单";
     setError("");
     setStatus("");
     setSuccess(null);
 
     const normalizedUploadKey = uploadKey.trim();
-    if (!normalizedUploadKey) return setError("请先填写上传密钥，再导入出题工具题单。");
+    if (!normalizedUploadKey) {
+      setError(`请先填写上传密钥，再导入${sourceName}。`);
+      return false;
+    }
     let items;
     try {
       items = parseCreationToolQuestionList(text);
     } catch (importError) {
-      return setError(importError instanceof Error ? importError.message : "题单格式无效。");
+      setError(importError instanceof Error ? importError.message : `${sourceName}格式无效。`);
+      return false;
     }
-    const existingSourceUrls = new Set(drafts.flatMap((draft) => draft.sourceUrl ? [draft.sourceUrl] : []));
+    const currentDrafts = draftsRef.current;
+    const existingSourceUrls = new Set(currentDrafts.flatMap((draft) => draft.sourceUrl ? [draft.sourceUrl] : []));
     const pendingItems = items.filter((item) => !existingSourceUrls.has(item.imageUrl));
     if (pendingItems.length === 0) {
-      setStatus("题单中的图片都已在当前截图网格中。");
-      return;
+      setStatus(`${sourceName}中的图片都已在当前截图网格中。`);
+      return true;
     }
-    if (drafts.length + pendingItems.length > COMMUNITY_SCREENSHOT_MAX_QUESTIONS) {
-      return setError(`当前已有 ${drafts.length} 张，再导入 ${pendingItems.length} 张会超过 ${COMMUNITY_SCREENSHOT_MAX_QUESTIONS} 张上限。`);
+    if (currentDrafts.length + pendingItems.length > COMMUNITY_SCREENSHOT_MAX_QUESTIONS) {
+      setError(`当前已有 ${currentDrafts.length} 张，再导入 ${pendingItems.length} 张会超过 ${COMMUNITY_SCREENSHOT_MAX_QUESTIONS} 张上限。`);
+      return false;
     }
 
     const controller = new AbortController();
@@ -227,19 +334,20 @@ export default function CommunityUploadPage() {
     let fatalError = "";
     let nextIndex = 0;
     let completed = 0;
-    const workers = Array.from({ length: Math.min(2, pendingItems.length) }, async () => {
+    const remoteImportConcurrency = window.matchMedia("(max-width: 767px)").matches ? 1 : 2;
+    const workers = Array.from({ length: Math.min(remoteImportConcurrency, pendingItems.length) }, async () => {
       while (nextIndex < pendingItems.length && !controller.signal.aborted) {
         const order = nextIndex;
         nextIndex += 1;
         const item = pendingItems[order];
-        setStatus(`正在下载、压缩并上传题单图片 ${completed + 1} / ${pendingItems.length}……`);
+        setStatus(`正在下载、压缩并上传${sourceName}图片 ${completed + 1} / ${pendingItems.length}……`);
         try {
           const uploaded = await importCommunityScreenshotFromUrl(
             item.imageUrl,
             normalizedUploadKey,
             controller.signal,
           );
-          const id = `question-list:${crypto.randomUUID()}`;
+          const id = `remote-image:${crypto.randomUUID()}`;
           uploadedKeysRef.current.set(id, uploaded.key);
           additions.push({
             order,
@@ -270,11 +378,14 @@ export default function CommunityUploadPage() {
       }
     });
 
+    let completedWithoutFailures = false;
     try {
       await Promise.all(workers);
       const orderedAdditions = additions.sort((left, right) => left.order - right.order).map(({ draft }) => draft);
       if (orderedAdditions.length > 0) {
-        setDrafts((current) => [...current, ...orderedAdditions]);
+        const nextDrafts = [...currentDrafts, ...orderedAdditions];
+        draftsRef.current = nextDrafts;
+        setDrafts(nextDrafts);
         setSelectedDraftId((current) => current ?? orderedAdditions[0].id);
       }
       if (fatalError) {
@@ -282,19 +393,36 @@ export default function CommunityUploadPage() {
         setError(fatalError);
       } else if (controller.signal.aborted) {
         setStatus(orderedAdditions.length > 0 ? `已保留成功导入的 ${orderedAdditions.length} 张图片。` : "");
-        setError("已取消题单导入；服务器已接收的图片会保留供本次提交复用。");
+        setError(`已取消${sourceName}导入；服务器已接收的图片会保留供本次提交复用。`);
       } else if (failures.length > 0) {
         failures.sort((left, right) => left.order - right.order);
         setStatus(`成功导入 ${orderedAdditions.length} 张，${failures.length} 张失败；再次导入只会重试失败图片。`);
         setError(`第 ${failures[0].order + 1} 张导入失败：${failures[0].message}`);
       } else {
-        setQuestionListText("");
-        setStatus(`已从出题工具题单导入 ${orderedAdditions.length} 张图片，可继续编辑答案和 BGM 标签。`);
+        completedWithoutFailures = true;
+        if (options.clearQuestionList !== false) setQuestionListText("");
+        setStatus(`已从${sourceName}导入 ${orderedAdditions.length} 张图片，可继续编辑答案和 BGM 标签。`);
       }
     } finally {
       if (operationAbortRef.current === controller) operationAbortRef.current = null;
       setIsImportingQuestionList(false);
     }
+    return completedWithoutFailures;
+  }
+
+  async function importImageLinks() {
+    let links: string[];
+    try {
+      links = parseScreenshotLinkList(imageUrlText);
+    } catch (linkError) {
+      setError(linkError instanceof Error ? linkError.message : "截图链接格式无效。");
+      return;
+    }
+    const imported = await importQuestionList(
+      JSON.stringify(links.map((imageUrl) => ({ image_url: imageUrl, label_text: "" }))),
+      { clearQuestionList: false, sourceName: "截图链接" },
+    );
+    if (imported) setImageUrlText("");
   }
 
   async function handleQuestionListFile(event: ChangeEvent<HTMLInputElement>) {
@@ -319,18 +447,18 @@ export default function CommunityUploadPage() {
   }
 
   function updateLabel(id: string, labelText: string) {
-    setDrafts((current) => current.map((draft) => draft.id === id ? { ...draft, labelText } : draft));
+    updateDrafts((current) => current.map((draft) => draft.id === id ? { ...draft, labelText } : draft));
   }
 
   function updateTags(id: string, animeTag: BangumiAnimeTag | null, characterTags: BangumiCharacterTag[]) {
-    setDrafts((current) => current.map((draft) => draft.id === id
+    updateDrafts((current) => current.map((draft) => draft.id === id
       ? { ...draft, animeTags: animeTag ? [animeTag] : [], characterTags }
       : draft));
   }
 
   function copyPreviousTags(index: number) {
     if (index <= 0) return;
-    setDrafts((current) => {
+    updateDrafts((current) => {
       const previous = current[index - 1];
       const target = current[index];
       if (!previous || !target) return current;
@@ -346,12 +474,14 @@ export default function CommunityUploadPage() {
 
   function removeDraft(id: string) {
     if (isBusy) return;
-    const index = drafts.findIndex((draft) => draft.id === id);
-    const removed = drafts[index];
+    const currentDrafts = draftsRef.current;
+    const index = currentDrafts.findIndex((draft) => draft.id === id);
+    const removed = currentDrafts[index];
     if (!removed) return;
     revokeDraftPreview(removed);
     uploadedKeysRef.current.delete(id);
-    const nextDrafts = drafts.filter((draft) => draft.id !== id);
+    const nextDrafts = currentDrafts.filter((draft) => draft.id !== id);
+    draftsRef.current = nextDrafts;
     setDrafts(nextDrafts);
     if (selectedDraftId === id) {
       setSelectedDraftId(nextDrafts[Math.min(index, nextDrafts.length - 1)]?.id ?? null);
@@ -387,10 +517,15 @@ export default function CommunityUploadPage() {
         nextIndex += 1;
         const [normalizedAnswer, answer] = candidates[candidateIndex];
         try {
-          const results = await searchBangumiAnime(answer, normalizedKey, controller.signal);
+          const results = await searchBangumiAnime(answer, normalizedKey, "all", controller.signal);
           const exact = results.find((result) => [result.name, result.nameCn]
             .some((name) => name && normalizeBangumiSearchText(name) === normalizedAnswer));
-          if (exact) matches.set(normalizedAnswer, { id: exact.id, name: exact.name, nameCn: exact.nameCn });
+          if (exact) matches.set(normalizedAnswer, {
+            id: exact.id,
+            name: exact.name,
+            nameCn: exact.nameCn,
+            subjectType: exact.subjectType ?? 2,
+          });
         } catch (matchError) {
           if (controller.signal.aborted) return;
           failures.push(matchError instanceof Error ? matchError.message : `${answer} 匹配失败`);
@@ -405,7 +540,7 @@ export default function CommunityUploadPage() {
         setError("已取消 BGM 自动匹配；已完成的查询仍会保留在浏览器缓存中。");
         return;
       }
-      setDrafts((current) => current.map((draft) => {
+      updateDrafts((current) => current.map((draft) => {
         if (draft.animeTags.length > 0) return draft;
         const match = matches.get(normalizeBangumiSearchText(draft.labelText));
         return match ? { ...draft, animeTags: [match], characterTags: [] } : draft;
@@ -507,6 +642,8 @@ export default function CommunityUploadPage() {
       setTitle(DEFAULT_QUESTION_SET_TITLE);
       setDescription("");
       setQuestionListText("");
+      setImageUrlText("");
+      draftsRef.current = [];
       setDrafts([]);
       setSelectedDraftId(null);
       submissionRef.current = null;
@@ -540,7 +677,7 @@ export default function CommunityUploadPage() {
             </button>
             <h1 className="text-3xl font-bold text-slate-950 sm:text-4xl">密钥上传截图</h1>
             <p className="mt-2 max-w-3xl text-sm leading-6 text-slate-600 sm:text-base">
-              可选择本地截图，或上传/粘贴动画截图工具的 JSON 题单。图片会进入自适应网格，点击任意缩略图即可填写答案并搜索 BGM（Bangumi）番剧与角色标签。
+              可拖放、粘贴或选择本地截图，也可粘贴 FanCaps / Bangumi 截图直链，或上传/粘贴动画截图工具的 JSON 题单。图片会进入自适应网格，点击任意缩略图即可填写答案并搜索 BGM（Bangumi）作品（动画/游戏）与角色标签。
             </p>
           </div>
           <div className="flex flex-wrap items-center gap-2">
@@ -626,19 +763,66 @@ export default function CommunityUploadPage() {
                   onChange={(event) => setDescription(event.target.value)}
                 />
               </label>
-              <label className="block md:col-span-2">
+              <div className="md:col-span-2">
                 <span className="mb-1 block text-sm font-semibold text-slate-900">选择截图（可分多次追加）</span>
-                <input
-                  ref={fileInputRef}
-                  accept="image/jpeg,image/png,image/webp,image/gif,image/avif"
-                  className="block w-full rounded-lg border border-dashed border-slate-300 bg-slate-50 p-3 text-sm file:mr-3 file:rounded-md file:border-0 file:bg-[var(--primary)] file:px-4 file:py-2 file:font-semibold file:text-white hover:border-slate-400 disabled:opacity-50"
+                <div
+                  aria-label="拖放、粘贴或选择截图区域"
+                  className={`grid place-items-center gap-2 rounded-lg border-2 border-dashed px-4 py-8 text-center transition ${isDraggingImages ? "border-[var(--primary)] bg-rose-50 ring-4 ring-rose-100" : "border-slate-300 bg-slate-50 hover:border-slate-400"}`}
+                  onDragEnter={handleDragEnter}
+                  onDragLeave={handleDragLeave}
+                  onDragOver={handleDragOver}
+                  onDrop={handleImageDrop}
+                >
+                  <p className="text-sm font-semibold text-slate-800">{isDraggingImages ? "松开即可添加图片或链接" : "把截图拖到这里"}</p>
+                  <p className="max-w-xl text-xs leading-5 text-slate-500">可一次拖入多张 JPEG、PNG、WebP、GIF、AVIF 图片，也可拖入 FanCaps / Bangumi 图片直链。</p>
+                  <button
+                    className="rounded-md bg-[var(--primary)] px-4 py-2 text-sm font-semibold text-white transition hover:opacity-90 disabled:opacity-50"
+                    disabled={isBusy}
+                    type="button"
+                    onClick={() => fileInputRef.current?.click()}
+                  >选择图片文件</button>
+                  <p className="text-xs leading-5 text-slate-500">或在页面任意位置按 Ctrl / Cmd + V 粘贴剪贴板截图。</p>
+                  <input
+                    ref={fileInputRef}
+                    accept="image/jpeg,image/png,image/webp,image/gif,image/avif"
+                    className="hidden"
+                    disabled={isBusy}
+                    multiple
+                    type="file"
+                    onChange={handleFiles}
+                  />
+                </div>
+                <span className="mt-1 block text-xs leading-5 text-slate-500">单个原文件不超过 30 MB；GIF/AVIF 会转为静态图，所有图片自动压缩至 1080p。</span>
+              </div>
+              <section className="space-y-3 rounded-xl border border-sky-200 bg-sky-50/60 p-4 md:col-span-2" aria-labelledby="screenshot-link-import-title">
+                <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+                  <div>
+                    <h3 className="text-sm font-bold text-slate-950" id="screenshot-link-import-title">粘贴截图直链</h3>
+                    <p className="mt-1 text-xs leading-5 text-slate-600">每行一个 FanCaps 或 Bangumi 的 HTTPS 图片直链；图片会经受保护端点下载、压缩并加入下方网格。</p>
+                  </div>
+                  <button
+                    className="shrink-0 rounded-md bg-sky-700 px-4 py-2 text-sm font-semibold text-white hover:bg-sky-800 disabled:opacity-50"
+                    disabled={isBusy || !imageUrlText.trim()}
+                    type="button"
+                    onClick={() => void importImageLinks()}
+                  >{isImportingQuestionList ? "正在导入…" : "导入截图链接"}</button>
+                </div>
+                <textarea
+                  aria-label="截图图片直链，每行一个"
+                  className="min-h-24 w-full resize-y break-all rounded-md border border-sky-200 bg-white px-3 py-2 font-mono text-xs leading-5 outline-none transition focus:border-[var(--primary)] focus:ring-4 focus:ring-rose-100 disabled:bg-slate-100"
                   disabled={isBusy}
-                  multiple
-                  type="file"
-                  onChange={handleFiles}
+                  placeholder={"https://cdni.fancaps.net/file/...jpg\nhttps://lain.bgm.tv/pic/cover/...jpg"}
+                  value={imageUrlText}
+                  onChange={(event) => {
+                    setImageUrlText(event.target.value);
+                    setError("");
+                    setSuccess(null);
+                  }}
                 />
-                <span className="mt-1 block text-xs leading-5 text-slate-500">支持 JPEG、PNG、WebP、GIF、AVIF；GIF/AVIF 会转为静态图，单个原文件不超过 30 MB。</span>
-              </label>
+                <p className="text-xs leading-5 text-slate-600">
+                  支持 FanCaps（cdni.fancaps.net 等）与 Bangumi（lain.bgm.tv）的 HTTPS 直链，最多 {COMMUNITY_SCREENSHOT_MAX_QUESTIONS} 个；`#` 开头的行为注释，已成功导入的图片在重试或提交时会复用服务器对象。
+                </p>
+              </section>
               <section className="space-y-3 rounded-xl border border-sky-200 bg-sky-50/60 p-4 md:col-span-2" aria-labelledby="question-list-import-title">
                 <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
                   <div>
@@ -707,7 +891,7 @@ export default function CommunityUploadPage() {
               <div>
                 <div className="mx-auto grid h-14 w-14 place-items-center rounded-full bg-slate-100 text-2xl" aria-hidden="true">▧</div>
                 <h2 className="mt-4 text-lg font-bold text-slate-900">尚未选择截图</h2>
-                <p className="mt-2 text-sm text-slate-500">通过上方文件框选择图片，或导入出题工具 JSON 题单后，这里会显示可点击编辑的缩略图网格。</p>
+                <p className="mt-2 text-sm text-slate-500">把图片拖入上方拖放区、按 Ctrl / Cmd + V 粘贴截图、选择图片文件或粘贴截图直链后，这里会显示可点击编辑的缩略图网格。</p>
               </div>
             </section>
           ) : (
@@ -818,7 +1002,7 @@ export default function CommunityUploadPage() {
                       onChange={(animeTag, characterTags) => updateTags(selectedDraft.id, animeTag, characterTags)}
                     />
                     <p className="mt-4 rounded-md bg-slate-50 px-3 py-2 text-xs leading-5 text-slate-600">
-                      输入或选择后，正确答案、BGM 番剧及角色标签会立即显示在对应缩略图上；最终仍由服务器重新规范化并校验角色归属。
+                      输入或选择后，正确答案、BGM 作品（动画/游戏）及角色标签会立即显示在对应缩略图上；最终仍由服务器重新规范化并校验角色归属。
                     </p>
                   </>
                 ) : null}

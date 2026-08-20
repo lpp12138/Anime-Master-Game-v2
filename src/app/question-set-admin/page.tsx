@@ -1,14 +1,18 @@
 "use client";
 
 import { useEffect, useMemo, useRef, useState, type FormEvent } from "react";
+import { AdminQuestionEditor } from "@/components/AdminQuestionEditor";
 import { Button } from "@/components/Button";
 import { bangumiTagDisplayName } from "@/lib/bangumiTags";
 import {
   deleteAdminQuestionSet,
+  deleteAdminQuestionSetQuestion,
   getAdminQuestionSet,
   listAdminQuestionSets,
   QuestionSetAdminApiError,
   updateAdminQuestionSet,
+  updateAdminQuestionSetQuestion,
+  type AdminQuestionMutationResult,
   type AdminQuestionSetDetail,
   type AdminQuestionSetFilters,
   type AdminQuestionSetPage,
@@ -86,6 +90,11 @@ function QuestionSetBadges({ item }: { item: AdminQuestionSetSummary }) {
           规范集合
         </span>
       )}
+      {item.isStructureEdited && (
+        <span className="rounded-full border border-amber-200 bg-amber-50 px-2 py-0.5 text-amber-800">
+          结构已人工编辑
+        </span>
+      )}
     </div>
   );
 }
@@ -107,6 +116,12 @@ export default function QuestionSetAdminPage() {
   const [isLoadingDetail, setIsLoadingDetail] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
   const [isDeleting, setIsDeleting] = useState(false);
+  const [showAddQuestion, setShowAddQuestion] = useState(false);
+  const [editingQuestionId, setEditingQuestionId] = useState<string | null>(null);
+  const [questionEditorDirty, setQuestionEditorDirty] = useState(false);
+  const [questionEditorBusy, setQuestionEditorBusy] = useState(false);
+  const [movingQuestionId, setMovingQuestionId] = useState<string | null>(null);
+  const [deletingQuestionId, setDeletingQuestionId] = useState<string | null>(null);
   const listAbortRef = useRef<AbortController | null>(null);
   const detailAbortRef = useRef<AbortController | null>(null);
   const keyInputRef = useRef<HTMLInputElement>(null);
@@ -118,7 +133,15 @@ export default function QuestionSetAdminPage() {
       || editForm.description !== original.description
       || editForm.isPublic !== original.isPublic;
   }, [detail, editForm]);
-  const isBusy = isLoadingList || isLoadingDetail || isSaving || isDeleting;
+  const hasUnsavedWork = isDirty || questionEditorDirty;
+  const isBusy = isLoadingList
+    || isLoadingDetail
+    || isSaving
+    || isDeleting
+    || questionEditorBusy
+    || movingQuestionId !== null
+    || deletingQuestionId !== null;
+  const hasOpenQuestionEditor = showAddQuestion || editingQuestionId !== null;
 
   useEffect(() => {
     keyInputRef.current?.focus();
@@ -129,11 +152,11 @@ export default function QuestionSetAdminPage() {
   }, []);
 
   useEffect(() => {
-    if (!isDirty) return;
+    if (!hasUnsavedWork) return;
     const confirmRouteExit = (event: Event) => {
       const routeEvent = event as CustomEvent<AppBeforeRouteChangeDetail>;
       if (routeEvent.detail?.path === "/question-set-admin") return;
-      if (!window.confirm("题库元数据尚未保存，确定离开管理页面吗？")) event.preventDefault();
+      if (!window.confirm("题库或单题修改尚未保存，确定离开管理页面吗？")) event.preventDefault();
     };
     const warnBeforeUnload = (event: BeforeUnloadEvent) => {
       event.preventDefault();
@@ -145,7 +168,14 @@ export default function QuestionSetAdminPage() {
       window.removeEventListener(APP_BEFORE_ROUTE_CHANGE_EVENT, confirmRouteExit);
       window.removeEventListener("beforeunload", warnBeforeUnload);
     };
-  }, [isDirty]);
+  }, [hasUnsavedWork]);
+
+  function resetQuestionEditor() {
+    setShowAddQuestion(false);
+    setEditingQuestionId(null);
+    setQuestionEditorDirty(false);
+    setQuestionEditorBusy(false);
+  }
 
   function handleRequestError(requestError: unknown) {
     if (requestError instanceof QuestionSetAdminApiError && requestError.status === 401) {
@@ -153,6 +183,7 @@ export default function QuestionSetAdminPage() {
       setPage(null);
       setDetail(null);
       setEditForm(null);
+      resetQuestionEditor();
     }
     setError(errorMessage(requestError));
   }
@@ -200,11 +231,11 @@ export default function QuestionSetAdminPage() {
   }
 
   function canLeaveCurrentEdit() {
-    return !isDirty || window.confirm("当前题库元数据尚未保存，确定放弃修改吗？");
+    return !hasUnsavedWork || window.confirm("当前题库或单题修改尚未保存，确定放弃修改吗？");
   }
 
   async function loadDetail(questionSetId: string) {
-    if (isDirty && !canLeaveCurrentEdit()) return;
+    if (hasUnsavedWork && !canLeaveCurrentEdit()) return;
     detailAbortRef.current?.abort();
     const controller = new AbortController();
     detailAbortRef.current = controller;
@@ -213,6 +244,7 @@ export default function QuestionSetAdminPage() {
     setNotice("");
     setShowDelete(false);
     setDeleteConfirmation("");
+    resetQuestionEditor();
     try {
       const loaded = await getAdminQuestionSet(questionSetId, uploadKey, controller.signal);
       setDetail(loaded);
@@ -239,6 +271,7 @@ export default function QuestionSetAdminPage() {
     if (!canLeaveCurrentEdit()) return;
     setDetail(null);
     setEditForm(null);
+    resetQuestionEditor();
     await loadPage({ ...appliedFilters, offset });
     window.scrollTo({ top: 0, behavior: "smooth" });
   }
@@ -276,6 +309,67 @@ export default function QuestionSetAdminPage() {
     }
   }
 
+  function imageCleanupText(cleanup: AdminQuestionMutationResult["imageCleanup"]) {
+    if (cleanup.pendingCount > 0) return `；${cleanup.pendingCount} 个旧图片对象等待维护任务重试`;
+    if (cleanup.preservedSharedCount > 0) return `；保留 ${cleanup.preservedSharedCount} 个仍被其他题目引用的图片对象`;
+    if (cleanup.deletedCount > 0) return `；已清理 ${cleanup.deletedCount} 个不再引用的旧图片对象`;
+    return "";
+  }
+
+  function applyQuestionMutation(
+    result: AdminQuestionMutationResult,
+    action: "created" | "updated" | "moved" | "deleted",
+  ) {
+    const updated = result.questionSet;
+    setDetail(updated);
+    setEditForm(editFormFromDetail(updated));
+    setPage((current) => current ? {
+      ...current,
+      items: current.items.map((item) => item.id === updated.id ? updated : item),
+    } : current);
+    resetQuestionEditor();
+    const actionText = action === "created" ? "题目已新增"
+      : action === "updated" ? "本题已更新"
+        : action === "moved" ? "题目顺序已更新"
+          : "题目已删除";
+    setNotice(`${actionText}${imageCleanupText(result.imageCleanup)}。`);
+  }
+
+  async function moveQuestion(question: AdminQuestionSetDetail["questions"][number], orderIndex: number) {
+    if (!detail || isDirty || questionEditorDirty || orderIndex < 0 || orderIndex >= detail.questions.length) return;
+    setMovingQuestionId(question.id);
+    setError("");
+    setNotice("");
+    try {
+      // 纯调序请求：不提交答案与标签，服务端复用现有内容，legacy 空答案题目也可直接调序。
+      const result = await updateAdminQuestionSetQuestion(detail.id, question.id, {
+        expectedUpdatedAt: detail.updatedAt,
+        orderIndex,
+      }, uploadKey);
+      applyQuestionMutation(result, "moved");
+    } catch (requestError) {
+      handleRequestError(requestError);
+    } finally {
+      setMovingQuestionId(null);
+    }
+  }
+
+  async function removeQuestion(question: AdminQuestionSetDetail["questions"][number]) {
+    if (!detail || isDirty || questionEditorDirty || detail.questions.length <= 1) return;
+    if (!window.confirm(`确定永久删除第 ${question.orderIndex + 1} 题吗？删除后题目顺序会自动前移。`)) return;
+    setDeletingQuestionId(question.id);
+    setError("");
+    setNotice("");
+    try {
+      const result = await deleteAdminQuestionSetQuestion(detail.id, question.id, detail.updatedAt, uploadKey);
+      applyQuestionMutation(result, "deleted");
+    } catch (requestError) {
+      handleRequestError(requestError);
+    } finally {
+      setDeletingQuestionId(null);
+    }
+  }
+
   async function removeDetail() {
     if (!detail || !detail.canDelete || deleteConfirmation !== detail.title) return;
     setIsDeleting(true);
@@ -288,6 +382,7 @@ export default function QuestionSetAdminPage() {
         : page?.offset ?? 0;
       setDetail(null);
       setEditForm(null);
+      resetQuestionEditor();
       setShowDelete(false);
       setDeleteConfirmation("");
       await loadPage({ ...appliedFilters, offset: nextOffset });
@@ -316,6 +411,7 @@ export default function QuestionSetAdminPage() {
     setPage(null);
     setDetail(null);
     setEditForm(null);
+    resetQuestionEditor();
     setError("");
     setNotice("管理密钥已从当前页面内存清除。");
     window.requestAnimationFrame(() => keyInputRef.current?.focus());
@@ -332,7 +428,7 @@ export default function QuestionSetAdminPage() {
             </div>
             <h1 className="text-3xl font-bold text-slate-950 sm:text-4xl">题库管理</h1>
             <p className="mt-2 max-w-3xl text-sm leading-6 text-slate-600 sm:text-base">
-              使用管理密钥检索和检查题库、查看正确答案与 Bangumi 标签、修改公开状态，或安全删除没有房间与游戏引用的题库。
+              使用管理密钥检索题库、查看受保护答案与 Bangumi 标签、逐题新增/换图/编辑/调序/删除、修改公开状态，或安全删除没有活动引用的题库。
             </p>
           </div>
           <div className="self-start rounded-full border border-amber-200 bg-amber-50 px-3 py-1.5 text-xs font-semibold text-amber-900">
@@ -519,80 +615,175 @@ export default function QuestionSetAdminPage() {
                       <div className="mt-4 grid gap-4 lg:grid-cols-2">
                         <label className="block">
                           <span className="mb-1 block text-sm font-semibold text-slate-900">题库标题</span>
-                          <input className="h-11 w-full rounded-md border border-[var(--line)] px-3 outline-none focus:border-[var(--primary)] focus:ring-4 focus:ring-rose-100 disabled:bg-slate-100" disabled={isSaving || isDeleting} maxLength={80} value={editForm.title} onChange={(event) => setEditForm((current) => current ? { ...current, title: event.target.value } : current)} />
+                          <input className="h-11 w-full rounded-md border border-[var(--line)] px-3 outline-none focus:border-[var(--primary)] focus:ring-4 focus:ring-rose-100 disabled:bg-slate-100" disabled={isSaving || isDeleting || hasOpenQuestionEditor} maxLength={80} value={editForm.title} onChange={(event) => setEditForm((current) => current ? { ...current, title: event.target.value } : current)} />
                           <span className="mt-1 block text-xs text-slate-500">{editForm.title.length} / 80</span>
                         </label>
                         <label className="block">
                           <span className="mb-1 block text-sm font-semibold text-slate-900">题库公开状态</span>
                           <span className="flex min-h-11 items-center gap-3 rounded-md border border-[var(--line)] px-3">
-                            <input checked={editForm.isPublic} disabled={isSaving || isDeleting} type="checkbox" onChange={(event) => setEditForm((current) => current ? { ...current, isPublic: event.target.checked } : current)} />
+                            <input checked={editForm.isPublic} disabled={isSaving || isDeleting || hasOpenQuestionEditor} type="checkbox" onChange={(event) => setEditForm((current) => current ? { ...current, isPublic: event.target.checked } : current)} />
                             <span className="text-sm font-medium">允许在公开社区题库中显示和选用</span>
                           </span>
                           {detail.isCanonicalCollection && !editForm.isPublic && <span className="mt-1 block text-xs leading-5 text-amber-700">取消公开会同时释放该规范同标题集合；以后同标题投稿可能创建新题库。</span>}
                         </label>
                         <label className="block lg:col-span-2">
                           <span className="mb-1 block text-sm font-semibold text-slate-900">题库说明</span>
-                          <textarea className="min-h-24 w-full resize-y rounded-md border border-[var(--line)] px-3 py-2 outline-none focus:border-[var(--primary)] focus:ring-4 focus:ring-rose-100 disabled:bg-slate-100" disabled={isSaving || isDeleting} maxLength={300} value={editForm.description} onChange={(event) => setEditForm((current) => current ? { ...current, description: event.target.value } : current)} />
+                          <textarea className="min-h-24 w-full resize-y rounded-md border border-[var(--line)] px-3 py-2 outline-none focus:border-[var(--primary)] focus:ring-4 focus:ring-rose-100 disabled:bg-slate-100" disabled={isSaving || isDeleting || hasOpenQuestionEditor} maxLength={300} value={editForm.description} onChange={(event) => setEditForm((current) => current ? { ...current, description: event.target.value } : current)} />
                           <span className="mt-1 block text-xs text-slate-500">{editForm.description.length} / 300</span>
                         </label>
                       </div>
                       <div className="mt-4 flex flex-wrap items-center gap-3">
-                        <Button className="h-10" disabled={!isDirty || isSaving || isDeleting} type="submit">{isSaving ? "保存中…" : "保存修改"}</Button>
-                        <Button className="h-10" disabled={!isDirty || isSaving || isDeleting} type="button" variant="secondary" onClick={() => setEditForm(editFormFromDetail(detail))}>放弃修改</Button>
+                        <Button className="h-10" disabled={!isDirty || isSaving || isDeleting || hasOpenQuestionEditor} type="submit">{isSaving ? "保存中…" : "保存修改"}</Button>
+                        <Button className="h-10" disabled={!isDirty || isSaving || isDeleting || hasOpenQuestionEditor} type="button" variant="secondary" onClick={() => setEditForm(editFormFromDetail(detail))}>放弃修改</Button>
                         {isDirty && <span className="text-xs font-semibold text-amber-700">有未保存修改</span>}
                       </div>
                     </form>
 
                     <div className="mt-6">
-                      <div className="flex flex-col gap-1 sm:flex-row sm:items-end sm:justify-between">
+                      <div className="flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
                         <div>
-                          <h3 className="text-lg font-bold text-slate-950">题目、答案与 Bangumi 标签</h3>
-                          <p className="mt-1 text-xs leading-5 text-slate-500">答案只从已验证的管理接口加载。图片使用 no-referrer，管理密钥不会发送到图片源站。</p>
+                          <h3 className="text-lg font-bold text-slate-950">题目图片单独管理</h3>
+                          <p className="mt-1 text-xs leading-5 text-slate-500">可逐题查询、编辑答案和 Bangumi 标签、替换截图、调整顺序、新增或删除。图片使用 no-referrer，管理密钥不会发送到图片源站。</p>
                         </div>
-                        <span className="text-xs text-slate-500">共 {detail.questions.length} 题</span>
+                        <div className="flex items-center gap-3">
+                          <span className="text-xs text-slate-500">共 {detail.questions.length} / 30 题</span>
+                          <Button
+                            className="h-10 px-3"
+                            disabled={!detail.canEditQuestions || detail.questions.length >= 30 || isBusy || isDirty || showAddQuestion || editingQuestionId !== null}
+                            type="button"
+                            onClick={() => {
+                              setEditingQuestionId(null);
+                              setShowAddQuestion(true);
+                              setError("");
+                              setNotice("");
+                            }}
+                          >
+                            新增题目
+                          </Button>
+                        </div>
                       </div>
-                      <div className="mt-4 grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-3">
-                        {detail.questions.map((question) => (
-                          <article className={`min-w-0 overflow-hidden rounded-lg border bg-white ${question.answerMismatch ? "border-amber-300" : "border-slate-200"}`} key={question.id}>
-                            <div className="aspect-video w-full bg-slate-950">
-                              <img alt={`第 ${question.orderIndex + 1} 题截图`} className="h-full w-full object-contain" loading="lazy" referrerPolicy="no-referrer" src={question.imageUrl} />
-                            </div>
-                            <div className="p-4">
-                              <div className="flex items-start justify-between gap-3">
-                                <span className="rounded-full bg-slate-900 px-2 py-0.5 text-xs font-bold text-white">第 {question.orderIndex + 1} 题</span>
-                                {question.answerMismatch && <span className="text-xs font-semibold text-amber-700">答案索引不一致</span>}
+
+                      {!detail.canEditQuestions && (
+                        <div className="mt-4 rounded-lg border border-amber-300 bg-amber-50 px-4 py-3 text-sm leading-6 text-amber-950">
+                          当前不能修改单题：活动游戏引用 {detail.gameSessionCount}、已准备房间 {detail.preparedRoomCount}{detail.storageKind === "corrupt" ? "，且 manifest 已损坏" : ""}。请先结束游戏、取消房间准备或修复存储一致性。
+                        </div>
+                      )}
+                      {detail.isStructureEdited && (
+                        <div className="mt-4 rounded-lg border border-violet-200 bg-violet-50 px-4 py-3 text-sm leading-6 text-violet-900">
+                          此题库曾执行新增、删除或调序，已与“同标题自动追加”规范集合分离，以保护历史投稿范围；它仍可正常公开和游玩。
+                        </div>
+                      )}
+
+                      {showAddQuestion && (
+                        <div className="mt-4">
+                          <AdminQuestionEditor
+                            key={`create:${detail.updatedAt}`}
+                            expectedUpdatedAt={detail.updatedAt}
+                            mode="create"
+                            questionSetId={detail.id}
+                            uploadKey={uploadKey}
+                            onBusyChange={setQuestionEditorBusy}
+                            onCancel={() => {
+                              if (canLeaveCurrentEdit()) resetQuestionEditor();
+                            }}
+                            onDirtyChange={setQuestionEditorDirty}
+                            onSaved={(result, action) => applyQuestionMutation(result, action)}
+                          />
+                        </div>
+                      )}
+                      {editingQuestionId && detail.questions.find((question) => question.id === editingQuestionId) && (
+                        <div className="mt-4">
+                          <AdminQuestionEditor
+                            key={`edit:${editingQuestionId}:${detail.updatedAt}`}
+                            expectedUpdatedAt={detail.updatedAt}
+                            mode="edit"
+                            question={detail.questions.find((question) => question.id === editingQuestionId)!}
+                            questionSetId={detail.id}
+                            uploadKey={uploadKey}
+                            onBusyChange={setQuestionEditorBusy}
+                            onCancel={() => {
+                              if (canLeaveCurrentEdit()) resetQuestionEditor();
+                            }}
+                            onDirtyChange={setQuestionEditorDirty}
+                            onSaved={(result, action) => applyQuestionMutation(result, action)}
+                          />
+                        </div>
+                      )}
+
+                      {detail.questions.length === 0 ? (
+                        <div className="mt-4 rounded-lg border border-dashed border-slate-300 bg-slate-50 px-4 py-10 text-center text-sm text-slate-600">当前题库没有题目，请使用“新增题目”补充。</div>
+                      ) : (
+                        <div className="mt-4 grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-3">
+                          {detail.questions.map((question) => (
+                            <article className={`min-w-0 overflow-hidden rounded-lg border bg-white ${editingQuestionId === question.id ? "border-sky-400 ring-2 ring-sky-100" : question.answerMismatch ? "border-amber-300" : "border-slate-200"}`} key={question.id}>
+                              <div className="aspect-video w-full bg-slate-950">
+                                <img alt={`第 ${question.orderIndex + 1} 题截图`} className="h-full w-full object-contain" loading="lazy" referrerPolicy="no-referrer" src={question.imageUrl} />
                               </div>
-                              <p className="mt-3 text-xs font-semibold text-slate-500">正确答案</p>
-                              <p className="mt-1 break-words text-base font-bold text-rose-700">{question.answerText || "（未填写）"}</p>
-                              {question.animeTags.length > 0 && (
-                                <div className="mt-3">
-                                  <p className="text-xs font-semibold text-slate-500">番剧</p>
-                                  <div className="mt-1 flex flex-wrap gap-1.5">{question.animeTags.map((tag) => <span className="rounded-full bg-sky-50 px-2 py-1 text-xs text-sky-800" key={tag.id}>{bangumiTagDisplayName(tag)}</span>)}</div>
+                              <div className="p-4">
+                                <div className="flex items-start justify-between gap-3">
+                                  <span className="rounded-full bg-slate-900 px-2 py-0.5 text-xs font-bold text-white">第 {question.orderIndex + 1} 题</span>
+                                  {question.answerMismatch && <span className="text-xs font-semibold text-amber-700">答案索引不一致</span>}
                                 </div>
-                              )}
-                              {question.characterTags.length > 0 && (
-                                <div className="mt-3">
-                                  <p className="text-xs font-semibold text-slate-500">画面角色</p>
-                                  <div className="mt-1 flex flex-wrap gap-1.5">{question.characterTags.map((tag) => <span className="rounded-full bg-violet-50 px-2 py-1 text-xs text-violet-800" key={tag.id}>{tag.nameCn || tag.name}</span>)}</div>
+                                <p className="mt-3 text-xs font-semibold text-slate-500">正确答案</p>
+                                <p className="mt-1 break-words text-base font-bold text-rose-700">{question.answerText || "（未填写）"}</p>
+                                {question.animeTags.length > 0 && (
+                                  <div className="mt-3">
+                                    <p className="text-xs font-semibold text-slate-500">BGM 作品（动画/游戏）</p>
+                                    <div className="mt-1 flex flex-wrap gap-1.5">{question.animeTags.map((tag) => <span className="rounded-full bg-sky-50 px-2 py-1 text-xs text-sky-800" key={tag.id}>{bangumiTagDisplayName(tag)}</span>)}</div>
+                                  </div>
+                                )}
+                                {question.characterTags.length > 0 && (
+                                  <div className="mt-3">
+                                    <p className="text-xs font-semibold text-slate-500">画面角色</p>
+                                    <div className="mt-1 flex flex-wrap gap-1.5">{question.characterTags.map((tag) => <span className="rounded-full bg-violet-50 px-2 py-1 text-xs text-violet-800" key={tag.id}>{tag.nameCn || tag.name}</span>)}</div>
+                                  </div>
+                                )}
+                                <p className="mt-3 break-all font-mono text-[10px] text-slate-400">{question.id}</p>
+                                <div className="mt-4 grid grid-cols-2 gap-2">
+                                  <Button
+                                    className="h-9 px-2"
+                                    disabled={!detail.canEditQuestions || isBusy || isDirty || showAddQuestion || editingQuestionId !== null}
+                                    type="button"
+                                    variant="secondary"
+                                    onClick={() => {
+                                      if (questionEditorDirty && !canLeaveCurrentEdit()) return;
+                                      setShowAddQuestion(false);
+                                      setEditingQuestionId(question.id);
+                                      setError("");
+                                      setNotice("");
+                                    }}
+                                  >
+                                    {editingQuestionId === question.id ? "正在编辑" : "编辑本题"}
+                                  </Button>
+                                  <Button
+                                    className="h-9 border-rose-200 px-2 text-rose-700 hover:bg-rose-50"
+                                    disabled={!detail.canEditQuestions || detail.questions.length <= 1 || isBusy || isDirty || showAddQuestion || editingQuestionId !== null}
+                                    type="button"
+                                    variant="secondary"
+                                    onClick={() => removeQuestion(question)}
+                                  >
+                                    {deletingQuestionId === question.id ? "删除中…" : "删除本题"}
+                                  </Button>
+                                  <Button className="h-9 px-2" disabled={!detail.canEditQuestions || question.orderIndex === 0 || isBusy || isDirty || showAddQuestion || editingQuestionId !== null} type="button" variant="secondary" onClick={() => moveQuestion(question, question.orderIndex - 1)}>上移</Button>
+                                  <Button className="h-9 px-2" disabled={!detail.canEditQuestions || question.orderIndex === detail.questions.length - 1 || isBusy || isDirty || showAddQuestion || editingQuestionId !== null} type="button" variant="secondary" onClick={() => moveQuestion(question, question.orderIndex + 1)}>下移</Button>
                                 </div>
-                              )}
-                              <p className="mt-3 break-all font-mono text-[10px] text-slate-400">{question.id}</p>
-                            </div>
-                          </article>
-                        ))}
-                      </div>
+                              </div>
+                            </article>
+                          ))}
+                        </div>
+                      )}
                     </div>
 
                     <div className="mt-6 rounded-lg border border-rose-200 bg-rose-50 p-4 sm:p-5">
                       <h3 className="text-lg font-bold text-rose-950">危险操作</h3>
                       {!detail.canDelete ? (
                         <p className="mt-2 text-sm leading-6 text-rose-900">
-                          当前不能删除：活动游戏引用 {detail.gameSessionCount}、已准备房间 {detail.preparedRoomCount}{detail.storageKind === "corrupt" ? "，且 manifest 已损坏" : ""}。历史归档是自包含快照，不会阻止删除；服务器不会绕过活动引用或完整性约束强制删除。
+                          当前不能删除：活动游戏引用 {detail.gameSessionCount}、已准备房间 {detail.preparedRoomCount}{detail.storageKind === "corrupt" ? "，且 manifest 已损坏" : detail.integrityIssues.length > 0 ? "，且存在需要先修复的存储一致性问题" : ""}。历史归档不会阻止删除；服务器不会绕过活动引用或完整性约束强制删除。
                         </p>
                       ) : !showDelete ? (
                         <div className="mt-3 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
                           <p className="text-sm leading-6 text-rose-900">删除会原子移除题库、题目索引、投稿记录和评分；只清理不再被其他题库引用的本项目 R2 图片。{detail.archivedGameCount > 0 ? ` ${detail.archivedGameCount} 条历史归档为自包含快照，将继续保留。` : ""}</p>
-                          <Button className="h-10 shrink-0 border-rose-300 text-rose-800 hover:bg-rose-100" disabled={isBusy || isDirty} type="button" variant="secondary" onClick={() => setShowDelete(true)}>准备删除</Button>
+                          <Button className="h-10 shrink-0 border-rose-300 text-rose-800 hover:bg-rose-100" disabled={isBusy || isDirty || hasOpenQuestionEditor} type="button" variant="secondary" onClick={() => setShowDelete(true)}>准备删除</Button>
                         </div>
                       ) : (
                         <div className="mt-4">

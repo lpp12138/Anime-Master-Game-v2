@@ -225,10 +225,16 @@ export type QuestionSet = {
   questions?: Question[];
 };
 
+export type BangumiSubjectType = 2 | 4;
+
+export type BangumiSubjectScope = "anime" | "game" | "all";
+
 export type BangumiAnimeTag = {
   id: number;
   name: string;
   nameCn: string | null;
+  /** Bangumi subject type (2=动画, 4=游戏)。旧数据可能缺失，搜索与规范化后应尽量携带。 */
+  subjectType?: BangumiSubjectType | null;
 };
 
 export type BangumiCharacterTag = {
@@ -486,6 +492,7 @@ export type DbQuestionSet = {
   community_submission_id?: string | null;
   community_submission_fingerprint?: string | null;
   community_collection_title?: string | null;
+  community_structure_edited?: number | boolean;
   created_at: string;
   updated_at?: string | null;
 };

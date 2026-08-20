@@ -1,6 +1,6 @@
 "use client";
 
-import type { BangumiAnimeTag } from "../types/game";
+import type { BangumiAnimeTag, BangumiSubjectScope } from "../types/game";
 
 export type BangumiAnimeSearchResult = BangumiAnimeTag & {
   imageUrl: string | null;
@@ -86,18 +86,19 @@ function cachePromise<K, V>(
 export function searchBangumiAnime(
   queryValue: string,
   uploadKey: string,
+  scope: BangumiSubjectScope = "anime",
   signal?: AbortSignal,
 ): Promise<BangumiAnimeSearchResult[]> {
   const query = queryValue.trim();
   const normalizedUploadKey = uploadKey.trim();
-  const cacheKey = `${normalizedUploadKey}\u0000${query.normalize("NFKC").toLocaleLowerCase()}`;
+  const cacheKey = `${normalizedUploadKey}\u0000${scope}\u0000${query.normalize("NFKC").toLocaleLowerCase()}`;
   return cachePromise(subjectSearchCache, cacheKey, SUBJECT_SEARCH_CACHE_MAX_ENTRIES, async () => {
-    const response = await fetchWithTimeout(apiUrl(`/api/bangumi/subjects?query=${encodeURIComponent(query)}`), {
+    const response = await fetchWithTimeout(apiUrl(`/api/bangumi/subjects?query=${encodeURIComponent(query)}&scope=${encodeURIComponent(scope)}`), {
       headers: requestHeaders(normalizedUploadKey),
     }, signal);
     const payload = await readJsonResponse<{ results?: BangumiAnimeSearchResult[] }>(
       response,
-      "番剧搜索失败，请稍后重试。",
+      "作品搜索失败，请稍后重试。",
     );
     return Array.isArray(payload.results) ? payload.results : [];
   });

@@ -60,23 +60,54 @@ globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
     return new Response(null, { status: 302, headers: { location: "https://example.com/private.png" } });
   }
   if (url.startsWith("https://api.bgm.tv/v0/search/subjects")) {
-    return new Response(JSON.stringify({ data: [{
+    let types: number[] = [2];
+    try {
+      const raw = init?.body ? await new Response(init.body).text() : "";
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed?.filter?.type)) types = parsed.filter.type.map(Number);
+    } catch {
+      // 读取失败时按动画范围处理，不影响断言。
+    }
+    const data = [{
       id: 2,
       type: 2,
       name: "AIR",
       name_cn: "青空",
       images: null,
       rating: { score: 7.4 },
-    }] }));
+    }];
+    if (types.includes(4)) {
+      data.push({
+        id: 104999,
+        type: 4,
+        name: "AIR 游戏",
+        name_cn: "青空（游戏）",
+        images: null,
+        rating: { score: 8.2 },
+      });
+    }
+    return new Response(JSON.stringify({ data }));
   }
   if (url === "https://api.bgm.tv/v0/subjects/2") {
     return new Response(JSON.stringify({ id: 2, type: 2, name: "AIR", name_cn: "青空" }));
+  }
+  if (url === "https://api.bgm.tv/v0/subjects/104999") {
+    return new Response(JSON.stringify({ id: 104999, type: 4, name: "AIR 游戏", name_cn: "青空（游戏）" }));
   }
   if (url === "https://api.bgm.tv/v0/subjects/2/characters") {
     return new Response(JSON.stringify([{
       id: 3,
       type: 1,
       name: "神尾観鈴",
+      relation: "主角",
+      images: null,
+    }]));
+  }
+  if (url === "https://api.bgm.tv/v0/subjects/104999/characters") {
+    return new Response(JSON.stringify([{
+      id: 5001,
+      type: 1,
+      name: "游戏角色",
       relation: "主角",
       images: null,
     }]));
@@ -365,8 +396,47 @@ test("Bangumi helper routes require the upload key and proxy normalized official
   }), env);
   assert.equal(searchResponse.status, 200);
   assert.deepEqual(await searchResponse.json(), {
-    results: [{ id: 2, name: "AIR", nameCn: "青空", imageUrl: null, date: null, score: 7.4 }],
+    results: [{ id: 2, name: "AIR", nameCn: "青空", subjectType: 2, imageUrl: null, date: null, score: 7.4 }],
   });
+  assert.equal(bangumiUpstreamRequestCount, before + 1);
+
+  // 同一关键词的 game 范围走独立的缓存键，需要重新访问上游。
+  const gameResponse = await worker.fetch(new Request("https://caicai.lpp.moe/api/bangumi/subjects?query=AIR&scope=game", {
+    headers: { "x-community-upload-key": UPLOAD_SECRET },
+  }), env);
+  assert.equal(gameResponse.status, 200);
+  assert.deepEqual(await gameResponse.json(), {
+    results: [{ id: 104999, name: "AIR 游戏", nameCn: "青空（游戏）", subjectType: 4, imageUrl: null, date: null, score: 8.2 }],
+  });
+
+  const allResponse = await worker.fetch(new Request("https://caicai.lpp.moe/api/bangumi/subjects?query=AIR&scope=all", {
+    headers: { "x-community-upload-key": UPLOAD_SECRET },
+  }), env);
+  assert.equal(allResponse.status, 200);
+  assert.deepEqual(await allResponse.json(), {
+    results: [
+      { id: 2, name: "AIR", nameCn: "青空", subjectType: 2, imageUrl: null, date: null, score: 7.4 },
+      { id: 104999, name: "AIR 游戏", nameCn: "青空（游戏）", subjectType: 4, imageUrl: null, date: null, score: 8.2 },
+    ],
+  });
+  assert.equal(bangumiUpstreamRequestCount, before + 3);
+
+  // 三个范围各自的缓存已生效，重复请求不再访问上游。
+  for (const scope of ["anime", "game", "all"]) {
+    const cached = await worker.fetch(new Request(
+      `https://caicai.lpp.moe/api/bangumi/subjects?query=AIR&scope=${scope}`,
+      { headers: { "x-community-upload-key": UPLOAD_SECRET } },
+    ), env);
+    assert.equal(cached.status, 200);
+  }
+  assert.equal(bangumiUpstreamRequestCount, before + 3);
+
+  const invalidScope = await worker.fetch(new Request("https://caicai.lpp.moe/api/bangumi/subjects?query=AIR&scope=book", {
+    headers: { "x-community-upload-key": UPLOAD_SECRET },
+  }), env);
+  assert.equal(invalidScope.status, 400);
+  assert.match(JSON.stringify(await invalidScope.json()), /搜索范围仅支持/);
+  assert.equal(bangumiUpstreamRequestCount, before + 3);
 
   const charactersResponse = await worker.fetch(new Request("https://caicai.lpp.moe/api/bangumi/subjects/2/characters", {
     headers: { "x-community-upload-key": UPLOAD_SECRET },
@@ -375,6 +445,51 @@ test("Bangumi helper routes require the upload key and proxy normalized official
   assert.deepEqual(await charactersResponse.json(), {
     characters: [{ id: 3, name: "神尾観鈴", relation: "主角", imageUrl: null }],
   });
+});
+
+test("Bangumi game subjects are canonicalized with subjectType 4 and their own official casts", async () => {
+  const { db, env } = createTestEnv();
+  const uploadResponse = await worker.fetch(uploadRequest(ONE_PIXEL_PNG), env);
+  assert.equal(uploadResponse.status, 200);
+  const uploaded = await uploadResponse.json() as { key: string };
+
+  const response = await worker.fetch(finalizeRequest({
+    title: "游戏题库",
+    playerId: "game-player",
+    nickname: "游戏测试者",
+    questions: [{
+      r2Key: uploaded.key,
+      labelText: "AIR 游戏",
+      animeTags: [{ id: 104999, name: "伪造游戏名", nameCn: null, subjectType: 4 }],
+      characterTags: [{ id: 5001, subjectId: 104999, name: "伪造角色名", nameCn: null, relation: "客串" }],
+    }],
+  }), env);
+  assert.equal(response.status, 200, await response.clone().text());
+  const result = await response.json() as { id: string };
+
+  const indexed = db.sqlite.prepare("SELECT * FROM question_image_index WHERE question_set_id=?").get(result.id) as Record<string, unknown>;
+  assert.equal(indexed.anime_subject_id, 104999);
+  assert.deepEqual(JSON.parse(indexed.anime_tags_json as string), [
+    { id: 104999, name: "AIR 游戏", nameCn: "青空（游戏）", subjectType: 4 },
+  ]);
+  assert.deepEqual(JSON.parse(indexed.character_tags_json as string), [
+    { id: 5001, subjectId: 104999, name: "游戏角色", nameCn: null, relation: "主角" },
+  ]);
+
+  // 游戏条目不接受来自其他 subject 的角色。
+  const wrongCast = await worker.fetch(finalizeRequest({
+    title: "游戏题库错误角色",
+    playerId: "game-player",
+    nickname: "游戏测试者",
+    questions: [{
+      r2Key: uploaded.key,
+      labelText: "AIR 游戏",
+      animeTags: [{ id: 104999, name: "AIR 游戏", nameCn: null, subjectType: 4 }],
+      characterTags: [{ id: 3, subjectId: 104999, name: "神尾観鈴", nameCn: null, relation: "主角" }],
+    }],
+  }), env);
+  assert.equal(wrongCast.status, 400);
+  assert.match(JSON.stringify(await wrongCast.json()), /不属于所选 Bangumi 作品/);
 });
 
 test("homepage screenshot upload rejects forged and oversized image dimensions", async () => {
@@ -429,7 +544,7 @@ test("browser-style WebP uploads can be finalized as a public manifest question 
   assert.equal(indexed.image_url, uploaded.url);
   assert.equal(indexed.answer_text, "测试答案");
   assert.equal(indexed.anime_subject_id, 2);
-  assert.deepEqual(JSON.parse(indexed.anime_tags_json as string), [{ id: 2, name: "AIR", nameCn: "青空" }]);
+  assert.deepEqual(JSON.parse(indexed.anime_tags_json as string), [{ id: 2, name: "AIR", nameCn: "青空", subjectType: 2 }]);
   assert.deepEqual(JSON.parse(indexed.character_tags_json as string), [{ id: 3, subjectId: 2, name: "神尾観鈴", nameCn: null, relation: "主角" }]);
   const characterIndexed = db.sqlite.prepare(`
     SELECT question_id
@@ -790,7 +905,7 @@ test("question-set finalization enforces count, label, and request-body limits",
     }],
   }), env);
   assert.equal(unrelatedCharacter.status, 400);
-  assert.match(JSON.stringify(await unrelatedCharacter.json()), /属于.*番剧/);
+  assert.match(JSON.stringify(await unrelatedCharacter.json()), /属于.*作品/);
 
   const forgedMembership = await worker.fetch(finalizeRequest({
     ...base,
@@ -802,7 +917,7 @@ test("question-set finalization enforces count, label, and request-body limits",
     }],
   }), env);
   assert.equal(forgedMembership.status, 400);
-  assert.match(JSON.stringify(await forgedMembership.json()), /不属于.*Bangumi 番剧/);
+  assert.match(JSON.stringify(await forgedMembership.json()), /不属于.*Bangumi 作品/);
 
   const longLabel = await worker.fetch(finalizeRequest({
     ...base,
@@ -871,7 +986,7 @@ test("question-set admin APIs require the management key and keep answers out of
   assert.equal(detail.canDelete, true);
   assert.deepEqual(detail.integrityIssues, []);
   assert.equal(detail.questions[0].answerText, "管理接口秘密答案");
-  assert.deepEqual(detail.questions[0].animeTags, [{ id: 2, name: "AIR", nameCn: "青空" }]);
+  assert.deepEqual(detail.questions[0].animeTags, [{ id: 2, name: "AIR", nameCn: "青空", subjectType: 2 }]);
   assert.deepEqual(detail.questions[0].characterTags, [{ id: 3, subjectId: 2, name: "神尾観鈴", nameCn: null, relation: "主角" }]);
 });
 
@@ -1091,6 +1206,723 @@ test("question-set admin metadata updates use CAS and keep canonical collection 
   assert.equal(historicalUpdate.status, 200, await historicalUpdate.clone().text());
   const historical = await historicalUpdate.json() as { isCanonicalCollection: boolean };
   assert.equal(historical.isCanonicalCollection, false);
+});
+
+test("question-set admin supports manifest question image CRUD, replacement, and ordering", async () => {
+  const { db, env, objects } = createTestEnv();
+  const uploaded = [] as Array<{ key: string; url: string }>;
+  for (const [bytes, contentType] of [
+    [ONE_PIXEL_PNG, "image/png"],
+    [ONE_PIXEL_WEBP, "image/webp"],
+    [ONE_PIXEL_PNG, "image/png"],
+    [ONE_PIXEL_WEBP, "image/webp"],
+  ] as const) {
+    const response = await worker.fetch(uploadRequest(bytes, UPLOAD_SECRET, contentType), env);
+    assert.equal(response.status, 200, await response.clone().text());
+    uploaded.push(await response.json() as { key: string; url: string });
+  }
+  const finalizeResponse = await worker.fetch(finalizeRequest({
+    submissionId: "admin-question-crud-submission",
+    title: "单题 CRUD 题库",
+    playerId: "admin-question-player",
+    nickname: "单题管理员",
+    questions: [
+      { r2Key: uploaded[0].key, labelText: "第一题" },
+      { r2Key: uploaded[1].key, labelText: "第二题" },
+    ],
+  }), env);
+  assert.equal(finalizeResponse.status, 200, await finalizeResponse.clone().text());
+  const created = await finalizeResponse.json() as { id: string };
+  let detailResponse = await worker.fetch(questionSetAdminRequest(`/api/admin/question-sets/${created.id}`), env);
+  let detail = await detailResponse.json() as {
+    updatedAt: string;
+    questions: Array<{ id: string; answerText: string; orderIndex: number; animeTags: unknown[]; characterTags: unknown[] }>;
+    isCanonicalCollection: boolean;
+    isStructureEdited: boolean;
+    imageCount: number;
+  };
+  const firstQuestionId = detail.questions[0].id;
+  const secondQuestionId = detail.questions[1].id;
+
+  const unauthorizedQuestion = await worker.fetch(questionSetAdminRequest(
+    `/api/admin/question-sets/${created.id}/questions/${firstQuestionId}`,
+    { key: null },
+  ), env);
+  assert.equal(unauthorizedQuestion.status, 401);
+  const questionRead = await worker.fetch(questionSetAdminRequest(
+    `/api/admin/question-sets/${created.id}/questions/${firstQuestionId}`,
+  ), env);
+  assert.equal(questionRead.status, 200, await questionRead.clone().text());
+  assert.equal((await questionRead.json() as { question: { answerText: string } }).question.answerText, "第一题");
+
+  const addResponse = await worker.fetch(questionSetAdminRequest(
+    `/api/admin/question-sets/${created.id}/questions`,
+    {
+      method: "POST",
+      body: {
+        r2Key: uploaded[2].key,
+        answerText: "新增第三题",
+        animeTags: [{ id: 2, name: "AIR", nameCn: "青空" }],
+        characterTags: [{ id: 3, subjectId: 2, name: "神尾観鈴", nameCn: null, relation: "主角" }],
+        expectedUpdatedAt: detail.updatedAt,
+      },
+    },
+  ), env);
+  assert.equal(addResponse.status, 200, await addResponse.clone().text());
+  let mutation = await addResponse.json() as {
+    questionSet: typeof detail;
+    imageCleanup: Record<string, number>;
+  };
+  detail = mutation.questionSet;
+  assert.equal(detail.imageCount, 3);
+  assert.equal(detail.questions.length, 3);
+  assert.equal(detail.isCanonicalCollection, false);
+  assert.equal(detail.isStructureEdited, true);
+  assert.deepEqual(mutation.imageCleanup, {
+    candidateCount: 0,
+    deletedCount: 0,
+    preservedSharedCount: 0,
+    pendingCount: 0,
+  });
+  const addedQuestion = detail.questions.find((question) => question.answerText === "新增第三题")!;
+  assert.deepEqual(addedQuestion.animeTags, [{ id: 2, name: "AIR", nameCn: "青空", subjectType: 2 }]);
+  assert.deepEqual(addedQuestion.characterTags, [{ id: 3, subjectId: 2, name: "神尾観鈴", nameCn: null, relation: "主角" }]);
+
+  const staleUpdate = await worker.fetch(questionSetAdminRequest(
+    `/api/admin/question-sets/${created.id}/questions/${firstQuestionId}`,
+    {
+      method: "PATCH",
+      body: {
+        answerText: "不应写入",
+        animeTags: [],
+        characterTags: [],
+        expectedUpdatedAt: "2026-01-01T00:00:00.000Z",
+      },
+    },
+  ), env);
+  assert.equal(staleUpdate.status, 409);
+
+  const updateResponse = await worker.fetch(questionSetAdminRequest(
+    `/api/admin/question-sets/${created.id}/questions/${addedQuestion.id}`,
+    {
+      method: "PATCH",
+      body: {
+        r2Key: uploaded[3].key,
+        answerText: "替换后的第三题",
+        animeTags: [],
+        characterTags: [],
+        expectedUpdatedAt: detail.updatedAt,
+      },
+    },
+  ), env);
+  assert.equal(updateResponse.status, 200, await updateResponse.clone().text());
+  mutation = await updateResponse.json() as typeof mutation;
+  detail = mutation.questionSet;
+  assert.deepEqual(mutation.imageCleanup, {
+    candidateCount: 1,
+    deletedCount: 1,
+    preservedSharedCount: 0,
+    pendingCount: 0,
+  });
+  assert.equal(objects.has(uploaded[2].key), false);
+  assert.equal(objects.has(uploaded[3].key), true);
+  const replacedQuestion = detail.questions.find((question) => question.id === addedQuestion.id)!;
+  assert.equal(replacedQuestion.answerText, "替换后的第三题");
+
+  const moveResponse = await worker.fetch(questionSetAdminRequest(
+    `/api/admin/question-sets/${created.id}/questions/${replacedQuestion.id}`,
+    {
+      method: "PATCH",
+      body: {
+        answerText: replacedQuestion.answerText,
+        animeTags: replacedQuestion.animeTags,
+        characterTags: replacedQuestion.characterTags,
+        orderIndex: 0,
+        expectedUpdatedAt: detail.updatedAt,
+      },
+    },
+  ), env);
+  assert.equal(moveResponse.status, 200, await moveResponse.clone().text());
+  mutation = await moveResponse.json() as typeof mutation;
+  detail = mutation.questionSet;
+  assert.deepEqual(detail.questions.map((question) => question.id), [replacedQuestion.id, firstQuestionId, secondQuestionId]);
+
+  const deleteResponse = await worker.fetch(questionSetAdminRequest(
+    `/api/admin/question-sets/${created.id}/questions/${secondQuestionId}`,
+    {
+      method: "DELETE",
+      body: { confirmQuestionId: secondQuestionId, expectedUpdatedAt: detail.updatedAt },
+    },
+  ), env);
+  assert.equal(deleteResponse.status, 200, await deleteResponse.clone().text());
+  mutation = await deleteResponse.json() as typeof mutation;
+  detail = mutation.questionSet;
+  assert.equal(detail.questions.length, 2);
+  assert.deepEqual(detail.questions.map((question, index) => [question.id, (question as { orderIndex?: number }).orderIndex ?? index]), [
+    [replacedQuestion.id, 0],
+    [firstQuestionId, 1],
+  ]);
+  assert.equal(objects.has(uploaded[1].key), false);
+
+  const stored = db.sqlite.prepare(`SELECT image_count,manifest_revision,community_collection_title,community_structure_edited
+    FROM question_sets WHERE id=?`).get(created.id) as Record<string, unknown>;
+  assert.equal(stored.image_count, 2);
+  assert.equal(stored.community_collection_title, null);
+  assert.equal(stored.community_structure_edited, 1);
+  assert.equal(Number(stored.manifest_revision) >= 4, true);
+  const manifest = decodeQuestionSetManifest(db.sqlite.prepare("SELECT * FROM question_sets WHERE id=?").get(created.id) as Record<string, unknown>);
+  assert.deepEqual(manifest?.map((question) => [question.id, question.order_index, question.label_text]), [
+    [replacedQuestion.id, 0, "替换后的第三题"],
+    [firstQuestionId, 1, "第一题"],
+  ]);
+  const indexed = db.sqlite.prepare(`SELECT question_id,order_index,answer_text FROM question_image_index
+    WHERE question_set_id=? ORDER BY order_index`).all(created.id) as Array<Record<string, unknown>>;
+  assert.deepEqual(indexed.map((row) => ({ ...row })), [
+    { question_id: replacedQuestion.id, order_index: 0, answer_text: "替换后的第三题" },
+    { question_id: firstQuestionId, order_index: 1, answer_text: "第一题" },
+  ]);
+});
+
+test("question-set admin refuses to delete the last individual question", async () => {
+  const { env } = createTestEnv();
+  const uploadResponse = await worker.fetch(uploadRequest(ONE_PIXEL_PNG), env);
+  const uploaded = await uploadResponse.json() as { key: string };
+  const finalizeResponse = await worker.fetch(finalizeRequest({
+    submissionId: "admin-last-question-submission",
+    title: "最后一题保护",
+    playerId: "last-question-player",
+    nickname: "单题管理员",
+    questions: [{ r2Key: uploaded.key, labelText: "唯一题" }],
+  }), env);
+  const created = await finalizeResponse.json() as { id: string };
+  const detailResponse = await worker.fetch(questionSetAdminRequest(`/api/admin/question-sets/${created.id}`), env);
+  const detail = await detailResponse.json() as { updatedAt: string; questions: Array<{ id: string }> };
+  const questionId = detail.questions[0].id;
+  const deleteResponse = await worker.fetch(questionSetAdminRequest(
+    `/api/admin/question-sets/${created.id}/questions/${questionId}`,
+    {
+      method: "DELETE",
+      body: { confirmQuestionId: questionId, expectedUpdatedAt: detail.updatedAt },
+    },
+  ), env);
+  assert.equal(deleteResponse.status, 409);
+  assert.match(JSON.stringify(await deleteResponse.json()), /至少需要保留 1 道题/);
+});
+
+test("question-set admin reorders legacy null-answer questions order-only and preserves label metadata", async () => {
+  const { db, env } = createTestEnv();
+  db.sqlite.prepare(`INSERT INTO question_sets
+    (id,title,created_by_player_id,is_public,image_count,created_at,updated_at)
+    VALUES (?,?,?,?,?,?,?)`)
+    .run("admin-legacy-null-answer", "旧版空答案题库", "legacy-owner", 0, 2, "2026-02-01T00:00:00.000Z", "2026-02-01T00:00:00.000Z");
+  db.sqlite.prepare(`INSERT INTO questions
+    (id,question_set_id,image_url,order_index,label_text,label_source,label_source_answer_id,label_updated_by_player_id,label_updated_at,created_at)
+    VALUES (?,?,?,?,?,?,?,?,?,?)`)
+    .run(
+      "legacy-null-question",
+      "admin-legacy-null-answer",
+      "https://example.com/null.webp",
+      0,
+      null,
+      "answer",
+      "legacy-source-answer",
+      "legacy-player",
+      "2026-02-01T01:00:00.000Z",
+      "2026-02-01T00:00:00.000Z",
+    );
+  db.sqlite.prepare(`INSERT INTO questions
+    (id,question_set_id,image_url,order_index,label_text,label_source,created_at)
+    VALUES (?,?,?,?,?,?,?)`)
+    .run(
+      "legacy-answered-question",
+      "admin-legacy-null-answer",
+      "https://example.com/answered.webp",
+      1,
+      "旧版已答题目",
+      "manual",
+      "2026-02-01T00:00:00.000Z",
+    );
+
+  const before = bangumiUpstreamRequestCount;
+  const detailResponse = await worker.fetch(questionSetAdminRequest("/api/admin/question-sets/admin-legacy-null-answer"), env);
+  assert.equal(detailResponse.status, 200, await detailResponse.clone().text());
+  const detail = await detailResponse.json() as {
+    updatedAt: string;
+    storageKind: string;
+    questions: Array<{ id: string; answerText: string | null; orderIndex: number }>;
+  };
+  assert.equal(detail.storageKind, "rows");
+  assert.equal(detail.questions[0].answerText, null);
+  assert.equal(detail.questions[0].id, "legacy-null-question");
+
+  // 纯调序：只提交顺序，不提交答案/标签，也不访问 Bangumi 上游。
+  const moveResponse = await worker.fetch(questionSetAdminRequest(
+    "/api/admin/question-sets/admin-legacy-null-answer/questions/legacy-null-question",
+    {
+      method: "PATCH",
+      body: { orderIndex: 1, expectedUpdatedAt: detail.updatedAt },
+    },
+  ), env);
+  assert.equal(moveResponse.status, 200, await moveResponse.clone().text());
+  const moved = await moveResponse.json() as {
+    questionSet: { updatedAt: string; questions: Array<{ id: string; orderIndex: number }> };
+  };
+  assert.deepEqual(moved.questionSet.questions.map((question) => [question.id, question.orderIndex]), [
+    ["legacy-answered-question", 0],
+    ["legacy-null-question", 1],
+  ]);
+  assert.equal(bangumiUpstreamRequestCount, before);
+
+  const stored = db.sqlite.prepare(`SELECT order_index,label_text,label_source,label_source_answer_id,label_updated_by_player_id,label_updated_at
+    FROM questions WHERE id='legacy-null-question'`).get() as Record<string, unknown>;
+  assert.deepEqual({ ...stored }, {
+    order_index: 1,
+    label_text: null,
+    label_source: "answer",
+    label_source_answer_id: "legacy-source-answer",
+    label_updated_by_player_id: "legacy-player",
+    label_updated_at: "2026-02-01T01:00:00.000Z",
+  });
+
+  // legacy 单题答案编辑仍可用：明确提交答案时才会改写 label 元数据。
+  const editResponse = await worker.fetch(questionSetAdminRequest(
+    "/api/admin/question-sets/admin-legacy-null-answer/questions/legacy-null-question",
+    {
+      method: "PATCH",
+      body: {
+        answerText: "补充答案",
+        animeTags: [],
+        characterTags: [],
+        expectedUpdatedAt: moved.questionSet.updatedAt,
+      },
+    },
+  ), env);
+  assert.equal(editResponse.status, 200, await editResponse.clone().text());
+  const edited = await editResponse.json() as { questionSet: { updatedAt: string } };
+  const editedStored = db.sqlite.prepare(`SELECT label_text,label_source,label_source_answer_id,label_updated_by_player_id
+    FROM questions WHERE id='legacy-null-question'`).get() as Record<string, unknown>;
+  assert.deepEqual({ ...editedStored }, {
+    label_text: "补充答案",
+    label_source: "manual",
+    label_source_answer_id: null,
+    label_updated_by_player_id: null,
+  });
+
+  // legacy 单题删除仍可用，且保留最后一题保护。
+  const deleteResponse = await worker.fetch(questionSetAdminRequest(
+    "/api/admin/question-sets/admin-legacy-null-answer/questions/legacy-answered-question",
+    {
+      method: "DELETE",
+      body: { confirmQuestionId: "legacy-answered-question", expectedUpdatedAt: edited.questionSet.updatedAt },
+    },
+  ), env);
+  assert.equal(deleteResponse.status, 200, await deleteResponse.clone().text());
+  const deleted = await deleteResponse.json() as { questionSet: { updatedAt: string; questions: Array<{ id: string }> } };
+  assert.deepEqual(deleted.questionSet.questions.map((question) => question.id), ["legacy-null-question"]);
+  const lastDelete = await worker.fetch(questionSetAdminRequest(
+    "/api/admin/question-sets/admin-legacy-null-answer/questions/legacy-null-question",
+    {
+      method: "DELETE",
+      body: { confirmQuestionId: "legacy-null-question", expectedUpdatedAt: deleted.questionSet.updatedAt },
+    },
+  ), env);
+  assert.equal(lastDelete.status, 409);
+  assert.match(JSON.stringify(await lastDelete.json()), /至少需要保留 1 道题/);
+  assert.equal(bangumiUpstreamRequestCount, before);
+});
+
+test("question-set admin fails closed on overlong stored image URLs instead of a D1 500", async () => {
+  const { db, env } = createTestEnv();
+  const overlongUrl = `https://example.com/${"x".repeat(2500)}.webp`;
+  db.sqlite.prepare(`INSERT INTO question_sets
+    (id,title,created_by_player_id,is_public,image_count,created_at,updated_at)
+    VALUES (?,?,?,?,?,?,?)`)
+    .run("admin-overlong-url-set", "超长图片地址题库", "legacy-owner", 0, 2, "2026-02-01T00:00:00.000Z", "2026-02-01T00:00:00.000Z");
+  db.sqlite.prepare(`INSERT INTO questions (id,question_set_id,image_url,order_index,label_text,created_at)
+    VALUES (?,?,?,?,?,?)`)
+    .run("overlong-question", "admin-overlong-url-set", overlongUrl, 0, "第一题", "2026-02-01T00:00:00.000Z");
+  db.sqlite.prepare(`INSERT INTO questions (id,question_set_id,image_url,order_index,label_text,created_at)
+    VALUES (?,?,?,?,?,?)`)
+    .run("normal-question", "admin-overlong-url-set", "https://example.com/normal.webp", 1, "第二题", "2026-02-01T00:00:00.000Z");
+  const uploadResponse = await worker.fetch(uploadRequest(ONE_PIXEL_PNG), env);
+  const uploaded = await uploadResponse.json() as { key: string };
+
+  const detailResponse = await worker.fetch(questionSetAdminRequest("/api/admin/question-sets/admin-overlong-url-set"), env);
+  assert.equal(detailResponse.status, 200, await detailResponse.clone().text());
+  const detail = await detailResponse.json() as { updatedAt: string; integrityIssues: string[] };
+  assert.match(detail.integrityIssues.join(" "), /第 1 题的图片地址超过 2048 字符上限/);
+
+  // 调序与新增都在单题 mutation 前以明确 409 拒绝，而不是落到 D1 CHECK 的 500。
+  for (const mutation of [
+    { method: "PATCH", path: "/api/admin/question-sets/admin-overlong-url-set/questions/normal-question", body: { orderIndex: 0, expectedUpdatedAt: detail.updatedAt } },
+    {
+      method: "POST",
+      path: "/api/admin/question-sets/admin-overlong-url-set/questions",
+      body: { r2Key: uploaded.key, answerText: "新增题", animeTags: [], characterTags: [], expectedUpdatedAt: detail.updatedAt },
+    },
+  ]) {
+    const response = await worker.fetch(questionSetAdminRequest(mutation.path, {
+      method: mutation.method as "PATCH" | "POST",
+      body: mutation.body,
+    }), env);
+    assert.equal(response.status, 409, mutation.path);
+    assert.match(JSON.stringify(await response.json()), /图片地址.*2048 字符上限/);
+  }
+  const unchanged = db.sqlite.prepare(`SELECT order_index FROM questions WHERE question_set_id=? ORDER BY order_index`)
+    .all("admin-overlong-url-set") as Array<{ order_index: number }>;
+  assert.deepEqual(unchanged.map((row) => row.order_index), [0, 1]);
+
+  // manifest 存储同样在重写索引前 fail-closed。
+  const manifest = encodeQuestionSetManifest([
+    {
+      id: "manifest-overlong",
+      questionSetId: "admin-overlong-manifest",
+      imageUrl: overlongUrl,
+      orderIndex: 0,
+      labelText: "超长题",
+      labelSource: "manual",
+      createdAt: "2026-02-01T00:00:00.000Z",
+    },
+    {
+      id: "manifest-normal",
+      questionSetId: "admin-overlong-manifest",
+      imageUrl: "https://example.com/normal.webp",
+      orderIndex: 1,
+      labelText: "正常题",
+      labelSource: "manual",
+      createdAt: "2026-02-01T00:00:00.000Z",
+    },
+  ]);
+  db.sqlite.prepare(`INSERT INTO question_sets
+    (id,title,created_by_player_id,is_public,image_count,manifest_version,manifest_revision,manifest_json,created_at,updated_at)
+    VALUES (?,?,?,?,?,?,?,?,?,?)`)
+    .run(
+      "admin-overlong-manifest",
+      "超长 manifest 题库",
+      "manifest-owner",
+      0,
+      2,
+      1,
+      0,
+      manifest,
+      "2026-02-01T00:00:00.000Z",
+      "2026-02-01T00:00:00.000Z",
+    );
+  const manifestDetailResponse = await worker.fetch(questionSetAdminRequest("/api/admin/question-sets/admin-overlong-manifest"), env);
+  const manifestDetail = await manifestDetailResponse.json() as { updatedAt: string; integrityIssues: string[] };
+  assert.match(manifestDetail.integrityIssues.join(" "), /第 1 题的图片地址超过 2048 字符上限/);
+  const manifestMoveResponse = await worker.fetch(questionSetAdminRequest(
+    "/api/admin/question-sets/admin-overlong-manifest/questions/manifest-normal",
+    { method: "PATCH", body: { orderIndex: 0, expectedUpdatedAt: manifestDetail.updatedAt } },
+  ), env);
+  assert.equal(manifestMoveResponse.status, 409);
+  assert.match(JSON.stringify(await manifestMoveResponse.json()), /图片地址.*2048 字符上限/);
+});
+
+test("question-set admin order-only PATCH reuses stored answer and tags without Bangumi upstream", async () => {
+  const { env } = createTestEnv();
+  const uploaded = [];
+  for (const [bytes, contentType] of [
+    [ONE_PIXEL_PNG, "image/png"],
+    [ONE_PIXEL_WEBP, "image/webp"],
+  ] as const) {
+    const response = await worker.fetch(uploadRequest(bytes, UPLOAD_SECRET, contentType), env);
+    assert.equal(response.status, 200, await response.clone().text());
+    uploaded.push(await response.json() as { key: string });
+  }
+  const finalizeResponse = await worker.fetch(finalizeRequest({
+    submissionId: "admin-order-only-submission",
+    title: "纯调序题库",
+    playerId: "admin-order-player",
+    nickname: "纯调序管理员",
+    questions: [
+      {
+        r2Key: uploaded[0].key,
+        labelText: "第一题",
+        animeTags: [{ id: 2, name: "AIR", nameCn: "青空" }],
+        characterTags: [{ id: 3, subjectId: 2, name: "神尾観鈴", nameCn: null, relation: "主角" }],
+      },
+      { r2Key: uploaded[1].key, labelText: "第二题" },
+    ],
+  }), env);
+  assert.equal(finalizeResponse.status, 200, await finalizeResponse.clone().text());
+  const created = await finalizeResponse.json() as { id: string };
+
+  const before = bangumiUpstreamRequestCount;
+  let detailResponse = await worker.fetch(questionSetAdminRequest(`/api/admin/question-sets/${created.id}`), env);
+  let detail = await detailResponse.json() as {
+    updatedAt: string;
+    questions: Array<{ id: string; answerText: string; animeTags: unknown[]; characterTags: unknown[] }>;
+  };
+  const firstQuestionId = detail.questions[0].id;
+  const secondQuestionId = detail.questions[1].id;
+  const firstTags = JSON.stringify({
+    a: detail.questions[0].animeTags,
+    c: detail.questions[0].characterTags,
+  });
+
+  // 纯调序：不提交答案与标签，服务端复用现有内容，不访问 Bangumi 上游。
+  const moveResponse = await worker.fetch(questionSetAdminRequest(
+    `/api/admin/question-sets/${created.id}/questions/${secondQuestionId}`,
+    { method: "PATCH", body: { orderIndex: 0, expectedUpdatedAt: detail.updatedAt } },
+  ), env);
+  assert.equal(moveResponse.status, 200, await moveResponse.clone().text());
+  const moved = await moveResponse.json() as { questionSet: typeof detail };
+  detail = moved.questionSet;
+  assert.deepEqual(detail.questions.map((question) => question.id), [secondQuestionId, firstQuestionId]);
+  assert.equal(detail.questions[1].answerText, "第一题");
+  assert.equal(JSON.stringify({ a: detail.questions[1].animeTags, c: detail.questions[1].characterTags }), firstTags);
+  assert.equal(bangumiUpstreamRequestCount, before);
+
+  // 提交与现有标签完全相同的完整载荷也不会触发上游规范化。
+  const noopResponse = await worker.fetch(questionSetAdminRequest(
+    `/api/admin/question-sets/${created.id}/questions/${firstQuestionId}`,
+    {
+      method: "PATCH",
+      body: {
+        answerText: "第一题",
+        animeTags: detail.questions[1].animeTags,
+        characterTags: detail.questions[1].characterTags,
+        expectedUpdatedAt: detail.updatedAt,
+      },
+    },
+  ), env);
+  assert.equal(noopResponse.status, 200, await noopResponse.clone().text());
+  assert.equal(bangumiUpstreamRequestCount, before);
+
+  // 标签一旦变化，仍必须经上游规范化，伪造名称会被覆盖。清空共享测试缓存，确保真正访问上游。
+  (globalThis.caches as unknown as { default: TestCache }).default.responses.clear();
+  const forgedResponse = await worker.fetch(questionSetAdminRequest(
+    `/api/admin/question-sets/${created.id}/questions/${firstQuestionId}`,
+    {
+      method: "PATCH",
+      body: {
+        answerText: "第一题",
+        animeTags: [{ id: 2, name: "伪造作品名", nameCn: "伪造中文名" }],
+        characterTags: [],
+        expectedUpdatedAt: detail.updatedAt,
+      },
+    },
+  ), env);
+  assert.equal(forgedResponse.status, 200, await forgedResponse.clone().text());
+  const forged = await forgedResponse.json() as {
+    questionSet: { questions: Array<{ id: string; animeTags: Array<{ id: number; name: string; nameCn: string }> }> };
+  };
+  const forgedQuestion = forged.questionSet.questions.find((question) => question.id === firstQuestionId)!;
+  assert.deepEqual(forgedQuestion.animeTags, [{ id: 2, name: "AIR", nameCn: "青空", subjectType: 2 }]);
+  assert.equal(bangumiUpstreamRequestCount, before + 1);
+});
+
+test("question-set admin enforces the 30-question ceiling when adding questions", async () => {
+  const { db, env } = createTestEnv();
+  const manifest = encodeQuestionSetManifest(Array.from({ length: 30 }, (_, index) => ({
+    id: `admin-30-question-${index}`,
+    questionSetId: "admin-30-set",
+    imageUrl: `https://example.com/${index}.webp`,
+    orderIndex: index,
+    labelText: `第 ${index + 1} 题`,
+    labelSource: "manual" as const,
+    createdAt: "2026-02-01T00:00:00.000Z",
+  })));
+  db.sqlite.prepare(`INSERT INTO question_sets
+    (id,title,created_by_player_id,is_public,image_count,manifest_version,manifest_revision,manifest_json,created_at,updated_at)
+    VALUES (?,?,?,?,?,?,?,?,?,?)`)
+    .run("admin-30-set", "30 题上限题库", "thirty-owner", 0, 30, 1, 0, manifest, "2026-02-01T00:00:00.000Z", "2026-02-01T00:00:00.000Z");
+  const uploadResponse = await worker.fetch(uploadRequest(ONE_PIXEL_PNG), env);
+  const uploaded = await uploadResponse.json() as { key: string };
+  const detailResponse = await worker.fetch(questionSetAdminRequest("/api/admin/question-sets/admin-30-set"), env);
+  const detail = await detailResponse.json() as { updatedAt: string; canEditQuestions: boolean };
+  assert.equal(detail.canEditQuestions, true);
+  const addResponse = await worker.fetch(questionSetAdminRequest(
+    "/api/admin/question-sets/admin-30-set/questions",
+    {
+      method: "POST",
+      body: { r2Key: uploaded.key, answerText: "第 31 题", animeTags: [], characterTags: [], expectedUpdatedAt: detail.updatedAt },
+    },
+  ), env);
+  assert.equal(addResponse.status, 409);
+  assert.match(JSON.stringify(await addResponse.json()), /30 题上限/);
+  const count = db.sqlite.prepare("SELECT image_count FROM question_sets WHERE id='admin-30-set'").get() as { image_count: number };
+  assert.equal(count.image_count, 30);
+});
+
+test("question-set admin refuses unsafe deletion of an oversized legacy question shape", async () => {
+  const { db, env } = createTestEnv();
+  const updatedAt = "2026-02-01T00:00:00.000Z";
+  db.sqlite.prepare(`INSERT INTO question_sets
+    (id,title,created_by_player_id,is_public,image_count,created_at,updated_at)
+    VALUES (?,?,?,?,?,?,?)`)
+    .run("admin-legacy-31-set", "异常 31 题 legacy", "legacy-owner", 0, 31, updatedAt, updatedAt);
+  const insertQuestion = db.sqlite.prepare(`INSERT INTO questions
+    (id,question_set_id,image_url,order_index,label_text,created_at) VALUES (?,?,?,?,?,?)`);
+  for (let index = 0; index < 31; index += 1) {
+    insertQuestion.run(
+      `legacy-31-question-${index}`,
+      "admin-legacy-31-set",
+      `https://example.com/legacy-${index}.webp`,
+      index,
+      `答案 ${index}`,
+      updatedAt,
+    );
+  }
+
+  const detailResponse = await worker.fetch(questionSetAdminRequest("/api/admin/question-sets/admin-legacy-31-set"), env);
+  assert.equal(detailResponse.status, 200);
+  const detail = await detailResponse.json() as { canDelete: boolean; canEditQuestions: boolean; updatedAt: string };
+  assert.equal(detail.canDelete, false);
+  assert.equal(detail.canEditQuestions, false);
+  const deleteResponse = await worker.fetch(questionSetAdminRequest("/api/admin/question-sets/admin-legacy-31-set", {
+    method: "DELETE",
+    body: { confirmQuestionSetId: "admin-legacy-31-set", expectedUpdatedAt: detail.updatedAt },
+  }), env);
+  assert.equal(deleteResponse.status, 409);
+  assert.match(JSON.stringify(await deleteResponse.json()), /存储数量或顺序不一致/);
+  assert.equal(db.sqlite.prepare("SELECT COUNT(*) count FROM question_sets WHERE id='admin-legacy-31-set'").get().count, 1);
+  assert.equal(db.sqlite.prepare("SELECT COUNT(*) count FROM questions WHERE question_set_id='admin-legacy-31-set'").get().count, 31);
+});
+
+test("question-set admin rejects missing, tampered, and non-homepage r2 keys", async () => {
+  const { db, env, objects } = createTestEnv();
+  const uploadResponse = await worker.fetch(uploadRequest(ONE_PIXEL_PNG), env);
+  const uploaded = await uploadResponse.json() as { key: string };
+  const finalizeResponse = await worker.fetch(finalizeRequest({
+    submissionId: "admin-r2-key-submission",
+    title: "r2 键校验题库",
+    playerId: "admin-r2-player",
+    nickname: "r2 管理员",
+    questions: [{ r2Key: uploaded.key, labelText: "唯一题" }],
+  }), env);
+  assert.equal(finalizeResponse.status, 200, await finalizeResponse.clone().text());
+  const created = await finalizeResponse.json() as { id: string };
+  const detailResponse = await worker.fetch(questionSetAdminRequest(`/api/admin/question-sets/${created.id}`), env);
+  const detail = await detailResponse.json() as { updatedAt: string; questions: Array<{ id: string }> };
+  const questionId = detail.questions[0].id;
+
+  // 对象不存在。
+  const missingResponse = await worker.fetch(questionSetAdminRequest(
+    `/api/admin/question-sets/${created.id}/questions`,
+    {
+      method: "POST",
+      body: {
+        r2Key: "question-images/community/2026/01/01/missing.png",
+        answerText: "新题",
+        animeTags: [],
+        characterTags: [],
+        expectedUpdatedAt: detail.updatedAt,
+      },
+    },
+  ), env);
+  assert.equal(missingResponse.status, 400);
+  assert.match(JSON.stringify(await missingResponse.json()), /不存在或未通过校验/);
+
+  // 路径穿越或错误前缀。
+  const tamperedResponse = await worker.fetch(questionSetAdminRequest(
+    `/api/admin/question-sets/${created.id}/questions`,
+    {
+      method: "POST",
+      body: {
+        r2Key: "question-images/community/../other.png",
+        answerText: "新题",
+        animeTags: [],
+        characterTags: [],
+        expectedUpdatedAt: detail.updatedAt,
+      },
+    },
+  ), env);
+  assert.equal(tamperedResponse.status, 400);
+  assert.match(JSON.stringify(await tamperedResponse.json()), /图片标识无效/);
+
+  // 对象存在但 uploadSource 不是 homepage-community，替换图片同样被拒绝且不落库。
+  const foreignKey = "question-images/community/2026/01/01/foreign.png";
+  objects.set(foreignKey, {
+    key: foreignKey,
+    version: "test-version",
+    size: ONE_PIXEL_PNG.byteLength,
+    etag: "test-etag",
+    httpEtag: '"test-etag"',
+    uploaded: new Date(),
+    checksums: {},
+    customMetadata: { uploadSource: "legacy-manual" },
+    httpMetadata: {},
+  } as R2Object);
+  const foreignResponse = await worker.fetch(questionSetAdminRequest(
+    `/api/admin/question-sets/${created.id}/questions/${questionId}`,
+    {
+      method: "PATCH",
+      body: {
+        r2Key: foreignKey,
+        answerText: "替换图答案",
+        animeTags: [],
+        characterTags: [],
+        expectedUpdatedAt: detail.updatedAt,
+      },
+    },
+  ), env);
+  assert.equal(foreignResponse.status, 400);
+  assert.match(JSON.stringify(await foreignResponse.json()), /不存在或未通过校验/);
+  const stored = db.sqlite.prepare(`SELECT image_url,answer_text FROM question_image_index WHERE question_id=?`)
+    .get(questionId) as Record<string, unknown>;
+  assert.equal(stored.image_url, `https://caicai.lpp.moe/api/r2-images/${uploaded.key}`);
+  assert.equal(stored.answer_text, "唯一题");
+});
+
+test("D1 0030 structure-edit migration upgrades the production schema transactionally", () => {
+  const sqlite = new DatabaseSync(":memory:");
+  applyMigrations(sqlite, "0029");
+  sqlite.prepare(`INSERT INTO question_sets
+    (id,title,created_by_player_id,is_public,image_count,community_submission_id,community_collection_title,created_at,updated_at)
+    VALUES (?,?,?,?,?,?,?,?,?)`)
+    .run(
+      "migration-0030-set",
+      "迁移前社区题库",
+      "migration-owner",
+      1,
+      1,
+      "migration-0030-submission",
+      "迁移前社区题库",
+      "2026-02-01T00:00:00.000Z",
+      "2026-02-01T00:00:00.000Z",
+    );
+  const migration = readFileSync(resolve(
+    import.meta.dirname,
+    "..",
+    "d1",
+    "migrations",
+    "0030_question_set_item_admin.sql",
+  ), "utf8");
+
+  // 失败回滚后列不存在，schema 版本不推进。
+  sqlite.exec("BEGIN IMMEDIATE");
+  try {
+    sqlite.exec(migration);
+    throw new Error("injected migration failure");
+  } catch {
+    sqlite.exec("ROLLBACK");
+  }
+  const afterRollback = sqlite.prepare(`SELECT COUNT(*) AS count FROM pragma_table_info('question_sets')
+    WHERE name='community_structure_edited'`).get() as { count: number };
+  assert.equal(afterRollback.count, 0);
+
+  // 正式应用后列存在、默认 0，且不触碰既有规范集合标题。
+  sqlite.exec(migration);
+  const column = sqlite.prepare(`SELECT name,type,"notnull" FROM pragma_table_info('question_sets')
+    WHERE name='community_structure_edited'`).get() as Record<string, unknown>;
+  assert.deepEqual({ ...column }, { name: "community_structure_edited", type: "INTEGER", notnull: 1 });
+  const existing = sqlite.prepare(`SELECT community_structure_edited,community_collection_title FROM question_sets
+    WHERE id='migration-0030-set'`).get() as Record<string, unknown>;
+  assert.deepEqual({ ...existing }, { community_structure_edited: 0, community_collection_title: "迁移前社区题库" });
+  sqlite.prepare(`INSERT INTO question_sets
+    (id,title,created_by_player_id,is_public,image_count,created_at,updated_at)
+    VALUES (?,?,?,?,?,?,?)`)
+    .run("migration-0030-fresh", "迁移后新题库", "migration-owner", 0, 0, "2026-02-02T00:00:00.000Z", "2026-02-02T00:00:00.000Z");
+  const fresh = sqlite.prepare("SELECT community_structure_edited FROM question_sets WHERE id='migration-0030-fresh'")
+    .get() as { community_structure_edited: number };
+  assert.equal(fresh.community_structure_edited, 0);
+  assert.throws(
+    () => sqlite.prepare("UPDATE question_sets SET community_structure_edited=2 WHERE id='migration-0030-set'").run(),
+    /CHECK constraint failed/,
+  );
+  sqlite.prepare("UPDATE question_sets SET community_structure_edited=1 WHERE id='migration-0030-set'").run();
 });
 
 test("D1 0029 admin integrity migration is transactional and idempotent", () => {

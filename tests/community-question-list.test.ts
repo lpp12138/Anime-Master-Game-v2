@@ -4,6 +4,7 @@ import test from "node:test";
 import {
   CREATION_TOOL_QUESTION_LIST_MAX_ITEMS,
   parseCreationToolQuestionList,
+  parseScreenshotLinkList,
 } from "../src/lib/creationToolQuestionList";
 
 test("creation-tool question lists accept JSONL copied from the screenshot picker", () => {
@@ -45,4 +46,35 @@ test("creation-tool question lists reject malformed, duplicate, and oversized in
     image_url: "https://example.com/image.jpg",
     label_text: "答案",
   })), /FanCaps.*Bangumi/);
+});
+
+test("screenshot link lists accept one URL per line with comments and whitespace", () => {
+  const links = parseScreenshotLinkList(`
+    # 截图直链
+    https://cdni.fancaps.net/file/fancaps-animeimages/1.jpg
+    https://lain.bgm.tv/pic/cover/l/00/00/2.jpg
+  `);
+  assert.deepEqual(links, [
+    "https://cdni.fancaps.net/file/fancaps-animeimages/1.jpg",
+    "https://lain.bgm.tv/pic/cover/l/00/00/2.jpg",
+  ]);
+});
+
+test("screenshot link lists reject empty, unsupported, duplicate, and oversized input", () => {
+  assert.throws(() => parseScreenshotLinkList("  \n# only comments\n"), /至少一个/);
+  assert.throws(() => parseScreenshotLinkList("https://example.com/a.jpg"), /FanCaps.*Bangumi/);
+  assert.throws(() => parseScreenshotLinkList("http://cdni.fancaps.net/a.jpg"), /FanCaps.*Bangumi/);
+  assert.throws(() => parseScreenshotLinkList("https://cdni.fancaps.net:8443/a.jpg"), /FanCaps.*Bangumi/);
+  assert.throws(() => parseScreenshotLinkList("https://user:password@lain.bgm.tv/a.jpg"), /FanCaps.*Bangumi/);
+  assert.throws(() => parseScreenshotLinkList(
+    "https://cdni.fancaps.net/a.jpg\nhttps://cdni.fancaps.net/a.jpg",
+  ), /重复/);
+  const tooMany = Array.from(
+    { length: CREATION_TOOL_QUESTION_LIST_MAX_ITEMS + 1 },
+    (_, index) => `https://cdni.fancaps.net/file/${index}.jpg`,
+  ).join("\n");
+  assert.throws(() => parseScreenshotLinkList(tooMany), /最多导入 30/);
+  assert.throws(() => parseScreenshotLinkList(
+    `https://cdni.fancaps.net/${"a".repeat(2048)}.jpg`,
+  ), /第 1 个链接/);
 });
