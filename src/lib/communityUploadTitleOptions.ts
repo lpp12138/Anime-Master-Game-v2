@@ -69,11 +69,3 @@ export function findAppendableQuestionSetByTitle(
   const matches = options.filter((option) => option.title === exactTitle);
   return matches.find((option) => option.isCanonicalCollection) ?? matches[0] ?? null;
 }
-
-/** Prefer the requested exact title, then the first available collection. */
-export function getDefaultAppendableQuestionSetId(
-  options: readonly AppendableQuestionSetOption[],
-  preferredTitle: string,
-): string {
-  return findAppendableQuestionSetByTitle(options, preferredTitle)?.id ?? options[0]?.id ?? "";
-}

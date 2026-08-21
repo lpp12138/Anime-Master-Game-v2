@@ -4,10 +4,10 @@ import test from "node:test";
 import {
   COMMUNITY_APPEND_MANIFEST_VERSION,
   findAppendableQuestionSetByTitle,
-  getDefaultAppendableQuestionSetId,
   isAppendableCommunityQuestionSet,
   toAppendableQuestionSetOptions,
 } from "../src/lib/communityUploadTitleOptions";
+import * as titleOptionsModule from "../src/lib/communityUploadTitleOptions";
 import type { AdminQuestionSetSummary } from "../src/lib/questionSetAdmin";
 
 function summary(overrides: Partial<AdminQuestionSetSummary>): AdminQuestionSetSummary {
@@ -93,13 +93,17 @@ test("exact-title lookup prefers the canonical ID and otherwise keeps exact matc
   assert.equal(findAppendableQuestionSetByTitle([], "AIR"), null);
 });
 
-test("default selection prefers 猜猜群题库, then the first existing set, then new", () => {
-  const options = toAppendableQuestionSetOptions([
-    summary({ id: "first", title: "其他题库" }),
-    summary({ id: "guess-detached", title: "猜猜群题库", isCanonicalCollection: false, isStructureEdited: true }),
-    summary({ id: "guess-group", title: "猜猜群题库" }),
-  ]);
-  assert.equal(getDefaultAppendableQuestionSetId(options, "猜猜群题库"), "guess-group");
-  assert.equal(getDefaultAppendableQuestionSetId(options, "不存在"), "first");
-  assert.equal(getDefaultAppendableQuestionSetId([], "猜猜群题库"), "");
+// 上传页不再提供任何默认选中：既不默认选中现有题库，也不默认进入新建模式，
+// 新建标题也没有默认名称。选项库只负责“可追加目标”的过滤与按 ID 查找，
+// 不得重新导出默认选择辅助函数。
+test("option helpers never compute a default selection", () => {
+  assert.deepEqual(
+    Object.keys(titleOptionsModule).sort(),
+    [
+      "COMMUNITY_APPEND_MANIFEST_VERSION",
+      "findAppendableQuestionSetByTitle",
+      "isAppendableCommunityQuestionSet",
+      "toAppendableQuestionSetOptions",
+    ],
+  );
 });

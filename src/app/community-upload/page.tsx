@@ -13,7 +13,6 @@ import {
 } from "@/lib/communityScreenshotUpload";
 import {
   findAppendableQuestionSetByTitle,
-  getDefaultAppendableQuestionSetId,
   toAppendableQuestionSetOptions,
   type AppendableQuestionSetOption,
 } from "@/lib/communityUploadTitleOptions";
@@ -33,7 +32,7 @@ import {
 } from "@/lib/router";
 import type { BangumiAnimeTag, BangumiCharacterTag } from "@/types/game";
 
-const DEFAULT_QUESTION_SET_TITLE = "猜猜群题库";
+const NEW_QUESTION_SET_MODE_VALUE = "__new_question_set__";
 const ACCEPTED_IMAGE_EXTENSION = /\.(?:jpe?g|png|webp|gif|avif)$/i;
 const ACCEPTED_IMAGE_TYPES = new Set(["image/jpeg", "image/png", "image/webp", "image/gif", "image/avif"]);
 
@@ -74,8 +73,9 @@ function revokeDraftPreview(draft: ScreenshotDraft) {
 export default function CommunityUploadPage() {
   const router = useRouter();
   const [uploadKey, setUploadKey] = useState("");
-  const [newTitle, setNewTitle] = useState(DEFAULT_QUESTION_SET_TITLE);
+  const [newTitle, setNewTitle] = useState("");
   const [selectedExistingSetId, setSelectedExistingSetId] = useState("");
+  const [isNewSetMode, setIsNewSetMode] = useState(false);
   const [existingSetOptions, setExistingSetOptions] = useState<AppendableQuestionSetOption[]>([]);
   const [existingSetsStatus, setExistingSetsStatus] = useState<"idle" | "loading" | "ready" | "error">("idle");
   const [existingSetsError, setExistingSetsError] = useState("");
@@ -98,7 +98,6 @@ export default function CommunityUploadPage() {
   const editorRef = useRef<HTMLElement>(null);
   const dragDepthRef = useRef(0);
   const draftsRef = useRef<ScreenshotDraft[]>([]);
-  const userChoseTitleRef = useRef(false);
   const submissionRef = useRef<{ id: string; signature: string } | null>(null);
   const uploadedKeysRef = useRef(new Map<string, string>());
   const operationAbortRef = useRef<AbortController | null>(null);
@@ -146,9 +145,9 @@ export default function CommunityUploadPage() {
     if (!key) {
       existingSetsAbortRef.current?.abort();
       existingSetsLoadedKeyRef.current = "";
-      userChoseTitleRef.current = false;
       setExistingSetOptions([]);
       setSelectedExistingSetId("");
+      setIsNewSetMode(false);
       setExistingSetsStatus("idle");
       setExistingSetsError("");
       return;
@@ -158,9 +157,9 @@ export default function CommunityUploadPage() {
     // 避免旧密钥的结果在防抖期间或快速改回原密钥后覆盖当前状态。
     existingSetsAbortRef.current?.abort();
     existingSetsLoadedKeyRef.current = "";
-    userChoseTitleRef.current = false;
     setExistingSetOptions([]);
     setSelectedExistingSetId("");
+    setIsNewSetMode(false);
     setExistingSetsStatus("idle");
     setExistingSetsError("");
     const timer = window.setTimeout(() => {
@@ -169,16 +168,14 @@ export default function CommunityUploadPage() {
     return () => window.clearTimeout(timer);
   }, [uploadKey]);
 
-  // 刷新后所选题库若已删除、改为私有或存储版本不兼容，回到新建模式并保留
-  // 自定义标题；人工结构编辑本身不再让题库从选项中消失。
+  // 刷新后所选题库若已删除、改为私有或存储版本不兼容，回到“未选择”状态
+  // （既不追加也不新建），并保留用户已填写的新建标题；人工结构编辑本身
+  // 不会让题库从选项中消失。
   useEffect(() => {
     if (!selectedExistingSetId) return;
     if (existingSetOptions.some((option) => option.id === selectedExistingSetId)) return;
-    if (!userChoseTitleRef.current) {
-      applyDefaultTitleSelection(existingSetOptions);
-    } else {
-      setSelectedExistingSetId("");
-    }
+    setSelectedExistingSetId("");
+    setIsNewSetMode(false);
   }, [existingSetOptions, selectedExistingSetId]);
 
   useEffect(() => {
@@ -277,10 +274,10 @@ export default function CommunityUploadPage() {
       if (controller.signal.aborted) return;
       let items = page.items;
       let options = toAppendableQuestionSetOptions(items);
-      // “猜猜群题库”即使不在最近更新的首 50 项中，也应能成为默认选项。
-      if (page.hasMore && !findAppendableQuestionSetByTitle(options, DEFAULT_QUESTION_SET_TITLE)) {
+      // “猜猜群题库”即使不在最近更新的首 50 项中，也并入选项，方便用户从下拉框选择。
+      if (page.hasMore && !findAppendableQuestionSetByTitle(options, "猜猜群题库")) {
         const preferredPage = await listAdminQuestionSets(
-          { search: DEFAULT_QUESTION_SET_TITLE, visibility: "public", source: "all", limit: 50, offset: 0 },
+          { search: "猜猜群题库", visibility: "public", source: "all", limit: 50, offset: 0 },
           normalizedKey,
           controller.signal,
         );
@@ -292,10 +289,6 @@ export default function CommunityUploadPage() {
       existingSetsLoadedKeyRef.current = normalizedKey;
       setExistingSetOptions(options);
       setExistingSetsStatus("ready");
-      // 密钥验证成功且用户尚未主动选择时应用默认选中：精确标题
-      // DEFAULT_QUESTION_SET_TITLE 优先，其次第一项现有可追加题库，
-      // 没有任何现有题库时才保持“新建题库”。用户主动选择后不再覆盖。
-      if (!userChoseTitleRef.current) applyDefaultTitleSelection(options);
     } catch (loadError) {
       if (controller.signal.aborted) return;
       existingSetsLoadedKeyRef.current = "";
@@ -304,14 +297,6 @@ export default function CommunityUploadPage() {
     } finally {
       if (existingSetsAbortRef.current === controller) existingSetsAbortRef.current = null;
     }
-  }
-
-  /**
-   * 默认选中逻辑：精确标题“猜猜群题库”优先；不存在时选第一项现有可追加题库；
-   * 没有任何现有题库时落到“新建题库”。
-   */
-  function applyDefaultTitleSelection(options: AppendableQuestionSetOption[]) {
-    setSelectedExistingSetId(getDefaultAppendableQuestionSetId(options, DEFAULT_QUESTION_SET_TITLE));
   }
 
   function focusEditorForDraft(id: string) {
@@ -699,9 +684,10 @@ export default function CommunityUploadPage() {
     setError("");
     setSuccess(null);
 
-    const normalizedTitle = selectedExistingSetId
-      ? selectedExistingSet?.title ?? ""
-      : newTitle.trim();
+    const isNewSetModeActive = isNewSetMode && !selectedExistingSetId;
+    const normalizedTitle = isNewSetModeActive
+      ? newTitle.trim()
+      : selectedExistingSet?.title ?? "";
     // 只有用户在下拉框明确选择现有题库时才绑定目标 ID。新建模式继续使用旧版
     // 同标题规范集合语义，避免异步列表刷新改变一次投稿的幂等目标。
     const targetQuestionSetId = selectedExistingSet?.id;
@@ -710,10 +696,13 @@ export default function CommunityUploadPage() {
     if (!normalizedUploadKey) return setError("请输入上传密钥。");
     if (!normalizedNickname) return setError("请输入上传者昵称。");
     if (normalizedNickname.length > 20) return setError("上传者昵称最多 20 个字符。");
+    if (!selectedExistingSetId && !isNewSetModeActive) {
+      return setError("请选择题库：可追加到现有题库，或选择“新建题库”并填写标题。");
+    }
     if (selectedExistingSetId && !selectedExistingSet) {
       return setError("所选的现有题库已不可追加，请重新选择或改为新建题库。");
     }
-    if (!normalizedTitle) return setError(selectedExistingSetId ? "请选择要追加的现有题库。" : "请输入题库标题。");
+    if (!normalizedTitle) return setError("请输入题库标题。");
     if (normalizedTitle.length > 80) return setError("题库标题最多 80 个字符。");
     if (description.trim().length > 300) return setError("题库说明最多 300 个字符。");
     if (drafts.length === 0) return setError("请选择至少一张截图。");
@@ -801,9 +790,9 @@ export default function CommunityUploadPage() {
       setSuccess(result);
       setStatus("");
       setUploadKey("");
-      setNewTitle(DEFAULT_QUESTION_SET_TITLE);
+      setNewTitle("");
       setSelectedExistingSetId("");
-      userChoseTitleRef.current = false;
+      setIsNewSetMode(false);
       existingSetsLoadedKeyRef.current = "";
       setDescription("");
       setQuestionListText("");
@@ -878,7 +867,7 @@ export default function CommunityUploadPage() {
                 <h2 className="text-lg font-bold text-slate-950" id="upload-settings-title">题库与上传设置</h2>
                 <p className="mt-1 text-xs leading-5 text-slate-500">密钥只通过请求头发送，不会保存到浏览器或写入图片。</p>
               </div>
-              <span className="text-xs text-slate-500">默认标题：{DEFAULT_QUESTION_SET_TITLE}</span>
+              <span className="text-xs text-slate-500">默认不选择题库：请从下拉框明确选择现有题库或新建题库</span>
             </div>
             <div className="grid gap-4 md:grid-cols-2">
               <label className="block md:col-span-2">
@@ -913,15 +902,22 @@ export default function CommunityUploadPage() {
                     aria-label="题库标题：新建或选择现有题库"
                     className="h-11 min-w-0 flex-1 rounded-md border border-[var(--line)] bg-white px-3 text-sm outline-none transition focus:border-[var(--primary)] focus:ring-4 focus:ring-rose-100 disabled:bg-slate-100"
                     disabled={isLocked}
-                    value={selectedExistingSetId}
+                    value={isNewSetMode ? NEW_QUESTION_SET_MODE_VALUE : selectedExistingSetId}
                     onChange={(event) => {
-                      userChoseTitleRef.current = true;
-                      setSelectedExistingSetId(event.target.value);
+                      const value = event.target.value;
+                      if (value === NEW_QUESTION_SET_MODE_VALUE) {
+                        setSelectedExistingSetId("");
+                        setIsNewSetMode(true);
+                      } else {
+                        setIsNewSetMode(false);
+                        setSelectedExistingSetId(value);
+                      }
                     }}
                   >
                     {isKeyVerified ? (
                       <>
-                        <option value="">＋ 新建题库（自定义标题）</option>
+                        <option value="">— 请选择题库 —</option>
+                        <option value={NEW_QUESTION_SET_MODE_VALUE}>＋ 新建题库（自定义标题）</option>
                         {existingSetOptions.length > 0 ? (
                           <optgroup label="追加到现有题库">
                             {existingSetOptions.map((option) => (
@@ -945,18 +941,15 @@ export default function CommunityUploadPage() {
                     {existingSetsStatus === "loading" ? "加载中…" : isKeyVerified ? "刷新" : "验证"}
                   </button>
                 </div>
-                {isKeyVerified && selectedExistingSetId === "" ? (
+                {isKeyVerified && isNewSetMode ? (
                   <>
                     <input
                       className="h-11 w-full rounded-md border border-[var(--line)] px-3 outline-none transition focus:border-[var(--primary)] focus:ring-4 focus:ring-rose-100 disabled:bg-slate-100"
                       disabled={isLocked}
                       maxLength={80}
-                      placeholder="输入新题库的标题"
+                      placeholder="输入新题库的标题（默认留空）"
                       value={newTitle}
-                      onChange={(event) => {
-                        userChoseTitleRef.current = true;
-                        setNewTitle(event.target.value);
-                      }}
+                      onChange={(event) => setNewTitle(event.target.value)}
                     />
                     {existingSetsStatus === "ready" && matchedExistingSet ? (
                       <p className="text-xs leading-5 text-amber-700">
@@ -972,6 +965,8 @@ export default function CommunityUploadPage() {
                   <p className="rounded-md bg-sky-50 px-3 py-2 text-xs leading-5 text-slate-700">
                     已选择「{selectedExistingSet.title}」：本次提交会按题库 ID 追加到该公开社区题库（当前 {selectedExistingSet.imageCount} 题）{selectedExistingSet.isStructureEdited ? "；该题库虽已人工增删或调序，仍可继续追加" : ""}。
                   </p>
+                ) : isKeyVerified ? (
+                  <p className="text-xs leading-5 text-slate-500">尚未选择题库：可追加到现有公开社区题库，或选择“＋ 新建题库”并填写标题；提交前必须明确选择其一。</p>
                 ) : null}
                 {existingSetsStatus === "loading" ? (
                   <p className="text-xs text-slate-500">正在加载可继续追加的现有题库…</p>
