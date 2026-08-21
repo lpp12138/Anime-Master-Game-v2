@@ -34,6 +34,7 @@ npm run build
 | Worker 本地运行时、重连、并发、D1 热路径或额度模型 | 上述相关测试，再运行 `npm run test:authority-local-runtime` |
 | 公开房间创建、目录、实时人数或题目来源 | `npm run test:public-rooms`、`npm run test:question-set-creation-method`、`npm run test:authority-vnext`、`npm run test:authority-local-runtime` |
 | 首页密钥截图选择/拖放/粘贴、受限直链或 JSON/JSONL 导入、同标题追加、答案/标签、图片索引或投稿幂等 | `npm run test:community-screenshot-upload`、`npm run test:r2-upload`、`npm run test:question-set-creation-method` |
+| 社区图片 MD5 去重、R2 ETag 校验、同批/并发重复、管理端索引保留或 `0034_question_image_md5.sql` | `npm run test:community-screenshot-upload`、`npm run test:r2-upload`，并覆盖旧行 NULL 升级、CHECK、partial unique index 与失败回滚 |
 | 逐题 R18 标记的导入校验（`is_r18`/`isR18` 只接受 boolean、拒绝 null/冲突）、manifest/legacy/图片索引保存与保留、完整性报告 R18 mismatch 或 `0032_question_is_r18.sql` 迁移 | `npm run test:community-screenshot-upload`、`npm run test:community-question-list`、`npm run test:question-set-creation-method`，并按下方 D1 migration 规则覆盖升级与失败不推进 |
 | 题库管理鉴权、检索、详情答案、逐题增删改查/换图/调序、元数据更新、安全删除、D1 引用保护或 R2 引用清理 | `npm run test:community-screenshot-upload`、`npm run test:r2-upload`、`npm run test:question-set-creation-method` |
 | Bangumi 动画/游戏代理、规范化、范围缓存或上游边界 | `npm run test:bangumi-api`、`npm run test:community-screenshot-upload` |
@@ -73,7 +74,7 @@ npm run build
 
 ### `test:community-screenshot-upload`
 
-覆盖受保护投稿及题库管理 API，包括密钥拒绝、受限截图直链解析、动画/游戏标签规范化、列表边界、答案只在管理详情/单题响应返回、legacy/manifest/corrupt 存储检查、逐题新增/更新/换图/调序/删除、最后一题保护、社区题库累计超过 30 题（同标题追加与管理员逐题新增均不受 30 上限，但单次投稿仍最多 30 张、每局仍最多 30 题）、`updatedAt` 并发冲突、结构编辑后的规范集合解绑、活动游戏和准备房间写入拒绝、D1 级联，以及共享、损坏引用和 R2 删除失败时的安全清理行为。
+覆盖受保护投稿及题库管理 API，包括密钥拒绝、受限截图直链解析、动画/游戏标签规范化、列表边界、答案只在管理详情/单题响应返回、legacy/manifest/corrupt 存储检查、逐题新增/更新/换图/调序/删除、最后一题保护、社区题库累计超过 30 题（同标题追加与管理员逐题新增均不受 30 上限，但单次投稿仍最多 30 张、每局仍最多 30 题）、R2 单段 ETag/MD5 落库、已有图片提示、同投稿及并发 finalize 去重、管理重写保留 MD5、`updatedAt` 并发冲突、结构编辑后的规范集合解绑、活动游戏和准备房间写入拒绝、D1 级联，以及共享、损坏引用和 R2 删除失败时的安全清理行为。
 
 ### `test:authority-local-runtime`
 

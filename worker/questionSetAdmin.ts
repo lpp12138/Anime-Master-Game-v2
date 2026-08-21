@@ -47,6 +47,7 @@ type AdminQuestionIndexDbRow = {
   answer_text: string;
   order_index: number;
   is_r18: number | boolean | null;
+  image_md5: string | null;
   anime_subject_id: number | null;
   anime_tags_json: string;
   character_tags_json: string;
@@ -276,7 +277,7 @@ async function getLegacyQuestions(db: D1Database, questionSetId: string) {
 
 async function getIndexedQuestions(db: D1Database, questionSetId: string) {
   const result = await db.prepare(`
-    SELECT question_id, question_set_id, image_url, answer_text, order_index, is_r18,
+    SELECT question_id, question_set_id, image_url, answer_text, order_index, is_r18, image_md5,
            anime_subject_id, anime_tags_json, character_tags_json, created_at
     FROM question_image_index
     WHERE question_set_id = ?
@@ -519,6 +520,8 @@ type AdminQuestionWriteInput = {
   animeTags?: BangumiAnimeTag[];
   characterTags?: BangumiCharacterTag[];
   imageUrl?: string;
+  /** 服务端从对应 R2 对象 ETag 验证得到，不接受浏览器直接指定。 */
+  imageMd5?: string;
   /** 省略时服务端复用现有值（创建默认 false）。 */
   isR18?: boolean;
   expectedUpdatedAt: string;
@@ -639,6 +642,7 @@ function buildAdminQuestionIndexStatements(
   questions: DbQuestion[],
   indexedById: Map<string, AdminQuestionIndexDbRow>,
   tagOverrides: Map<string, AdminQuestionTags>,
+  imageMd5Overrides: Map<string, string | null>,
 ) {
   const guard = "SELECT 1 FROM question_sets WHERE id=? AND COALESCE(updated_at,created_at)=?";
   const statements: D1PreparedStatement[] = [
@@ -661,11 +665,14 @@ function buildAdminQuestionIndexStatements(
       : indexed?.anime_subject_id ?? null;
     const animeTagsJson = override ? JSON.stringify(override.animeTags) : indexed?.anime_tags_json ?? "[]";
     const characterTagsJson = override ? JSON.stringify(override.characterTags) : indexed?.character_tags_json ?? "[]";
+    const imageMd5 = imageMd5Overrides.has(question.id)
+      ? imageMd5Overrides.get(question.id) ?? null
+      : indexed?.image_md5 ?? null;
     statements.push(db.prepare(`INSERT INTO question_image_index (
         question_id,question_set_id,image_url,answer_text,order_index,
-        anime_subject_id,anime_tags_json,character_tags_json,created_at,is_r18
+        anime_subject_id,anime_tags_json,character_tags_json,created_at,is_r18,image_md5
       )
-      SELECT ?,?,?,?,?,?,?,?,?,?
+      SELECT ?,?,?,?,?,?,?,?,?,?,?
       WHERE EXISTS (${guard})`)
       .bind(
         question.id,
@@ -678,6 +685,7 @@ function buildAdminQuestionIndexStatements(
         characterTagsJson,
         indexed?.created_at ?? question.created_at,
         isDbTruthy(question.is_r18) ? 1 : 0,
+        imageMd5,
         questionSetId,
         updatedAt,
       ));
@@ -690,6 +698,7 @@ async function executeAdminQuestionMutation(
   state: AdminQuestionMutationState,
   questions: DbQuestion[],
   tagOverrides: Map<string, AdminQuestionTags>,
+  imageMd5Overrides: Map<string, string | null>,
   structuralChange: boolean,
 ): Promise<AdminQuestionSetDetail> {
   const currentUpdatedAt = state.row.updated_at ?? state.row.created_at;
@@ -778,9 +787,20 @@ async function executeAdminQuestionMutation(
     questions,
     state.indexedById,
     tagOverrides,
+    imageMd5Overrides,
   ));
 
-  const results = await db.batch(statements);
+  const results = await (async () => {
+    try {
+      return await db.batch(statements);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (/(?:question_image_index_md5_unique|question_image_index\.image_md5)/i.test(message)) {
+        throw new QuestionSetAdminError("该图片题库已有，请勿重复上传。", 409);
+      }
+      throw error;
+    }
+  })();
   const updatedRows = (results[0]?.results ?? []) as Array<{ id: string }>;
   if (updatedRows.length === 0) {
     const current = await getQuestionSetRow(db, state.row.id);
@@ -847,6 +867,7 @@ export async function createAdminQuestionSetQuestion(
     state,
     [...state.questions, question],
     tagOverrides,
+    new Map([[question.id, input.imageMd5 ?? null]]),
     true,
   );
   return { questionSet, removedImageUrls: [] };
@@ -911,7 +932,17 @@ export async function updateAdminQuestionSetQuestion(
   reordered.splice(orderIndex, 0, updatedQuestion);
   const questions = reordered.map((question, index) => ({ ...question, order_index: index }));
   const tagOverrides = tagsChanged ? new Map<string, AdminQuestionTags>([[questionId, tags]]) : new Map();
-  const questionSet = await executeAdminQuestionMutation(db, state, questions, tagOverrides, orderChanged);
+  const imageMd5Overrides = current.image_url === imageUrl
+    ? new Map<string, string | null>()
+    : new Map<string, string | null>([[questionId, input.imageMd5 ?? null]]);
+  const questionSet = await executeAdminQuestionMutation(
+    db,
+    state,
+    questions,
+    tagOverrides,
+    imageMd5Overrides,
+    orderChanged,
+  );
   return {
     questionSet,
     removedImageUrls: current.image_url === imageUrl ? [] : [current.image_url],
@@ -943,7 +974,7 @@ export async function deleteAdminQuestionSetQuestion(
   const questions = state.questions
     .filter((question) => question.id !== questionId)
     .map((question, index) => ({ ...question, order_index: index }));
-  const questionSet = await executeAdminQuestionMutation(db, state, questions, new Map(), true);
+  const questionSet = await executeAdminQuestionMutation(db, state, questions, new Map(), new Map(), true);
   return { questionSet, removedImageUrls: [current.image_url] };
 }
 

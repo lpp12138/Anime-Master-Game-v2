@@ -758,7 +758,17 @@ export default function CommunityUploadPage() {
         if (!r2Key) {
           if (!draft.file) throw new Error(`第 ${index + 1} 张导入图片缺少可复用的服务器对象，请重新导入题单。`);
           setStatus(`正在压缩并上传第 ${index + 1} / ${drafts.length} 张：${draft.displayName}`);
-          const uploaded = await uploadCommunityScreenshot(draft.file, normalizedUploadKey, controller.signal);
+          let uploaded: Awaited<ReturnType<typeof uploadCommunityScreenshot>>;
+          try {
+            uploaded = await uploadCommunityScreenshot(draft.file, normalizedUploadKey, controller.signal);
+          } catch (uploadError) {
+            const message = uploadError instanceof Error ? uploadError.message : "图片上传失败。";
+            if (message.includes("题库已有")) {
+              focusEditorForDraft(draft.id);
+              throw new Error(`第 ${index + 1} 张“${draft.displayName}”：${message}`);
+            }
+            throw uploadError;
+          }
           r2Key = uploaded.key;
           uploadedKeysRef.current.set(draft.id, r2Key);
           hasStoredUploads = true;

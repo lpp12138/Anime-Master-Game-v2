@@ -13,6 +13,7 @@ export type CommunityScreenshotUploadResult = {
   width: number;
   height: number;
   size: number;
+  imageMd5: string;
 };
 
 export type CommunityRemoteScreenshotUploadResult = CommunityScreenshotUploadResult & {
@@ -197,7 +198,15 @@ export async function uploadCommunityScreenshot(
     response,
     `${file.name} 上传失败，请稍后重试。`,
   );
-  if (!result.key || !result.url || !result.width || !result.height || typeof result.size !== "number") {
+  if (
+    !result.key
+    || !result.url
+    || !result.width
+    || !result.height
+    || typeof result.size !== "number"
+    || typeof result.imageMd5 !== "string"
+    || !/^[0-9a-f]{32}$/.test(result.imageMd5)
+  ) {
     throw new Error("图片服务返回了无效结果。");
   }
   return result as CommunityScreenshotUploadResult;

@@ -1852,7 +1852,11 @@ export type QuestionImportItem = {
   animeTags?: BangumiAnimeTag[];
   characterTags?: BangumiCharacterTag[];
   isR18?: boolean;
+  /** 服务端从单段 R2 对象 ETag 验证得到；仅社区题库索引会持久化。 */
+  imageMd5?: string;
 };
+
+const COMMUNITY_IMAGE_MD5_PATTERN = /^[0-9a-f]{32}$/;
 
 function isHttpImageUrl(value: string) {
   try {
@@ -1889,6 +1893,10 @@ function normalizeQuestionImportItems(items: QuestionImportItem[]) {
     // null/字符串/数字拒绝，两个字段同时存在且值冲突拒绝。
     const isR18 = parseImportedIsR18(item as unknown as Record<string, unknown>, `第 ${index + 1} 题`);
     const tags = normalizeBangumiQuestionTags(item.animeTags, item.characterTags);
+    const imageMd5 = item.imageMd5?.trim().toLowerCase();
+    if (imageMd5 !== undefined && !COMMUNITY_IMAGE_MD5_PATTERN.test(imageMd5)) {
+      throw new Error(`第 ${index + 1} 题的图片 MD5 无效。`);
+    }
     seenUrls.add(imageUrl);
     normalizedItems.push({
       imageUrl,
@@ -1896,6 +1904,7 @@ function normalizeQuestionImportItems(items: QuestionImportItem[]) {
       isR18,
       animeTags: tags.animeTags,
       characterTags: tags.characterTags,
+      ...(imageMd5 === undefined ? {} : { imageMd5 }),
     });
   }
 
@@ -2704,6 +2713,17 @@ export class HomepageCommunityQuestionSetConflictError extends Error {
   }
 }
 
+export class HomepageCommunityQuestionSetDuplicateImageError extends Error {
+  constructor() {
+    super("该图片题库已有，请勿重复上传。");
+    this.name = "HomepageCommunityQuestionSetDuplicateImageError";
+  }
+}
+
+function isCommunityImageMd5UniqueError(error: { message?: string } | null | undefined) {
+  return Boolean(error?.message && /(?:question_image_index_md5_unique|question_image_index\.image_md5)/i.test(error.message));
+}
+
 type CommunityQuestionSetSubmissionRow = {
   submission_id: string;
   submission_fingerprint: string;
@@ -2855,6 +2875,7 @@ function buildHomepageImageIndexRows(questions: DbQuestion[], questionItems: Que
     answer_text: question.label_text!,
     order_index: question.order_index,
     is_r18: question.is_r18 === true ? 1 : 0,
+    image_md5: questionItems[index].imageMd5 ?? null,
     anime_subject_id: questionItems[index].animeTags?.[0]?.id ?? null,
     anime_tags_json: questionItems[index].animeTags ?? [],
     character_tags_json: questionItems[index].characterTags ?? [],
@@ -2923,9 +2944,9 @@ async function appendHomepageCommunityQuestions(params: {
     ...imageIndexRows.map((row) => ({
       query: `INSERT INTO question_image_index (
           question_id, question_set_id, image_url, answer_text, order_index,
-          anime_subject_id, anime_tags_json, character_tags_json, created_at, is_r18
+          anime_subject_id, anime_tags_json, character_tags_json, created_at, is_r18, image_md5
         )
-        SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+        SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
         WHERE EXISTS (${guardQuery})
         RETURNING *`,
       bindings: [
@@ -2939,6 +2960,7 @@ async function appendHomepageCommunityQuestions(params: {
         JSON.stringify(row.character_tags_json),
         row.created_at,
         row.is_r18,
+        row.image_md5,
         ...guardBindings,
       ],
     })),
@@ -2961,6 +2983,9 @@ async function appendHomepageCommunityQuestions(params: {
       ],
     },
   ]);
+  if (error?.code === "23505" && isCommunityImageMd5UniqueError(error)) {
+    throw new HomepageCommunityQuestionSetDuplicateImageError();
+  }
   if (error?.code === "23505") return null;
   if (error) throw new HomepageCommunityQuestionSetPersistenceError(error.message);
 
@@ -3023,6 +3048,9 @@ export async function createHomepageCommunityQuestionSet(params: {
   const questionItems = normalizeQuestionImportItems(params.questions);
   if (questionItems.length !== params.questions.length) throw new Error("题库中包含无效或重复的图片。");
   if (questionItems.some((question) => !question.labelText)) throw new Error("每张截图都必须填写正确答案。");
+  if (questionItems.some((question) => !question.imageMd5)) {
+    throw new Error("每张社区截图都必须具有服务端验证的图片 MD5。");
+  }
 
   for (let attempt = 0; attempt < 8; attempt += 1) {
     const priorSubmission = await getHomepageCommunityQuestionSetBySubmissionId(submissionId);
@@ -3087,6 +3115,9 @@ export async function createHomepageCommunityQuestionSet(params: {
     ]);
     const questionSet = insertedRows?.[0]?.[0] as DbQuestionSet | undefined;
     const insertedSubmission = insertedRows?.[2]?.[0] as CommunityQuestionSetSubmissionRow | undefined;
+    if (error?.code === "23505" && isCommunityImageMd5UniqueError(error)) {
+      throw new HomepageCommunityQuestionSetDuplicateImageError();
+    }
     if (error?.code === "23505") continue;
     if (error || !questionSet || !insertedSubmission) {
       throw new HomepageCommunityQuestionSetPersistenceError(

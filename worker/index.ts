@@ -1706,6 +1706,14 @@ function buildR2ImageKey(request: Request, env: Env, fileNameOverride?: string, 
   return [prefix, normalizedCategory, datePath, `${id}-${fileName}`].filter(Boolean).join("/");
 }
 
+function getR2ObjectImageMd5(object: Pick<R2Object, "etag" | "httpEtag">) {
+  for (const candidate of [object.etag, object.httpEtag]) {
+    const normalized = candidate?.trim().replace(/^W\//i, "").replace(/^"|"$/g, "").toLowerCase();
+    if (normalized && /^[0-9a-f]{32}$/.test(normalized)) return normalized;
+  }
+  return null;
+}
+
 function getRequestContentLength(request: Request) {
   const value = request.headers.get("content-length");
   if (!value) {
@@ -1758,6 +1766,7 @@ async function putR2Image(
     publicId: key,
     size: object.size,
     etag: object.httpEtag,
+    imageMd5: getR2ObjectImageMd5(object),
   };
 }
 
@@ -2203,6 +2212,7 @@ async function getAdminQuestionWriteInput(
   cache: Cache,
   options: {
     requireImage: boolean;
+    excludeQuestionIdFromImageDedup?: string;
     loadCurrentTags?: () => Promise<{ animeTags: BangumiAnimeTag[]; characterTags: BangumiCharacterTag[] }>;
   },
 ) {
@@ -2245,8 +2255,9 @@ async function getAdminQuestionWriteInput(
   const r2Key = typeof payload.r2Key === "string" ? payload.r2Key.trim() : "";
   if (options.requireImage && !r2Key) throw new QuestionSetAdminError("请选择要新增的截图。", 400);
   let imageUrl = "";
+  let imageMd5: string | undefined;
   if (r2Key) {
-    if (!env.IMAGE_BUCKET) throw new QuestionSetAdminError("服务器图片存储尚未配置。", 500);
+    if (!env.IMAGE_BUCKET || !env.DB) throw new QuestionSetAdminError("服务器题库或图片存储尚未配置。", 500);
     const prefix = getR2ImagePrefix(env);
     const requiredKeyPrefix = [prefix, "community"].filter(Boolean).join("/") + "/";
     if (!r2Key.startsWith(requiredKeyPrefix) || r2Key.includes("..")) {
@@ -2256,6 +2267,12 @@ async function getAdminQuestionWriteInput(
     if (!object || object.customMetadata?.uploadSource !== "homepage-community") {
       throw new QuestionSetAdminError("服务器图片不存在或未通过校验，请重新上传。", 400);
     }
+    imageMd5 = getR2ObjectImageMd5(object) ?? undefined;
+    if (!imageMd5) throw new QuestionSetAdminError("服务器图片缺少有效 MD5，请重新上传。", 400);
+    const duplicate = await findCommunityImageMd5Duplicate(env.DB, [imageMd5], {
+      excludeQuestionId: options.excludeQuestionIdFromImageDedup,
+    });
+    if (duplicate) throw new QuestionSetAdminError(communityImageDuplicateMessage(duplicate), 409);
     imageUrl = getR2PublicUrl(request, env, r2Key);
   }
 
@@ -2296,6 +2313,7 @@ async function getAdminQuestionWriteInput(
     ...(canonicalAnimeTags === undefined ? {} : { animeTags: canonicalAnimeTags }),
     ...(canonicalCharacterTags === undefined ? {} : { characterTags: canonicalCharacterTags }),
     ...(imageUrl ? { imageUrl } : {}),
+    ...(imageMd5 ? { imageMd5 } : {}),
     ...(submittedR18 === undefined ? {} : { isR18: submittedR18 as boolean }),
     expectedUpdatedAt: payload.expectedUpdatedAt as string,
     ...(payload.orderIndex === undefined ? {} : { orderIndex: payload.orderIndex as number }),
@@ -2369,6 +2387,7 @@ async function handleQuestionSetAdminQuestionItem(
         questionId,
         await getAdminQuestionWriteInput(request, env, cache, {
           requireImage: false,
+          excludeQuestionIdFromImageDedup: questionId,
           loadCurrentTags: async () => {
             const current = await getAdminQuestionSetQuestion(env.DB, questionSetId, questionId);
             return {
@@ -2406,11 +2425,74 @@ async function handleQuestionSetAdminQuestionItem(
   }
 }
 
+type CommunityImageMd5DuplicateRow = {
+  question_id: string;
+  question_set_id: string;
+  question_set_title: string;
+  order_index: number;
+};
+
+async function findCommunityImageMd5Duplicate(
+  db: D1Database,
+  imageMd5s: string[],
+  options: { excludeQuestionId?: string } = {},
+) {
+  const uniqueMd5s = [...new Set(imageMd5s)];
+  if (uniqueMd5s.length === 0) return null;
+  const placeholders = uniqueMd5s.map(() => "?").join(",");
+  const excludeClause = options.excludeQuestionId ? "AND qi.question_id <> ?" : "";
+  const bindings = options.excludeQuestionId ? [...uniqueMd5s, options.excludeQuestionId] : uniqueMd5s;
+  return db.prepare(`
+    SELECT qi.question_id, qi.question_set_id, qs.title AS question_set_title, qi.order_index
+    FROM question_image_index qi
+    INNER JOIN question_sets qs ON qs.id = qi.question_set_id
+    WHERE qi.image_md5 IN (${placeholders})
+      ${excludeClause}
+    ORDER BY qs.is_public DESC, qi.created_at ASC, qi.question_id ASC
+    LIMIT 1
+  `).bind(...bindings).first<CommunityImageMd5DuplicateRow>();
+}
+
+function communityImageDuplicateMessage(duplicate?: CommunityImageMd5DuplicateRow | null) {
+  return duplicate
+    ? `该图片题库已有（《${duplicate.question_set_title}》第 ${duplicate.order_index + 1} 题），请勿重复上传。`
+    : "该图片题库已有，请勿重复上传。";
+}
+
+function communityImageDuplicateResponse(
+  duplicate: CommunityImageMd5DuplicateRow | null,
+  request: Request,
+  env: Env,
+) {
+  return json({
+    error: communityImageDuplicateMessage(duplicate),
+    code: "COMMUNITY_IMAGE_DUPLICATE",
+    ...(duplicate ? {
+      existing: {
+        questionId: duplicate.question_id,
+        questionSetId: duplicate.question_set_id,
+        questionSetTitle: duplicate.question_set_title,
+        orderIndex: duplicate.order_index,
+      },
+    } : {}),
+  }, { status: 409 }, request, env);
+}
+
+async function deleteRejectedCommunityUpload(env: Env, key: string) {
+  try {
+    await env.IMAGE_BUCKET?.delete(key);
+  } catch (error) {
+    // The daily 72-hour orphan reconciliation remains the fallback if an
+    // immediate duplicate-upload cleanup fails.
+    console.error("Duplicate community image cleanup failed", error);
+  }
+}
+
 async function handleCommunityScreenshotUpload(request: Request, env: Env) {
   const authError = await authorizeCommunityUpload(request, env);
   if (authError) return authError;
-  if (!env.IMAGE_BUCKET) {
-    return json({ error: "服务器图片存储尚未配置。" }, { status: 500 }, request, env);
+  if (!env.IMAGE_BUCKET || !env.DB) {
+    return json({ error: "服务器题库或图片存储尚未配置。" }, { status: 500 }, request, env);
   }
   if (!(request.headers.get("content-type") ?? "").toLowerCase().startsWith("image/")) {
     return json({ error: "只能上传图片文件。" }, { status: 415 }, request, env);
@@ -2462,6 +2544,23 @@ async function handleCommunityScreenshotUpload(request: Request, env: Env) {
     "community",
   );
   if (!uploaded.ok) return uploaded.response;
+  if (!uploaded.imageMd5) {
+    await deleteRejectedCommunityUpload(env, uploaded.key);
+    return json({ error: "图片 MD5 校验失败，请重新上传。" }, { status: 500 }, request, env);
+  }
+
+  let duplicate: CommunityImageMd5DuplicateRow | null;
+  try {
+    duplicate = await findCommunityImageMd5Duplicate(env.DB, [uploaded.imageMd5]);
+  } catch (error) {
+    await deleteRejectedCommunityUpload(env, uploaded.key);
+    console.error("Community image MD5 lookup failed", error);
+    return json({ error: "题库图片去重检查失败，请稍后重试。" }, { status: 500 }, request, env);
+  }
+  if (duplicate) {
+    await deleteRejectedCommunityUpload(env, uploaded.key);
+    return communityImageDuplicateResponse(duplicate, request, env);
+  }
 
   return json({
     key: uploaded.key,
@@ -2469,6 +2568,7 @@ async function handleCommunityScreenshotUpload(request: Request, env: Env) {
     width: image.width,
     height: image.height,
     size: uploaded.size,
+    imageMd5: uploaded.imageMd5,
   }, {}, request, env);
 }
 
@@ -2604,6 +2704,8 @@ type SubmittedCommunityQuestion = {
   isR18: boolean;
   animeTags: BangumiAnimeTag[];
   characterTags: BangumiCharacterTag[];
+  /** 仅由服务端从已验证 R2 对象 ETag 填入。 */
+  imageMd5?: string;
 };
 
 async function canonicalizeSubmittedBangumiTags<T extends Pick<SubmittedCommunityQuestion, "animeTags" | "characterTags">>(
@@ -2769,9 +2871,41 @@ async function handleCommunityQuestionSetCreate(request: Request, env: Env, cach
     return json({ error: "部分服务器图片不存在或未通过校验，请重新上传。" }, { status: 400 }, request, env);
   }
 
+  const imageMd5s: string[] = [];
+  for (const object of storedObjects) {
+    const imageMd5 = object ? getR2ObjectImageMd5(object) : null;
+    if (!imageMd5) {
+      return json({ error: "部分服务器图片缺少有效 MD5，请重新上传。" }, { status: 400 }, request, env);
+    }
+    imageMd5s.push(imageMd5);
+  }
+  const firstImageByMd5 = new Map<string, number>();
+  for (const [index, imageMd5] of imageMd5s.entries()) {
+    const firstIndex = firstImageByMd5.get(imageMd5);
+    if (firstIndex !== undefined) {
+      return json({
+        error: `第 ${index + 1} 张图片题库已有：与本次第 ${firstIndex + 1} 张完全相同，请勿重复上传。`,
+        code: "COMMUNITY_IMAGE_DUPLICATE",
+      }, { status: 409 }, request, env);
+    }
+    firstImageByMd5.set(imageMd5, index);
+  }
+  let existingDuplicate: CommunityImageMd5DuplicateRow | null;
+  try {
+    existingDuplicate = await findCommunityImageMd5Duplicate(env.DB, imageMd5s);
+  } catch (error) {
+    console.error("Community finalize MD5 lookup failed", error);
+    return json({ error: "题库图片去重检查失败，请稍后重试。" }, { status: 500 }, request, env);
+  }
+  if (existingDuplicate) return communityImageDuplicateResponse(existingDuplicate, request, env);
+
+  const verifiedQuestions = submittedQuestions.map((question, index) => ({
+    ...question,
+    imageMd5: imageMd5s[index],
+  }));
   let canonicalQuestions: SubmittedCommunityQuestion[];
   try {
-    canonicalQuestions = await canonicalizeSubmittedBangumiTags(cache, submittedQuestions);
+    canonicalQuestions = await canonicalizeSubmittedBangumiTags(cache, verifiedQuestions);
   } catch (error) {
     if (error instanceof BangumiApiError) {
       return json({ error: error.message }, { status: error.status }, request, env);
@@ -2792,6 +2926,7 @@ async function handleCommunityQuestionSetCreate(request: Request, env: Env, cach
         imageUrl: getR2PublicUrl(request, env, question.r2Key),
         labelText: question.labelText,
         isR18: question.isR18,
+        imageMd5: question.imageMd5,
         animeTags: question.animeTags,
         characterTags: question.characterTags,
       })),
@@ -2799,6 +2934,34 @@ async function handleCommunityQuestionSetCreate(request: Request, env: Env, cach
   } catch (error) {
     if (error instanceof gameService.HomepageCommunityQuestionSetConflictError) {
       return json({ error: error.message }, { status: 409 }, request, env);
+    }
+    if (error instanceof gameService.HomepageCommunityQuestionSetDuplicateImageError) {
+      // If two identical requests race, the unique MD5 guard may be the first
+      // constraint observed by the loser. Recheck the stable submission ID so
+      // an already-committed identical request still gets the idempotent success.
+      let existing: Awaited<ReturnType<typeof gameService.getHomepageCommunityQuestionSetBySubmissionId>>;
+      try {
+        existing = await runWithGameDatabase(
+          env,
+          () => gameService.getHomepageCommunityQuestionSetBySubmissionId(submissionId),
+        );
+      } catch (lookupError) {
+        console.error("Homepage community duplicate idempotency lookup failed", lookupError);
+        return json({ error: "题库保存结果确认失败，请稍后重试。" }, { status: 500 }, request, env);
+      }
+      if (existing) {
+        if (existing.submissionFingerprint !== submissionFingerprint) {
+          return json({ error: "投稿内容已发生变化，请作为一次新投稿重试。" }, { status: 409 }, request, env);
+        }
+        return json({
+          id: existing.questionSet.id,
+          title: existing.questionSet.title,
+          imageCount: existing.questionSet.imageCount,
+          appended: existing.appended,
+          addedImageCount: existing.addedImageCount,
+        }, {}, request, env);
+      }
+      return communityImageDuplicateResponse(null, request, env);
     }
     if (error instanceof gameService.HomepageCommunityQuestionSetPersistenceError) {
       console.error("Homepage community question set persistence failed", error.cause);

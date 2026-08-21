@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { readFileSync, readdirSync } from "node:fs";
 import { join, resolve } from "node:path";
 import test from "node:test";
@@ -21,6 +22,12 @@ const ONE_PIXEL_WEBP = Uint8Array.from(Buffer.from(
   "UklGRiYAAABXRUJQVlA4IBoAAAAwAQCdASoBAAEAAQAaJaQAA3AA/v5HgAAAAA==",
   "base64",
 ));
+
+function imageVariant(bytes: Uint8Array, marker: number) {
+  const variant = bytes.slice();
+  variant[variant.length - 1] ^= marker & 0xff;
+  return variant;
+}
 
 class TestCache {
   private readonly responses = new Map<string, Response>();
@@ -176,12 +183,13 @@ function createTestEnv() {
   const bucket = {
     async put(key: string, value: ArrayBuffer, options?: R2PutOptions) {
       putCount += 1;
+      const etag = createHash("md5").update(new Uint8Array(value)).digest("hex");
       const object = {
         key,
         version: "test-version",
         size: value.byteLength,
-        etag: "test-etag",
-        httpEtag: '"test-etag"',
+        etag,
+        httpEtag: `"${etag}"`,
         uploaded: new Date(),
         checksums: {},
         customMetadata: options?.customMetadata,
@@ -476,13 +484,19 @@ test("Bangumi game subjects are canonicalized with subjectType 4 and their own o
     { id: 5001, subjectId: 104999, name: "游戏角色", nameCn: null, relation: "主角" },
   ]);
 
-  // 游戏条目不接受来自其他 subject 的角色。
+  // 游戏条目不接受来自其他 subject 的角色。使用另一张图片，避免先被全局 MD5 去重拦截。
+  const wrongCastUploadResponse = await worker.fetch(
+    uploadRequest(imageVariant(ONE_PIXEL_PNG, 2), UPLOAD_SECRET, "image/png"),
+    env,
+  );
+  assert.equal(wrongCastUploadResponse.status, 200);
+  const wrongCastUpload = await wrongCastUploadResponse.json() as { key: string };
   const wrongCast = await worker.fetch(finalizeRequest({
     title: "游戏题库错误角色",
     playerId: "game-player",
     nickname: "游戏测试者",
     questions: [{
-      r2Key: uploaded.key,
+      r2Key: wrongCastUpload.key,
       labelText: "AIR 游戏",
       animeTags: [{ id: 104999, name: "AIR 游戏", nameCn: null, subjectType: 4 }],
       characterTags: [{ id: 3, subjectId: 104999, name: "神尾観鈴", nameCn: null, relation: "主角" }],
@@ -564,6 +578,108 @@ test("browser-style WebP uploads can be finalized as a public manifest question 
   assert.equal(indexPayload.images[0].questionId, indexed.question_id);
   assert.equal("answerText" in indexPayload.images[0], false);
   assert.equal("answer_text" in indexPayload.images[0], false);
+});
+
+test("community upload reports an exact MD5 already present in the question bank and removes the rejected object", async () => {
+  const { db, env, objects, deletedKeys, getPutCount } = createTestEnv();
+  const firstUploadResponse = await worker.fetch(uploadRequest(ONE_PIXEL_PNG), env);
+  assert.equal(firstUploadResponse.status, 200);
+  const firstUpload = await firstUploadResponse.json() as { key: string; imageMd5: string };
+  assert.match(firstUpload.imageMd5, /^[0-9a-f]{32}$/);
+  const finalized = await worker.fetch(finalizeRequest({
+    submissionId: "md5-existing-first-submission",
+    title: "MD5 已有题库",
+    playerId: "md5-player",
+    nickname: "MD5 上传者",
+    questions: [{ r2Key: firstUpload.key, labelText: "已有题" }],
+  }), env);
+  assert.equal(finalized.status, 200, await finalized.clone().text());
+  assert.equal(
+    (db.sqlite.prepare("SELECT image_md5 FROM question_image_index").get() as { image_md5: string }).image_md5,
+    firstUpload.imageMd5,
+  );
+
+  const duplicateResponse = await worker.fetch(uploadRequest(ONE_PIXEL_PNG), env);
+  assert.equal(duplicateResponse.status, 409);
+  const duplicate = await duplicateResponse.json() as {
+    error: string;
+    code: string;
+    existing: { questionSetTitle: string; orderIndex: number };
+  };
+  assert.equal(duplicate.code, "COMMUNITY_IMAGE_DUPLICATE");
+  assert.match(duplicate.error, /题库已有.*MD5 已有题库.*第 1 题/);
+  assert.deepEqual(duplicate.existing, {
+    questionId: (db.sqlite.prepare("SELECT question_id FROM question_image_index").get() as { question_id: string }).question_id,
+    questionSetId: (db.sqlite.prepare("SELECT question_set_id FROM question_image_index").get() as { question_set_id: string }).question_set_id,
+    questionSetTitle: "MD5 已有题库",
+    orderIndex: 0,
+  });
+  assert.equal(getPutCount(), 2);
+  assert.equal(objects.size, 1);
+  assert.equal(deletedKeys.length, 1);
+});
+
+test("community finalize rejects duplicate MD5s in one submission and an atomic concurrent duplicate", async () => {
+  const sameBatch = createTestEnv();
+  const firstResponse = await worker.fetch(uploadRequest(ONE_PIXEL_PNG), sameBatch.env);
+  const secondResponse = await worker.fetch(uploadRequest(ONE_PIXEL_PNG), sameBatch.env);
+  assert.equal(firstResponse.status, 200);
+  assert.equal(secondResponse.status, 200);
+  const first = await firstResponse.json() as { key: string };
+  const second = await secondResponse.json() as { key: string };
+  const duplicateBatchResponse = await worker.fetch(finalizeRequest({
+    submissionId: "md5-same-batch-submission",
+    title: "同批 MD5 重复",
+    playerId: "md5-player",
+    nickname: "MD5 上传者",
+    questions: [
+      { r2Key: first.key, labelText: "第一题" },
+      { r2Key: second.key, labelText: "第二题" },
+    ],
+  }), sameBatch.env);
+  assert.equal(duplicateBatchResponse.status, 409);
+  assert.match(JSON.stringify(await duplicateBatchResponse.json()), /第 2 张图片题库已有.*第 1 张完全相同/);
+  assert.equal(sameBatch.db.sqlite.prepare("SELECT COUNT(*) count FROM question_sets").get().count, 0);
+  assert.equal(sameBatch.db.sqlite.prepare("SELECT COUNT(*) count FROM question_image_index").get().count, 0);
+
+  const concurrent = createTestEnv();
+  const uploadResponse = await worker.fetch(uploadRequest(ONE_PIXEL_WEBP, UPLOAD_SECRET, "image/webp"), concurrent.env);
+  const uploaded = await uploadResponse.json() as { key: string; imageMd5: string };
+  concurrent.db.beforeNextBatch = () => {
+    concurrent.db.sqlite.prepare(`INSERT INTO question_sets
+      (id,title,created_by_player_id,is_public,image_count,created_at,updated_at)
+      VALUES (?,?,?,?,?,?,?)`).run(
+      "concurrent-md5-existing-set",
+      "并发先写题库",
+      "concurrent-owner",
+      1,
+      1,
+      "2026-08-20T00:00:00.000Z",
+      "2026-08-20T00:00:00.000Z",
+    );
+    concurrent.db.sqlite.prepare(`INSERT INTO question_image_index
+      (question_id,question_set_id,image_url,answer_text,order_index,image_md5,created_at)
+      VALUES (?,?,?,?,?,?,?)`).run(
+      "concurrent-md5-existing-question",
+      "concurrent-md5-existing-set",
+      "https://example.com/concurrent.webp",
+      "并发已有",
+      0,
+      uploaded.imageMd5,
+      "2026-08-20T00:00:00.000Z",
+    );
+  };
+  const concurrentResponse = await worker.fetch(finalizeRequest({
+    submissionId: "md5-concurrent-submission",
+    title: "并发冲突投稿",
+    playerId: "md5-player",
+    nickname: "MD5 上传者",
+    questions: [{ r2Key: uploaded.key, labelText: "并发重复" }],
+  }), concurrent.env);
+  assert.equal(concurrentResponse.status, 409, await concurrentResponse.clone().text());
+  assert.match(JSON.stringify(await concurrentResponse.json()), /题库已有/);
+  assert.equal(concurrent.db.sqlite.prepare("SELECT COUNT(*) count FROM question_sets").get().count, 1);
+  assert.equal(concurrent.db.sqlite.prepare("SELECT COUNT(*) count FROM question_image_index").get().count, 1);
 });
 
 test("same-title homepage submissions append atomically to one ordered question set", async () => {
@@ -691,8 +807,11 @@ test("same-title append accumulates beyond 30 while a single submission stays ca
   const { db, env, objects } = createTestEnv();
   const makeStoredKey = (index: number) => {
     const key = `question-images/community/2026/08/20/00000000-0000-4000-8000-${String(index).padStart(12, "0")}-screenshot.png`;
+    const etag = String(index + 1).padStart(32, "0");
     objects.set(key, {
       key,
+      etag,
+      httpEtag: `"${etag}"`,
       customMetadata: { uploadSource: "homepage-community" },
     } as R2Object);
     return key;
@@ -1254,16 +1373,16 @@ test("question-set admin metadata updates use CAS and keep canonical collection 
 
 test("question-set admin supports manifest question image CRUD, replacement, and ordering", async () => {
   const { db, env, objects } = createTestEnv();
-  const uploaded = [] as Array<{ key: string; url: string }>;
+  const uploaded = [] as Array<{ key: string; url: string; imageMd5: string }>;
   for (const [bytes, contentType] of [
     [ONE_PIXEL_PNG, "image/png"],
     [ONE_PIXEL_WEBP, "image/webp"],
-    [ONE_PIXEL_PNG, "image/png"],
-    [ONE_PIXEL_WEBP, "image/webp"],
+    [imageVariant(ONE_PIXEL_PNG, 1), "image/png"],
+    [imageVariant(ONE_PIXEL_WEBP, 1), "image/webp"],
   ] as const) {
     const response = await worker.fetch(uploadRequest(bytes, UPLOAD_SECRET, contentType), env);
     assert.equal(response.status, 200, await response.clone().text());
-    uploaded.push(await response.json() as { key: string; url: string });
+    uploaded.push(await response.json() as { key: string; url: string; imageMd5: string });
   }
   const finalizeResponse = await worker.fetch(finalizeRequest({
     submissionId: "admin-question-crud-submission",
@@ -1373,6 +1492,24 @@ test("question-set admin supports manifest question image CRUD, replacement, and
   const replacedQuestion = detail.questions.find((question) => question.id === addedQuestion.id)!;
   assert.equal(replacedQuestion.answerText, "替换后的第三题");
 
+  // 换图成功响应丢失后的同 key 重试应排除当前题自身的 MD5：返回幂等成功，
+  // 而不是误报“题库已有”。
+  const replacementRetry = await worker.fetch(questionSetAdminRequest(
+    `/api/admin/question-sets/${created.id}/questions/${addedQuestion.id}`,
+    {
+      method: "PATCH",
+      body: {
+        r2Key: uploaded[3].key,
+        answerText: "替换后的第三题",
+        animeTags: [],
+        characterTags: [],
+        expectedUpdatedAt: detail.updatedAt,
+      },
+    },
+  ), env);
+  assert.equal(replacementRetry.status, 200, await replacementRetry.clone().text());
+  assert.equal((await replacementRetry.clone().text()).includes("题库已有"), false);
+
   const moveResponse = await worker.fetch(questionSetAdminRequest(
     `/api/admin/question-sets/${created.id}/questions/${replacedQuestion.id}`,
     {
@@ -1419,11 +1556,21 @@ test("question-set admin supports manifest question image CRUD, replacement, and
     [replacedQuestion.id, 0, "替换后的第三题"],
     [firstQuestionId, 1, "第一题"],
   ]);
-  const indexed = db.sqlite.prepare(`SELECT question_id,order_index,answer_text FROM question_image_index
+  const indexed = db.sqlite.prepare(`SELECT question_id,order_index,answer_text,image_md5 FROM question_image_index
     WHERE question_set_id=? ORDER BY order_index`).all(created.id) as Array<Record<string, unknown>>;
   assert.deepEqual(indexed.map((row) => ({ ...row })), [
-    { question_id: replacedQuestion.id, order_index: 0, answer_text: "替换后的第三题" },
-    { question_id: firstQuestionId, order_index: 1, answer_text: "第一题" },
+    {
+      question_id: replacedQuestion.id,
+      order_index: 0,
+      answer_text: "替换后的第三题",
+      image_md5: uploaded[3].imageMd5,
+    },
+    {
+      question_id: firstQuestionId,
+      order_index: 1,
+      answer_text: "第一题",
+      image_md5: uploaded[0].imageMd5,
+    },
   ]);
 });
 
@@ -2575,6 +2722,51 @@ test("D1 0032 adds per-question is_r18 to legacy rows and the image index with d
   sqlite.prepare("UPDATE question_image_index SET is_r18=1 WHERE question_id=?").run("r18-migration-question");
   assert.throws(() => sqlite.prepare("UPDATE questions SET is_r18=2 WHERE id=?").run("r18-migration-question"), /CHECK/);
   assert.throws(() => sqlite.prepare("UPDATE question_image_index SET is_r18=2 WHERE question_id=?").run("r18-migration-question"), /CHECK/);
+});
+
+test("D1 0034 adds a nullable, validated, globally unique image MD5 index", () => {
+  const sqlite = new DatabaseSync(":memory:");
+  applyMigrations(sqlite, "0033");
+  sqlite.prepare(`INSERT INTO question_sets
+    (id,title,created_by_player_id,is_public,image_count,created_at,updated_at)
+    VALUES (?,?,?,?,?,?,?)`).run(
+    "md5-migration-set",
+    "MD5 迁移题库",
+    "migration-owner",
+    1,
+    2,
+    "2026-08-20T00:00:00.000Z",
+    "2026-08-20T00:00:00.000Z",
+  );
+  const insert = sqlite.prepare(`INSERT INTO question_image_index
+    (question_id,question_set_id,image_url,answer_text,order_index,created_at)
+    VALUES (?,?,?,?,?,?)`);
+  insert.run("md5-migration-one", "md5-migration-set", "https://example.com/one.webp", "第一题", 0, "2026-08-20T00:00:00.000Z");
+  insert.run("md5-migration-two", "md5-migration-set", "https://example.com/two.webp", "第二题", 1, "2026-08-20T00:00:00.000Z");
+  const migration = readFileSync(resolve(import.meta.dirname, "..", "d1", "migrations", "0034_question_image_md5.sql"), "utf8");
+
+  sqlite.exec("BEGIN IMMEDIATE");
+  try {
+    sqlite.exec(migration);
+    throw new Error("injected migration failure");
+  } catch {
+    sqlite.exec("ROLLBACK");
+  }
+  assert.equal(sqlite.prepare("SELECT COUNT(*) count FROM pragma_table_info('question_image_index') WHERE name='image_md5'").get().count, 0);
+  assert.equal(sqlite.prepare("SELECT COUNT(*) count FROM sqlite_master WHERE type='index' AND name='question_image_index_md5_unique'").get().count, 0);
+
+  sqlite.exec(migration);
+  assert.equal(sqlite.prepare("SELECT COUNT(*) count FROM question_image_index WHERE image_md5 IS NULL").get().count, 2);
+  const md5 = "0123456789abcdef0123456789abcdef";
+  sqlite.prepare("UPDATE question_image_index SET image_md5=? WHERE question_id='md5-migration-one'").run(md5);
+  assert.throws(
+    () => sqlite.prepare("UPDATE question_image_index SET image_md5=? WHERE question_id='md5-migration-two'").run(md5),
+    /UNIQUE constraint failed/,
+  );
+  assert.throws(
+    () => sqlite.prepare("UPDATE question_image_index SET image_md5='ABC' WHERE question_id='md5-migration-two'").run(),
+    /CHECK constraint failed/,
+  );
 });
 
 test("old manifests without is_r18 decode as false and invalid markers fail closed", () => {
