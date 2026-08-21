@@ -105,6 +105,8 @@ export type AdminQuestionSetDeleteData = {
   id: string;
   title: string;
   imageUrls: string[];
+  /** 删除时在同一 D1 batch 中被原子取消准备（退回 LOBBY）的房间数。 */
+  releasedPreparedRoomCount: number;
 };
 
 function asCount(value: unknown) {
@@ -394,8 +396,9 @@ export async function getAdminQuestionSetDetail(db: D1Database, questionSetId: s
     storageKind,
     questions,
     integrityIssues: [...new Set(integrityIssues)],
+    // 已准备房间不阻止删除：整库 DELETE 会在同一 D1 batch 中先原子取消引用
+    // 房间的准备（退回 LOBBY），只有活动游戏、损坏存储和形状异常才禁止删除。
     canDelete: summary.gameSessionCount === 0
-      && summary.preparedRoomCount === 0
       && storageKind !== "corrupt"
       && !hasQuestionShapeIssue,
     canEditQuestions: summary.gameSessionCount === 0
@@ -999,36 +1002,64 @@ export async function deleteAdminQuestionSet(
   if (detail.storageKind === "corrupt") {
     throw new QuestionSetAdminError("题库 manifest 已损坏；为避免遗留无法追踪的图片，修复前不能删除。", 409);
   }
-  if (!detail.canDelete) {
-    const hasUnsafeShape = detail.questions.length > QUESTION_SET_MANIFEST_MAX_QUESTIONS
-      || detail.questions.length !== detail.imageCount
-      || detail.questions.some((question, index) => question.orderIndex !== index);
-    if (hasUnsafeShape) {
-      throw new QuestionSetAdminError("题库存储数量或顺序不一致；为避免遗漏图片引用，修复前不能删除。", 409);
-    }
+  const hasUnsafeShape = detail.questions.length > QUESTION_SET_MANIFEST_MAX_QUESTIONS
+    || detail.questions.length !== detail.imageCount
+    || detail.questions.some((question, index) => question.orderIndex !== index);
+  if (hasUnsafeShape) {
+    throw new QuestionSetAdminError("题库存储数量或顺序不一致；为避免遗漏图片引用，修复前不能删除。", 409);
+  }
+  // 活动游戏仍禁止删除（game_sessions 外键 RESTRICT 兜底）；已准备房间不阻止
+  // 删除，而是与题库删除放在同一个 D1 batch 中原子取消准备。
+  if (detail.gameSessionCount > 0) {
     throw new QuestionSetAdminError(
-      `题库仍被 ${detail.gameSessionCount} 局活动游戏或 ${detail.preparedRoomCount} 个房间引用；请先结束游戏或取消房间准备，不能直接删除。`,
+      `题库仍被 ${detail.gameSessionCount} 局活动游戏引用；请先结束游戏，不能直接删除。`,
       409,
     );
   }
 
-  let deleted: { id: string } | null;
+  const releasedAt = new Date().toISOString();
+  let results: Array<{ results?: Array<{ id: string }> }>;
   try {
-    deleted = await db.prepare(`
-      DELETE FROM question_sets
-      WHERE id = ?
-        AND COALESCE(updated_at, created_at) = ?
-        AND NOT EXISTS (SELECT 1 FROM game_sessions gs WHERE gs.question_set_id = question_sets.id)
-        AND NOT EXISTS (SELECT 1 FROM rooms r WHERE r.prepared_question_set_id = question_sets.id)
-      RETURNING id
-    `).bind(questionSetId, expectedUpdatedAt).first<{ id: string }>();
+    // 先取消引用房间的准备（回到 LOBBY 并清空出题人/题库引用等列），再删除题库。
+    // 两条语句共享同一个题库修订号守卫：若版本已过期，房间不会被清空，删除也
+    // 会失败，整体回滚；并发准备要么被本条 UPDATE 原子清掉，要么在题库删除后
+    // 被 rooms_prepared_question_set_*_guard trigger 拒绝。
+    results = await db.batch([
+      db.prepare(`
+        UPDATE rooms
+        SET game_status='LOBBY', current_presenter_player_id=NULL, current_game_id=NULL,
+            prepared_question_set_id=NULL, prepared_question_count=NULL, lobby_question_count=NULL,
+            prepared_question_source=NULL, room_state_revision=room_state_revision+1,
+            public_activity_at=CASE WHEN room_visibility='PUBLIC' THEN ? ELSE public_activity_at END,
+            updated_at=?
+        WHERE prepared_question_set_id=?
+          AND EXISTS (
+            SELECT 1 FROM question_sets qs
+            WHERE qs.id=? AND COALESCE(qs.updated_at,qs.created_at)=?
+              AND NOT EXISTS (
+                SELECT 1 FROM game_sessions gs WHERE gs.question_set_id=qs.id
+              )
+          )
+        RETURNING id
+      `).bind(releasedAt, releasedAt, questionSetId, questionSetId, expectedUpdatedAt),
+      db.prepare(`
+        DELETE FROM question_sets
+        WHERE id = ?
+          AND COALESCE(updated_at, created_at) = ?
+          AND NOT EXISTS (SELECT 1 FROM game_sessions gs WHERE gs.question_set_id = question_sets.id)
+          AND NOT EXISTS (SELECT 1 FROM rooms r WHERE r.prepared_question_set_id = question_sets.id)
+        RETURNING id
+      `).bind(questionSetId, expectedUpdatedAt),
+    ]);
   } catch (error) {
     if (isQuestionSetReferenceConstraintError(error)) {
       throw new QuestionSetAdminError("题库引用或版本刚刚发生变化，请刷新后重试。", 409);
     }
     throw error;
   }
-  if (!deleted) {
+  const releasedRoomRows = results[0]?.results ?? [];
+  const deletedRows = results[1]?.results ?? [];
+  if (deletedRows.length === 0) {
     const exists = await db.prepare("SELECT id FROM question_sets WHERE id = ?").bind(questionSetId).first<{ id: string }>();
     if (!exists) throw new QuestionSetAdminError("题库不存在。", 404);
     throw new QuestionSetAdminError("题库引用或版本刚刚发生变化，请刷新后重试。", 409);
@@ -1038,5 +1069,6 @@ export async function deleteAdminQuestionSet(
     id: detail.id,
     title: detail.title,
     imageUrls: [...new Set(detail.questions.map((question) => question.imageUrl).filter(Boolean))],
+    releasedPreparedRoomCount: releasedRoomRows.length,
   };
 }

@@ -83,6 +83,7 @@ export interface Env {
   R2_EXISTING_IMAGE_LIMIT?: string;
   REMOTE_IMAGE_PROXY_CANDIDATES?: string;
   COMMUNITY_UPLOAD_SECRET?: string;
+  QUESTION_SET_DELETE_SECRET?: string;
 }
 
 type RpcBody = {
@@ -276,6 +277,8 @@ const QUESTION_SET_ADMIN_BODY_MAX_BYTES = 16 * 1024;
 const QUESTION_SET_ADMIN_PATH_PREFIX = "/api/admin/question-sets/";
 const COMMUNITY_UPLOAD_KEY_HEADER = "x-community-upload-key";
 const COMMUNITY_UPLOAD_SECRET_MIN_LENGTH = 24;
+const QUESTION_SET_DELETE_KEY_HEADER = "x-question-set-delete-key";
+const QUESTION_SET_DELETE_SECRET_MIN_LENGTH = 24;
 const ROOM_CLEANUP_IDLE_MS = 48 * 60 * 60 * 1000;
 const ROOM_CLEANUP_MAX_ROOMS_PER_RUN = 50;
 const ROOM_CLEANUP_MAX_ORPHAN_QUESTION_SETS_PER_RUN = 100;
@@ -545,7 +548,7 @@ function corsHeaders(request: Request, env: Env) {
   return {
     "Access-Control-Allow-Origin": allowOrigin,
     "Access-Control-Allow-Methods": "GET,HEAD,POST,PATCH,DELETE,OPTIONS",
-    "Access-Control-Allow-Headers": `content-type,${COMMUNITY_UPLOAD_KEY_HEADER}`,
+    "Access-Control-Allow-Headers": `content-type,${COMMUNITY_UPLOAD_KEY_HEADER},${QUESTION_SET_DELETE_KEY_HEADER}`,
     "Access-Control-Max-Age": "86400",
     "Vary": "Origin",
   };
@@ -2024,11 +2027,9 @@ async function handleCommunityRemoteImageSource(request: Request, env: Env) {
   }
 }
 
-async function hasValidCommunityUploadKey(request: Request, env: Env) {
-  const configuredSecret = (env.COMMUNITY_UPLOAD_SECRET ?? "").trim();
-  if (configuredSecret.length < COMMUNITY_UPLOAD_SECRET_MIN_LENGTH) return false;
-
-  const suppliedHeader = (request.headers.get(COMMUNITY_UPLOAD_KEY_HEADER) ?? "").trim();
+async function hasValidSecretKey(request: Request, headerName: string, configuredSecret: string) {
+  const suppliedHeader = (request.headers.get(headerName) ?? "").trim();
+  // 超过 512 字符的密钥直接视为不匹配，避免把超长输入送入哈希比较。
   const suppliedSecret = suppliedHeader.length <= 512 ? suppliedHeader : "__invalid_oversized_key__";
   const encoder = new TextEncoder();
   const [configuredDigest, suppliedDigest] = await Promise.all([
@@ -2044,6 +2045,18 @@ async function hasValidCommunityUploadKey(request: Request, env: Env) {
   return difference === 0;
 }
 
+async function hasValidCommunityUploadKey(request: Request, env: Env) {
+  const configuredSecret = (env.COMMUNITY_UPLOAD_SECRET ?? "").trim();
+  if (configuredSecret.length < COMMUNITY_UPLOAD_SECRET_MIN_LENGTH) return false;
+  return hasValidSecretKey(request, COMMUNITY_UPLOAD_KEY_HEADER, configuredSecret);
+}
+
+async function hasValidQuestionSetDeleteKey(request: Request, env: Env) {
+  const configuredSecret = (env.QUESTION_SET_DELETE_SECRET ?? "").trim();
+  if (configuredSecret.length < QUESTION_SET_DELETE_SECRET_MIN_LENGTH) return false;
+  return hasValidSecretKey(request, QUESTION_SET_DELETE_KEY_HEADER, configuredSecret);
+}
+
 async function sha256Hex(value: string) {
   const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value));
   return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
@@ -2055,6 +2068,17 @@ async function authorizeCommunityUpload(request: Request, env: Env) {
   }
   if (!await hasValidCommunityUploadKey(request, env)) {
     return json({ error: "上传密钥无效。" }, { status: 401 }, request, env);
+  }
+  return null;
+}
+
+// 只用于整库 DELETE：管理密钥之外，还需要单独的删除密钥（QUESTION_SET_DELETE_SECRET）。
+async function authorizeQuestionSetDelete(request: Request, env: Env) {
+  if ((env.QUESTION_SET_DELETE_SECRET ?? "").trim().length < QUESTION_SET_DELETE_SECRET_MIN_LENGTH) {
+    return json({ error: "题库删除功能尚未配置，请联系服务器管理员配置删除密钥。" }, { status: 503 }, request, env);
+  }
+  if (!await hasValidQuestionSetDeleteKey(request, env)) {
+    return json({ error: "题库删除密钥无效。" }, { status: 403 }, request, env);
   }
   return null;
 }
@@ -2186,12 +2210,15 @@ async function handleQuestionSetAdminItem(request: Request, env: Env, encodedQue
       return json(detail, {}, request, env);
     }
     if (request.method === "DELETE") {
+      const deleteAuthError = await authorizeQuestionSetDelete(request, env);
+      if (deleteAuthError) return deleteAuthError;
       const deleted = await deleteAdminQuestionSet(env.DB, questionSetId, await readQuestionSetAdminBody(request));
       const imageCleanup = await cleanupDeletedAdminQuestionSetImages(env, deleted.imageUrls);
       return json({
         deleted: true,
         questionSetId: deleted.id,
         title: deleted.title,
+        releasedPreparedRoomCount: deleted.releasedPreparedRoomCount,
         imageCleanup,
       }, {}, request, env);
     }

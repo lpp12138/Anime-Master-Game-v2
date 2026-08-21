@@ -109,6 +109,7 @@ export default function QuestionSetAdminPage() {
   const [detail, setDetail] = useState<AdminQuestionSetDetail | null>(null);
   const [editForm, setEditForm] = useState<EditForm | null>(null);
   const [deleteConfirmation, setDeleteConfirmation] = useState("");
+  const [deleteKey, setDeleteKey] = useState("");
   const [showDelete, setShowDelete] = useState(false);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
@@ -244,6 +245,7 @@ export default function QuestionSetAdminPage() {
     setNotice("");
     setShowDelete(false);
     setDeleteConfirmation("");
+    setDeleteKey("");
     resetQuestionEditor();
     try {
       const loaded = await getAdminQuestionSet(questionSetId, uploadKey, controller.signal);
@@ -372,11 +374,16 @@ export default function QuestionSetAdminPage() {
 
   async function removeDetail() {
     if (!detail || !detail.canDelete || deleteConfirmation !== detail.title) return;
+    const trimmedDeleteKey = deleteKey.trim();
+    if (!trimmedDeleteKey) {
+      setError("请输入题库删除密钥。");
+      return;
+    }
     setIsDeleting(true);
     setError("");
     setNotice("");
     try {
-      const deleted = await deleteAdminQuestionSet(detail.id, detail.updatedAt, uploadKey);
+      const deleted = await deleteAdminQuestionSet(detail.id, detail.updatedAt, uploadKey, trimmedDeleteKey);
       const nextOffset = page && page.items.length === 1 && page.offset > 0
         ? Math.max(0, page.offset - page.limit)
         : page?.offset ?? 0;
@@ -385,6 +392,7 @@ export default function QuestionSetAdminPage() {
       resetQuestionEditor();
       setShowDelete(false);
       setDeleteConfirmation("");
+      setDeleteKey("");
       await loadPage({ ...appliedFilters, offset: nextOffset });
       const cleanup = deleted.imageCleanup;
       const cleanupText = cleanup.pendingCount > 0
@@ -394,7 +402,10 @@ export default function QuestionSetAdminPage() {
           : cleanup.deletedCount > 0
             ? `；已清理 ${cleanup.deletedCount} 个独占图片对象`
             : "";
-      setNotice(`题库“${deleted.title}”已安全删除${cleanupText}。`);
+      const releasedText = deleted.releasedPreparedRoomCount > 0
+        ? `；已自动取消 ${deleted.releasedPreparedRoomCount} 个房间的题库准备`
+        : "";
+      setNotice(`题库“${deleted.title}”已安全删除${releasedText}${cleanupText}。`);
     } catch (requestError) {
       handleRequestError(requestError);
     } finally {
@@ -412,8 +423,11 @@ export default function QuestionSetAdminPage() {
     setDetail(null);
     setEditForm(null);
     resetQuestionEditor();
+    setShowDelete(false);
+    setDeleteConfirmation("");
+    setDeleteKey("");
     setError("");
-    setNotice("管理密钥已从当前页面内存清除。");
+    setNotice("管理密钥与删除密钥已从当前页面内存清除。");
     window.requestAnimationFrame(() => keyInputRef.current?.focus());
   }
 
@@ -428,7 +442,7 @@ export default function QuestionSetAdminPage() {
             </div>
             <h1 className="text-3xl font-bold text-slate-950 sm:text-4xl">题库管理</h1>
             <p className="mt-2 max-w-3xl text-sm leading-6 text-slate-600 sm:text-base">
-              使用管理密钥检索题库、查看受保护答案与 Bangumi 标签、逐题新增/换图/编辑/调序/删除、修改公开状态，或安全删除没有活动引用的题库。
+              使用管理密钥检索题库、查看受保护答案与 Bangumi 标签、逐题新增/换图/编辑/调序/删除、修改公开状态；永久删除整个题库时还需要单独配置的删除密钥（也只会保存在当前页面内存）。有房间正准备该题库时，删除会先把这些房间安全退回大厅并取消准备。
             </p>
           </div>
           <div className="self-start rounded-full border border-amber-200 bg-amber-50 px-3 py-1.5 text-xs font-semibold text-amber-900">
@@ -781,11 +795,11 @@ export default function QuestionSetAdminPage() {
                       <h3 className="text-lg font-bold text-rose-950">危险操作</h3>
                       {!detail.canDelete ? (
                         <p className="mt-2 text-sm leading-6 text-rose-900">
-                          当前不能删除：活动游戏引用 {detail.gameSessionCount}、已准备房间 {detail.preparedRoomCount}{detail.storageKind === "corrupt" ? "，且 manifest 已损坏" : detail.integrityIssues.length > 0 ? "，且存在需要先修复的存储一致性问题" : ""}。历史归档不会阻止删除；服务器不会绕过活动引用或完整性约束强制删除。
+                          当前不能删除：活动游戏引用 {detail.gameSessionCount}{detail.storageKind === "corrupt" ? "，且 manifest 已损坏" : detail.integrityIssues.length > 0 ? "，且存在需要先修复的存储一致性问题" : ""}。已准备房间不再阻止删除：删除会先把这些房间原子退回大厅并取消准备。服务器不会绕过活动引用或完整性约束强制删除。
                         </p>
                       ) : !showDelete ? (
                         <div className="mt-3 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-                          <p className="text-sm leading-6 text-rose-900">删除会原子移除题库、题目索引、投稿记录和评分；只清理不再被其他题库引用的本项目 R2 图片。{detail.archivedGameCount > 0 ? ` ${detail.archivedGameCount} 条历史归档为自包含快照，将继续保留。` : ""}</p>
+                          <p className="text-sm leading-6 text-rose-900">删除需要独立配置的删除密钥（与上方管理密钥不同，仅整库删除使用）。删除会原子移除题库、题目索引、投稿记录和评分，并把正在准备它的房间退回大厅；只清理不再被其他题库引用的本项目 R2 图片。{detail.archivedGameCount > 0 ? ` ${detail.archivedGameCount} 条历史归档为自包含快照，将继续保留。` : ""}</p>
                           <Button className="h-10 shrink-0 border-rose-300 text-rose-800 hover:bg-rose-100" disabled={isBusy || isDirty || hasOpenQuestionEditor} type="button" variant="secondary" onClick={() => setShowDelete(true)}>准备删除</Button>
                         </div>
                       ) : (
@@ -794,9 +808,14 @@ export default function QuestionSetAdminPage() {
                             <span className="text-sm font-semibold text-rose-950">输入完整题库标题“{detail.title}”确认</span>
                             <input className="mt-2 h-11 w-full rounded-md border border-rose-300 bg-white px-3 outline-none focus:ring-4 focus:ring-rose-200" disabled={isDeleting} value={deleteConfirmation} onChange={(event) => setDeleteConfirmation(event.target.value)} />
                           </label>
+                          <label className="mt-3 block">
+                            <span className="text-sm font-semibold text-rose-950">题库删除密钥</span>
+                            <input autoComplete="off" className="mt-2 h-11 w-full rounded-md border border-rose-300 bg-white px-3 outline-none focus:ring-4 focus:ring-rose-200" disabled={isDeleting} maxLength={512} placeholder="与上方管理密钥不同的单独删除密钥" type="password" value={deleteKey} onChange={(event) => setDeleteKey(event.target.value)} />
+                            <span className="mt-1 block text-xs leading-5 text-slate-500">服务器单独配置的删除密钥，只保留在当前页面内存，并仅通过整库删除请求头发送。</span>
+                          </label>
                           <div className="mt-3 flex flex-wrap gap-3">
-                            <Button className="h-10 bg-rose-700 shadow-none hover:bg-rose-800" disabled={isDeleting || deleteConfirmation !== detail.title} type="button" onClick={removeDetail}>{isDeleting ? "正在安全删除…" : "永久删除这个题库"}</Button>
-                            <Button className="h-10" disabled={isDeleting} type="button" variant="secondary" onClick={() => { setShowDelete(false); setDeleteConfirmation(""); }}>取消</Button>
+                            <Button className="h-10 bg-rose-700 shadow-none hover:bg-rose-800" disabled={isDeleting || deleteConfirmation !== detail.title || !deleteKey.trim()} type="button" onClick={removeDetail}>{isDeleting ? "正在安全删除…" : "永久删除这个题库"}</Button>
+                            <Button className="h-10" disabled={isDeleting} type="button" variant="secondary" onClick={() => { setShowDelete(false); setDeleteConfirmation(""); setDeleteKey(""); }}>取消</Button>
                           </div>
                         </div>
                       )}

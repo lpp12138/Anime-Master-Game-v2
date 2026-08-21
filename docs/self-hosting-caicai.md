@@ -22,7 +22,7 @@ Nginx 443
 - 每日状态备份定时器：`anime-master-game-backup.timer`
 - 增量状态备份：`/var/backups/anime-master-game/daily`
 
-`worker.env` 权限应保持为 `0640 root:animegame`，其中的 `COMMUNITY_UPLOAD_SECRET` 不得复制进代码或前端环境变量。
+`worker.env` 权限应保持为 `0640 root:animegame`，其中的 `COMMUNITY_UPLOAD_SECRET` 与 `QUESTION_SET_DELETE_SECRET` 不得复制进代码或前端环境变量。
 
 ## 更新
 
@@ -116,13 +116,15 @@ curl -fsS http://127.0.0.1:8787/api/public-rooms >/dev/null
 
 增量硬链接备份仍位于同一块磁盘，只能防误操作和迁移失败；应定期把最新快照加密复制到另一台主机或对象存储，才能防整机/磁盘故障。
 
-## 密钥轮换
+## 密钥生成与轮换
 
-生成新密钥并写入权限受限的环境文件，然后重启 Worker：
+生成/轮换时两个密钥都应直接写入权限受限的环境文件，不要打印到终端、日志或工单：
 
 ```bash
-secret="$(openssl rand -base64 32 | tr '+/' '-_' | tr -d '=\n')"
-printf 'COMMUNITY_UPLOAD_SECRET=%s\n' "$secret" > /etc/anime-master-game/worker.env
+umask 077
+printf 'COMMUNITY_UPLOAD_SECRET=%s\nQUESTION_SET_DELETE_SECRET=%s\n' \
+  "$(openssl rand -base64 32 | tr '+/' '-_' | tr -d '=\n')" \
+  "$(openssl rand -base64 32 | tr '+/' '-_' | tr -d '=\n')" > /etc/anime-master-game/worker.env
 chown root:animegame /etc/anime-master-game/worker.env
 chmod 0640 /etc/anime-master-game/worker.env
 systemctl restart anime-master-game.service
@@ -136,11 +138,12 @@ systemctl restart anime-master-game.service
 
 ```bash
 sudo sed -n 's/^COMMUNITY_UPLOAD_SECRET=//p' /etc/anime-master-game/worker.env
+sudo sed -n 's/^QUESTION_SET_DELETE_SECRET=//p' /etc/anime-master-game/worker.env
 ```
 
-管理页可检索题库、检查答案与 Bangumi 标签，修改标题、说明和公开状态，并逐题新增、查询、编辑答案/标签、拖放或粘贴换图、调序及删除。取消公开会立即从社区目录下架；规范同标题集合同时释放，之后的新投稿可能建立另一个规范集合。单题新增、删除或调序也会释放该题库的同标题自动绑定，但题库重新保持公开时仍会出现在截图上传页，可按题库 ID 明确选择并继续追加。所有修改和删除都使用页面刚读取的 `updatedAt` 做乐观并发控制，遇到 409 必须刷新后重新确认，不能绕过版本条件；活动游戏或已准备房间引用时不能修改题目。
+管理页可检索题库、检查答案与 Bangumi 标签，修改标题、说明和公开状态，并逐题新增、查询、编辑答案/标签、拖放或粘贴换图、调序及删除。取消公开会立即从社区目录下架；规范同标题集合同时释放，之后的新投稿可能建立另一个规范集合。单题新增、删除或调序也会释放该题库的同标题自动绑定，但题库重新保持公开时仍会出现在截图上传页，可按题库 ID 明确选择并继续追加。所有修改和删除都使用页面刚读取的 `updatedAt` 做乐观并发控制，遇到 409 必须刷新后重新确认，不能绕过版本条件；活动游戏或已准备房间引用时仍不能修改单题。
 
-永久删除还要求输入完整题库标题。Worker 会拒绝活动游戏、已准备房间或损坏 manifest 的题库；历史结算归档是自包含快照，删除题库后仍保留。题库及题目、图片索引、投稿记录和评分先在 D1 中级联删除，成功后才重新扫描所有剩余题库引用并清理不再共享的本站 R2 对象。引用扫描或 R2 删除失败会在页面显示待重试数量，且不会把失败伪报成已清理；损坏的剩余 manifest 会让清理失败关闭。每日 72 小时孤儿对账继续处理普通待清理对象。
+永久删除整个题库除管理密钥外，还要在危险操作区输入单独的删除密钥（`QUESTION_SET_DELETE_SECRET`，页面只保存在内存，仅随整库删除请求头发送）并输入完整题库标题。Worker 会拒绝活动游戏或损坏 manifest 的题库；已准备房间不阻止删除，而是先在同一个 D1 batch 中把引用该题库的房间原子退回大厅并取消准备，再删除题库，成功响应返回释放的房间数，页面会提示。历史结算归档是自包含快照，删除题库后仍保留。题库及题目、图片索引、投稿记录和评分先在 D1 中级联删除，成功后才重新扫描所有剩余题库引用并清理不再共享的本站 R2 对象。引用扫描或 R2 删除失败会在页面显示待重试数量，且不会把失败伪报成已清理；损坏的剩余 manifest 会让清理失败关闭。每日 72 小时孤儿对账继续处理普通待清理对象。
 
 只有在管理页不可用的应急情况下，才停止 Worker、先做一致性备份，再用 SQL 取消公开；同时必须释放规范集合标识，并使用条件 ID，不能直接删除行：
 

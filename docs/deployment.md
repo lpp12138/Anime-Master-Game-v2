@@ -40,10 +40,12 @@ npm install
 cp .env.example .env.local
 ```
 
-首页密钥上传和受保护题库管理共用一个只供本地 Worker 读取的 `.dev.vars` 密钥（至少 24 个字符，不能使用 `NEXT_PUBLIC_` 前缀）：
+首页密钥上传和受保护题库管理共用一个只供本地 Worker 读取的 `.dev.vars` 密钥（至少 24 个字符，不能使用 `NEXT_PUBLIC_` 前缀）；整库删除另需一个独立删除密钥：
 
 ```bash
-printf 'COMMUNITY_UPLOAD_SECRET=%s\n' "$(openssl rand -base64 32 | tr -d '\n')" > .dev.vars
+printf 'COMMUNITY_UPLOAD_SECRET=%s\nQUESTION_SET_DELETE_SECRET=%s\n' \
+  "$(openssl rand -base64 32 | tr -d '\n')" \
+  "$(openssl rand -base64 32 | tr -d '\n')" > .dev.vars
 chmod 600 .dev.vars
 ```
 
@@ -164,13 +166,14 @@ URL/JSONL 导入统一由 Worker 在校验当前房间出题人身份后有界�
 npm run d1:migrate:remote
 ```
 
-给首页截图上传和题库管理入口配置 Worker secret：
+给首页截图上传和题库管理入口配置 Worker secret，整库删除再单独配置删除密钥：
 
 ```bash
 npx wrangler secret put COMMUNITY_UPLOAD_SECRET
+npx wrangler secret put QUESTION_SET_DELETE_SECRET
 ```
 
-该值只应存在于 Worker secret 或服务器权限受限的环境文件中；不要写进 `wrangler.toml`、Git、Pages 环境变量或任何 `NEXT_PUBLIC_*` 变量。
+两个值都只应存在于 Worker secret 或服务器权限受限的环境文件中；不要写进 `wrangler.toml`、Git、Pages 环境变量或任何 `NEXT_PUBLIC_*` 变量。
 
 首页按钮进入独立上传页；该页面接受文件选择、多图拖放和 Ctrl/Cmd+V 剪贴板截图，也接受动画截图工具导出的 JSON/JSONL 文件、直接粘贴的 `image_url` / `label_text` 题单，或每行一个截图直链，并以自适应网格展示截图。题单和直链远端图片只通过受上传密钥保护的 `POST /api/community-remote-image-source` 获取；该接口限定为 FanCaps/Bangumi HTTPS 域名、拒绝跨域重定向、限制 20 MiB 和 15 秒上游请求，随后仍由浏览器压缩、由截图上传接口重新校验。反向代理必须为该接口单独限速，不能为了通用 URL 粘贴而放宽 SSRF 白名单。
 
@@ -178,7 +181,7 @@ npx wrangler secret put COMMUNITY_UPLOAD_SECRET
 
 受同一上传密钥保护的 `GET /api/community-image-index?animeSubjectId=<id>&characterId=<optional>&limit=<1-50>` 只查询公开题库，返回图片标识和规范标签，不返回 `answer_text`。它是可信预览/整理工具的后端读模型，不应改成匿名答案接口。
 
-`/question-set-admin` 使用同一密钥访问 `/api/admin/question-sets` 管理 API。密钥只驻留页面内存；列表不返回答案，只有受保护详情和单题 GET 返回答案/Bangumi 标签。题库 PATCH、单题 POST/PATCH/DELETE 和整库 DELETE 都要求当前 `expectedUpdatedAt`；单题/整库删除还分别要求完整匹配的 `confirmQuestionId` / `confirmQuestionSetId`。单题 mutation 同时更新 manifest 或 legacy rows、连续顺序和 `question_image_index`；新增、删除、调序会写入 `community_structure_edited=1` 并释放仅凭同标题自动命中的规范集合标题，但公开社区题库仍可在上传页按 ID 选择后继续追加。服务端拒绝修改被活动游戏或已准备房间引用、损坏或形状不一致的题库，并执行 1–30 题、图片来源及版本检查。
+`/question-set-admin` 使用同一密钥访问 `/api/admin/question-sets` 管理 API。密钥只驻留页面内存；列表不返回答案，只有受保护详情和单题 GET 返回答案/Bangumi 标签。题库 PATCH、单题 POST/PATCH/DELETE 和整库 DELETE 都要求当前 `expectedUpdatedAt`；单题/整库删除还分别要求完整匹配的 `confirmQuestionId` / `confirmQuestionSetId`，整库 DELETE 另需 `x-question-set-delete-key` 请求头（服务端单独配置的 `QUESTION_SET_DELETE_SECRET`，至少 24 字符；未配置返回 503，缺失/错误返回 403，常量时间比较且超长输入直接拒绝）。单题 mutation 同时更新 manifest 或 legacy rows、连续顺序和 `question_image_index`；新增、删除、调序会写入 `community_structure_edited=1` 并释放仅凭同标题自动命中的规范集合标题，但公开社区题库仍可在上传页按 ID 选择后继续追加。单题 mutation 仍会拒绝被活动游戏或已准备房间引用、损坏或形状不一致的题库，并执行图片来源及版本检查。已准备房间不再阻止整库删除：删除会先在同一个 D1 batch 中把引用该题库的房间原子退回 LOBBY 并清空出题人/题库引用等列（成功响应返回 `releasedPreparedRoomCount`），再删除题库；过期版本不会清空房间，活动游戏仍被拒绝，并发准备会被 trigger 拒绝。
 
 替换/删除单题或删除整库时，D1 先提交，再重新扫描全部剩余 legacy、图片索引和 manifest 引用，只批量清理不再共享的可信本站 R2 对象；扫描、映射或 R2 删除失败只报告待重试对象，不回滚或伪报 D1 失败。损坏的任一剩余 manifest 会让引用扫描失败关闭，避免误删未追踪图片；历史归档是自包含快照，可以保留。
 

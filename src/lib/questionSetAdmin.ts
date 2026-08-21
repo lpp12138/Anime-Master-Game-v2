@@ -83,6 +83,8 @@ export type AdminQuestionSetDeleteResult = {
   questionSetId: string;
   title: string;
   imageCleanup: AdminQuestionImageCleanup;
+  /** 删除时被原子取消准备（退回 LOBBY）的房间数。 */
+  releasedPreparedRoomCount: number;
 };
 
 export class QuestionSetAdminApiError extends Error {
@@ -274,14 +276,20 @@ export function deleteAdminQuestionSet(
   questionSetId: string,
   expectedUpdatedAt: string,
   uploadKey: string,
+  deleteKey: string,
   signal?: AbortSignal,
 ) {
+  // 只有整库 DELETE 发送独立删除密钥；单题删除和其他管理请求不携带该请求头。
+  const trimmedDeleteKey = deleteKey.trim();
   return adminFetch<AdminQuestionSetDeleteResult>(
     `/api/admin/question-sets/${encodeURIComponent(questionSetId)}`,
     uploadKey,
     {
       method: "DELETE",
-      headers: { "content-type": "application/json" },
+      headers: {
+        "content-type": "application/json",
+        ...(trimmedDeleteKey ? { "x-question-set-delete-key": trimmedDeleteKey } : {}),
+      },
       body: JSON.stringify({ confirmQuestionSetId: questionSetId, expectedUpdatedAt }),
     },
     signal,

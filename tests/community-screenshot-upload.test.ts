@@ -14,6 +14,7 @@ import worker, { type Env } from "../worker/index";
 import { decodeQuestionSetManifest, encodeQuestionSetManifest } from "../worker/questionSetManifest";
 
 const UPLOAD_SECRET = "test-community-upload-key-32-characters";
+const DELETE_SECRET = "test-question-set-delete-key-32-characters";
 const ONE_PIXEL_PNG = Uint8Array.from(Buffer.from(
   "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
   "base64",
@@ -217,6 +218,7 @@ function createTestEnv() {
     R2_IMAGE_PREFIX: "question-images",
     R2_PUBLIC_BASE_URL: "https://caicai.lpp.moe/api/r2-images",
     COMMUNITY_UPLOAD_SECRET: UPLOAD_SECRET,
+    QUESTION_SET_DELETE_SECRET: DELETE_SECRET,
     ALLOWED_ORIGIN: "https://caicai.lpp.moe",
   } as unknown as Env;
   return { db, env, objects, deletedKeys, getPutCount: () => putCount };
@@ -250,7 +252,7 @@ function finalizeRequest(payload: unknown, key = UPLOAD_SECRET) {
 
 function questionSetAdminRequest(
   path: string,
-  options: { method?: string; body?: unknown; key?: string | null } = {},
+  options: { method?: string; body?: unknown; key?: string | null; deleteKey?: string | null } = {},
 ) {
   const method = options.method ?? "GET";
   return new Request(`https://caicai.lpp.moe${path}`, {
@@ -258,6 +260,7 @@ function questionSetAdminRequest(
     headers: {
       ...(options.body === undefined ? {} : { "content-type": "application/json" }),
       ...(options.key === null ? {} : { "x-community-upload-key": options.key ?? UPLOAD_SECRET }),
+      ...(options.deleteKey === null ? {} : { "x-question-set-delete-key": options.deleteKey ?? DELETE_SECRET }),
     },
     ...(options.body === undefined ? {} : { body: JSON.stringify(options.body) }),
   });
@@ -1279,6 +1282,7 @@ test("question-set admin validates list bounds, methods, and mutation body limit
   assert.equal(methodResponse.headers.get("allow"), "GET");
   assert.match(methodResponse.headers.get("access-control-allow-methods") ?? "", /PATCH/);
   assert.match(methodResponse.headers.get("access-control-allow-methods") ?? "", /DELETE/);
+  assert.match(methodResponse.headers.get("access-control-allow-headers") ?? "", /x-question-set-delete-key/);
 
   const oversizedResponse = await worker.fetch(questionSetAdminRequest("/api/admin/question-sets/oversized-set", {
     method: "PATCH",
@@ -1637,6 +1641,8 @@ test("question-set admin supports manifest question image CRUD, replacement, and
     `/api/admin/question-sets/${created.id}/questions/${secondQuestionId}`,
     {
       method: "DELETE",
+      // 单题删除不要求独立删除密钥（只有整库 DELETE 才需要）。
+      deleteKey: null,
       body: { confirmQuestionId: secondQuestionId, expectedUpdatedAt: detail.updatedAt },
     },
   ), env);
@@ -2522,36 +2528,219 @@ test("question-set admin deletion rejects active games but preserves self-contai
     body: { confirmQuestionSetId: created.id, expectedUpdatedAt: detail.updatedAt },
   }), env);
   assert.equal(deleted.status, 200, await deleted.clone().text());
+  const deletedResult = await deleted.clone().json() as { releasedPreparedRoomCount: number };
+  assert.equal(deletedResult.releasedPreparedRoomCount, 0);
   assert.ok(db.sqlite.prepare("SELECT game_session_id FROM game_result_archives WHERE game_session_id='admin-archived-game'").get());
   assert.equal(objects.has(uploaded.key), false);
 });
 
-test("question-set admin deletion rejects prepared-room references", async () => {
+test("question-set admin whole-set deletion releases prepared rooms and deletes the set atomically", async () => {
   const { db, env } = createTestEnv();
   const uploadResponse = await worker.fetch(uploadRequest(ONE_PIXEL_PNG), env);
   const uploaded = await uploadResponse.json() as { key: string };
   const finalizeResponse = await worker.fetch(finalizeRequest({
-    submissionId: "admin-delete-blocked-submission",
+    submissionId: "admin-delete-releases-submission",
     title: "被房间引用的题库",
     playerId: "admin-delete-player",
     nickname: "管理测试者",
     questions: [{ r2Key: uploaded.key, labelText: "答案" }],
   }), env);
+  assert.equal(finalizeResponse.status, 200, await finalizeResponse.clone().text());
   const created = await finalizeResponse.json() as { id: string };
-  db.sqlite.prepare(`INSERT INTO rooms (id,room_code,host_player_id,prepared_question_set_id) VALUES (?,?,?,?)`)
-    .run("admin-reference-room", "ADMREF", "admin-reference-host", created.id);
+  db.sqlite.prepare(`INSERT INTO rooms
+    (id,room_code,host_player_id,game_status,current_presenter_player_id,current_game_id,
+     prepared_question_set_id,prepared_question_count,lobby_question_count,prepared_question_source,room_visibility)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?)`)
+    .run(
+      "admin-reference-room",
+      "ADMREF",
+      "admin-reference-host",
+      "QUESTION_SETUP",
+      "admin-reference-host",
+      "admin-ref-game",
+      created.id,
+      5,
+      5,
+      "COMMUNITY",
+      "PUBLIC",
+    );
 
   const detailResponse = await worker.fetch(questionSetAdminRequest(`/api/admin/question-sets/${created.id}`), env);
   const detail = await detailResponse.json() as { updatedAt: string; preparedRoomCount: number; canDelete: boolean };
   assert.equal(detail.preparedRoomCount, 1);
-  assert.equal(detail.canDelete, false);
+  // 已准备房间不再阻止删除：canDelete 只看活动游戏、存储损坏与形状异常。
+  assert.equal(detail.canDelete, true);
+
+  const deleteResponse = await worker.fetch(questionSetAdminRequest(`/api/admin/question-sets/${created.id}`, {
+    method: "DELETE",
+    body: { confirmQuestionSetId: created.id, expectedUpdatedAt: detail.updatedAt },
+  }), env);
+  assert.equal(deleteResponse.status, 200, await deleteResponse.clone().text());
+  const result = await deleteResponse.json() as { deleted: boolean; releasedPreparedRoomCount: number };
+  assert.equal(result.deleted, true);
+  assert.equal(result.releasedPreparedRoomCount, 1);
+
+  // 题库被删除；房间保留、退回 LOBBY 并清空准备相关列，公开房间活动时间被刷新。
+  assert.equal(db.sqlite.prepare("SELECT COUNT(*) AS count FROM question_sets WHERE id=?").get(created.id).count, 0);
+  const room = db.sqlite.prepare("SELECT * FROM rooms WHERE id='admin-reference-room'").get() as Record<string, unknown>;
+  assert.equal(room.game_status, "LOBBY");
+  assert.equal(room.current_presenter_player_id, null);
+  assert.equal(room.current_game_id, null);
+  assert.equal(room.prepared_question_set_id, null);
+  assert.equal(room.prepared_question_count, null);
+  assert.equal(room.lobby_question_count, null);
+  assert.equal(room.prepared_question_source, null);
+  assert.equal(room.room_state_revision, 1);
+  assert.ok(String(room.public_activity_at) >= detail.updatedAt);
+  assert.equal(db.sqlite.prepare("SELECT COUNT(*) AS count FROM rooms WHERE id='admin-reference-room'").get().count, 1);
+});
+
+test("question-set admin stale whole-set delete never clears prepared rooms", async () => {
+  const { db, env } = createTestEnv();
+  const uploadResponse = await worker.fetch(uploadRequest(ONE_PIXEL_PNG), env);
+  const uploaded = await uploadResponse.json() as { key: string };
+  const finalizeResponse = await worker.fetch(finalizeRequest({
+    submissionId: "admin-delete-stale-submission",
+    title: "过期删除题库",
+    playerId: "admin-delete-player",
+    nickname: "管理测试者",
+    questions: [{ r2Key: uploaded.key, labelText: "答案" }],
+  }), env);
+  assert.equal(finalizeResponse.status, 200, await finalizeResponse.clone().text());
+  const created = await finalizeResponse.json() as { id: string };
+  db.sqlite.prepare("INSERT INTO rooms (id,room_code,host_player_id,prepared_question_set_id) VALUES (?,?,?,?)")
+    .run("admin-stale-room", "ADMSTL", "admin-stale-host", created.id);
+
+  const detailResponse = await worker.fetch(questionSetAdminRequest(`/api/admin/question-sets/${created.id}`), env);
+  const detail = await detailResponse.json() as { updatedAt: string };
+  // 先通过元数据 PATCH 推进题库版本，再用旧版本发起整库删除。
+  const patchResponse = await worker.fetch(questionSetAdminRequest(`/api/admin/question-sets/${created.id}`, {
+    method: "PATCH",
+    body: { title: "过期删除题库（已修改）", description: null, isPublic: false, expectedUpdatedAt: detail.updatedAt },
+  }), env);
+  assert.equal(patchResponse.status, 200, await patchResponse.clone().text());
+
+  const staleDelete = await worker.fetch(questionSetAdminRequest(`/api/admin/question-sets/${created.id}`, {
+    method: "DELETE",
+    body: { confirmQuestionSetId: created.id, expectedUpdatedAt: detail.updatedAt },
+  }), env);
+  assert.equal(staleDelete.status, 409);
+  assert.match(JSON.stringify(await staleDelete.json()), /已被其他操作修改/);
+  // 过期请求既不能清空房间准备，也不能删除题库。
+  const room = db.sqlite.prepare("SELECT prepared_question_set_id FROM rooms WHERE id='admin-stale-room'")
+    .get() as { prepared_question_set_id: string | null };
+  assert.equal(room.prepared_question_set_id, created.id);
+  assert.ok(db.sqlite.prepare("SELECT id FROM question_sets WHERE id=?").get(created.id));
+});
+
+test("question-set admin delete race with a newly active game does not clear prepared rooms", async () => {
+  const { db, env } = createTestEnv();
+  const uploadResponse = await worker.fetch(uploadRequest(ONE_PIXEL_PNG), env);
+  const uploaded = await uploadResponse.json() as { key: string };
+  const finalizeResponse = await worker.fetch(finalizeRequest({
+    submissionId: "admin-delete-game-race-submission",
+    title: "并发开局删除题库",
+    playerId: "admin-delete-player",
+    nickname: "管理测试者",
+    questions: [{ r2Key: uploaded.key, labelText: "答案" }],
+  }), env);
+  assert.equal(finalizeResponse.status, 200, await finalizeResponse.clone().text());
+  const created = await finalizeResponse.json() as { id: string };
+  db.sqlite.prepare(`INSERT INTO rooms
+    (id,room_code,host_player_id,game_status,current_presenter_player_id,prepared_question_set_id,prepared_question_count)
+    VALUES (?,?,?,?,?,?,?)`)
+    .run("admin-delete-race-room", "ADMRCE", "admin-race-host", "QUESTION_SETUP", "admin-race-host", created.id, 1);
+
+  const detailResponse = await worker.fetch(questionSetAdminRequest(`/api/admin/question-sets/${created.id}`), env);
+  const detail = await detailResponse.json() as { updatedAt: string; canDelete: boolean };
+  assert.equal(detail.canDelete, true);
+  // 模拟详情读取后、删除 batch 开始前已有游戏落库。房间释放语句和题库删除语句
+  // 都必须看到该活动游戏并保持无副作用地返回 409。
+  db.beforeNextBatch = () => {
+    db.sqlite.prepare(`INSERT INTO game_sessions (id,room_id,question_set_id,presenter_player_id)
+      VALUES (?,?,?,?)`)
+      .run("admin-delete-race-game", "admin-delete-race-room", created.id, "admin-race-host");
+  };
   const deleteResponse = await worker.fetch(questionSetAdminRequest(`/api/admin/question-sets/${created.id}`, {
     method: "DELETE",
     body: { confirmQuestionSetId: created.id, expectedUpdatedAt: detail.updatedAt },
   }), env);
   assert.equal(deleteResponse.status, 409);
-  assert.match(JSON.stringify(await deleteResponse.json()), /1 个房间引用/);
+  const room = db.sqlite.prepare("SELECT game_status,prepared_question_set_id FROM rooms WHERE id='admin-delete-race-room'")
+    .get() as { game_status: string; prepared_question_set_id: string | null };
+  assert.deepEqual({ ...room }, { game_status: "QUESTION_SETUP", prepared_question_set_id: created.id });
   assert.ok(db.sqlite.prepare("SELECT id FROM question_sets WHERE id=?").get(created.id));
+});
+
+test("whole-set question-set deletion requires the separate delete key", async () => {
+  const { db, env } = createTestEnv();
+  const uploadResponse = await worker.fetch(uploadRequest(ONE_PIXEL_PNG), env);
+  const uploaded = await uploadResponse.json() as { key: string };
+  const finalizeResponse = await worker.fetch(finalizeRequest({
+    submissionId: "admin-delete-key-submission",
+    title: "删除密钥题库",
+    playerId: "admin-delete-key-player",
+    nickname: "删除密钥测试者",
+    questions: [{ r2Key: uploaded.key, labelText: "答案" }],
+  }), env);
+  assert.equal(finalizeResponse.status, 200, await finalizeResponse.clone().text());
+  const created = await finalizeResponse.json() as { id: string };
+  const detailResponse = await worker.fetch(questionSetAdminRequest(`/api/admin/question-sets/${created.id}`), env);
+  const detail = await detailResponse.json() as { updatedAt: string };
+  const deleteBody = { confirmQuestionSetId: created.id, expectedUpdatedAt: detail.updatedAt };
+
+  // 管理密钥仍然必须有效：缺少管理密钥时优先返回 401，即使删除密钥正确。
+  const missingManagement = await worker.fetch(questionSetAdminRequest(`/api/admin/question-sets/${created.id}`, {
+    method: "DELETE",
+    body: deleteBody,
+    key: null,
+  }), env);
+  assert.equal(missingManagement.status, 401);
+
+  // 缺少或错误的删除密钥返回 403，题库保持不变。
+  const missingDeleteKey = await worker.fetch(questionSetAdminRequest(`/api/admin/question-sets/${created.id}`, {
+    method: "DELETE",
+    body: deleteBody,
+    deleteKey: null,
+  }), env);
+  assert.equal(missingDeleteKey.status, 403);
+  assert.match(JSON.stringify(await missingDeleteKey.json()), /删除密钥无效/);
+  const wrongDeleteKey = await worker.fetch(questionSetAdminRequest(`/api/admin/question-sets/${created.id}`, {
+    method: "DELETE",
+    body: deleteBody,
+    deleteKey: "wrong-delete-key",
+  }), env);
+  assert.equal(wrongDeleteKey.status, 403);
+  assert.ok(db.sqlite.prepare("SELECT id FROM question_sets WHERE id=?").get(created.id));
+
+  // 超长删除密钥同样被拒绝。
+  const oversizedDeleteKey = await worker.fetch(questionSetAdminRequest(`/api/admin/question-sets/${created.id}`, {
+    method: "DELETE",
+    body: deleteBody,
+    deleteKey: "x".repeat(4096),
+  }), env);
+  assert.equal(oversizedDeleteKey.status, 403);
+
+  // 服务器未配置删除密钥时返回 503，且不执行删除。
+  delete env.QUESTION_SET_DELETE_SECRET;
+  const unconfigured = await worker.fetch(questionSetAdminRequest(`/api/admin/question-sets/${created.id}`, {
+    method: "DELETE",
+    body: deleteBody,
+  }), env);
+  assert.equal(unconfigured.status, 503);
+  assert.match(JSON.stringify(await unconfigured.json()), /尚未配置/);
+  assert.ok(db.sqlite.prepare("SELECT id FROM question_sets WHERE id=?").get(created.id));
+  env.QUESTION_SET_DELETE_SECRET = DELETE_SECRET;
+
+  // 正确的删除密钥可以完成删除，并返回本次释放的房间数。
+  const deleted = await worker.fetch(questionSetAdminRequest(`/api/admin/question-sets/${created.id}`, {
+    method: "DELETE",
+    body: deleteBody,
+  }), env);
+  assert.equal(deleted.status, 200, await deleted.clone().text());
+  const result = await deleted.json() as { releasedPreparedRoomCount: number };
+  assert.equal(result.releasedPreparedRoomCount, 0);
+  assert.equal(db.sqlite.prepare("SELECT COUNT(*) AS count FROM question_sets WHERE id=?").get(created.id).count, 0);
 });
 
 test("question-set admin deletion preserves R2 images still shared by another question set", async () => {
