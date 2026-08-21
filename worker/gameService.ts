@@ -2720,6 +2720,13 @@ export class HomepageCommunityQuestionSetDuplicateImageError extends Error {
   }
 }
 
+export class HomepageCommunityQuestionSetAppendTargetError extends Error {
+  constructor(message = "所选题库已不存在或当前不能追加，请刷新题库列表后重试。") {
+    super(message);
+    this.name = "HomepageCommunityQuestionSetAppendTargetError";
+  }
+}
+
 function isCommunityImageMd5UniqueError(error: { message?: string } | null | undefined) {
   return Boolean(error?.message && /(?:question_image_index_md5_unique|question_image_index\.image_md5)/i.test(error.message));
 }
@@ -2771,17 +2778,31 @@ async function getHomepageCommunityCollection(title: string) {
   return data;
 }
 
-function getAppendableHomepageQuestions(questionSet: DbQuestionSet, title: string) {
+async function getHomepageCommunityQuestionSetById(questionSetId: string) {
+  const { data, error } = await d1
+    .from("question_sets")
+    .select("*")
+    .eq("id", questionSetId)
+    .maybeSingle<DbQuestionSet>();
+  if (error) throw new HomepageCommunityQuestionSetPersistenceError(error.message);
+  return data;
+}
+
+function getAppendableHomepageQuestions(
+  questionSet: DbQuestionSet,
+  title: string,
+  options: { requireCanonicalCollection: boolean },
+) {
   if (
     !questionSet.is_public
     || questionSet.title !== title
-    || questionSet.community_collection_title !== title
     || !questionSet.community_submission_id
-    || questionSet.community_structure_edited === 1
-    || questionSet.community_structure_edited === true
     || questionSet.manifest_version !== QUESTION_SET_MANIFEST_VERSION
+    || (options.requireCanonicalCollection && questionSet.community_collection_title !== title)
   ) {
-    throw new HomepageCommunityQuestionSetPersistenceError(`同名题库“${title}”不是可追加的社区截图题库。`);
+    throw new HomepageCommunityQuestionSetAppendTargetError(
+      `所选题库“${title}”已不存在、已改名、未公开或存储格式不支持追加，请刷新列表后重试。`,
+    );
   }
   try {
     const questions = decodeQuestionSetManifest(questionSet);
@@ -2890,8 +2911,11 @@ async function appendHomepageCommunityQuestions(params: {
   submissionFingerprint: string;
   playerId: string;
   questionItems: QuestionImportItem[];
+  requireCanonicalCollection: boolean;
 }) {
-  const existingQuestions = getAppendableHomepageQuestions(params.questionSet, params.title);
+  const existingQuestions = getAppendableHomepageQuestions(params.questionSet, params.title, {
+    requireCanonicalCollection: params.requireCanonicalCollection,
+  });
   const startOrderIndex = existingQuestions.length;
   const revision = params.questionSet.manifest_revision;
   if (!Number.isInteger(revision) || (revision ?? -1) < 0 || typeof params.questionSet.manifest_json !== "string") {
@@ -2911,7 +2935,9 @@ async function appendHomepageCommunityQuestions(params: {
   const nextRevision = revision + 1;
   const nextImageCount = combinedQuestions.length;
   const guardQuery = `SELECT 1 FROM question_sets
-    WHERE id=? AND community_collection_title=? AND manifest_revision=? AND image_count=? AND manifest_json=?`;
+    WHERE id=? AND title=? AND is_public=1 AND community_submission_id IS NOT NULL
+      AND manifest_version=${QUESTION_SET_MANIFEST_VERSION}
+      AND manifest_revision=? AND image_count=? AND manifest_json=?`;
   const guardBindings = [
     params.questionSet.id,
     params.title,
@@ -2925,8 +2951,8 @@ async function appendHomepageCommunityQuestions(params: {
     {
       query: `UPDATE question_sets
         SET image_count=?, manifest_revision=?, manifest_json=?, updated_at=?
-        WHERE id=? AND community_collection_title=? AND manifest_version=?
-          AND manifest_revision=? AND image_count=? AND manifest_json=?
+        WHERE id=? AND title=? AND is_public=1 AND community_submission_id IS NOT NULL
+          AND manifest_version=? AND manifest_revision=? AND image_count=? AND manifest_json=?
         RETURNING *`,
       bindings: [
         nextImageCount,
@@ -3011,6 +3037,7 @@ export async function createHomepageCommunityQuestionSet(params: {
   playerId: string;
   nickname: string;
   title: string;
+  targetQuestionSetId?: string;
   description?: string;
   questions: QuestionImportItem[];
 }) {
@@ -3021,10 +3048,14 @@ export async function createHomepageCommunityQuestionSet(params: {
   const playerId = params.playerId.trim();
   const nickname = params.nickname.replace(/[\r\n]+/g, " ").trim();
   const title = params.title.replace(/[\r\n]+/g, " ").trim();
+  const targetQuestionSetId = params.targetQuestionSetId?.trim() || undefined;
   const description = params.description?.trim() || null;
   if (!/^[a-zA-Z0-9_-]{16,160}$/.test(submissionId)) throw new Error("投稿标识无效，请刷新页面后重试。");
   if (!/^[0-9a-f]{64}$/.test(submissionFingerprint)) throw new Error("投稿内容指纹无效，请刷新页面后重试。");
   if (!/^[a-zA-Z0-9_-]{1,160}$/.test(playerId)) throw new Error("上传者标识无效，请刷新页面后重试。");
+  if (targetQuestionSetId && !/^[a-zA-Z0-9_-]{1,160}$/.test(targetQuestionSetId)) {
+    throw new HomepageCommunityQuestionSetAppendTargetError("要追加的题库标识无效，请刷新列表后重试。");
+  }
   if (!nickname) throw new Error("请输入上传者昵称。");
   if (nickname.length > 20) throw new Error("上传者昵称最多 20 个字符。");
   if (!title) throw new Error("请输入题库标题。");
@@ -3061,7 +3092,12 @@ export async function createHomepageCommunityQuestionSet(params: {
       return priorSubmission;
     }
 
-    const collection = await findOrClaimHomepageCommunityCollection(title);
+    const collection = targetQuestionSetId
+      ? await getHomepageCommunityQuestionSetById(targetQuestionSetId)
+      : await findOrClaimHomepageCommunityCollection(title);
+    if (targetQuestionSetId && !collection) {
+      throw new HomepageCommunityQuestionSetAppendTargetError();
+    }
     if (collection) {
       const appended = await appendHomepageCommunityQuestions({
         questionSet: collection,
@@ -3070,6 +3106,7 @@ export async function createHomepageCommunityQuestionSet(params: {
         submissionFingerprint,
         playerId,
         questionItems,
+        requireCanonicalCollection: !targetQuestionSetId,
       });
       if (appended) return appended;
       continue;

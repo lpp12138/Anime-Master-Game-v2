@@ -8,7 +8,7 @@
 
 Room runtime generation 3 硬切后，历史房间的 `runtime_generation` 保持 `NULL`，访问会被逻辑拒绝但不会立即删除。拒绝路径不得更新 `updated_at`，这些房间仍由本流程在 48 小时后按原有 R2 追溯顺序自然清理。
 
-不要在生产环境绕过 Worker 直接删除旧房间或题库题目，否则会先丢失 `rooms -> game_sessions -> question_sets -> questions/manifest` 的追溯链，导致 R2 图片对象无法被安全清理。逐题新增、换图、调序和删除应使用 `/question-set-admin`：服务端会在一个 D1 batch 中同步 manifest/legacy rows、连续顺序和 `question_image_index`，再对被替换/删除图片做完整剩余引用扫描。新增、删除或调序会解除题库的规范同标题追加绑定；直接 SQL 不会执行这些保护。下面 SQL 仅用于本地排查、预览或紧急手动维护。
+不要在生产环境绕过 Worker 直接删除旧房间或题库题目，否则会先丢失 `rooms -> game_sessions -> question_sets -> questions/manifest` 的追溯链，导致 R2 图片对象无法被安全清理。逐题新增、换图、调序和删除应使用 `/question-set-admin`：服务端会在一个 D1 batch 中同步 manifest/legacy rows、连续顺序和 `question_image_index`，再对被替换/删除图片做完整剩余引用扫描。新增、删除或调序会解除题库仅凭同标题自动命中的规范绑定，但公开题库仍可在截图上传页按 ID 选择并继续追加；直接 SQL 不会同步这些状态与索引。下面 SQL 仅用于本地排查、预览或紧急手动维护。
 
 本地预览：
 

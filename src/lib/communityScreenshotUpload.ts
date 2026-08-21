@@ -23,6 +23,8 @@ export type CommunityRemoteScreenshotUploadResult = CommunityScreenshotUploadRes
 export type CommunityQuestionSetUploadInput = {
   submissionId: string;
   title: string;
+  /** 选择现有题库时按精确 ID 追加；省略时保留旧版同标题规范集合行为。 */
+  targetQuestionSetId?: string;
   description?: string;
   playerId: string;
   nickname: string;

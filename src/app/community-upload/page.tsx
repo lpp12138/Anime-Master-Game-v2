@@ -169,8 +169,8 @@ export default function CommunityUploadPage() {
     return () => window.clearTimeout(timer);
   }, [uploadKey]);
 
-  // 刷新后所选题库若已不可追加（被删除、改结构等），回到新建模式并保留自定义标题；
-  // 若用户从未主动选择，则重新应用默认选中逻辑。
+  // 刷新后所选题库若已删除、改为私有或存储版本不兼容，回到新建模式并保留
+  // 自定义标题；人工结构编辑本身不再让题库从选项中消失。
   useEffect(() => {
     if (!selectedExistingSetId) return;
     if (existingSetOptions.some((option) => option.id === selectedExistingSetId)) return;
@@ -254,9 +254,8 @@ export default function CommunityUploadPage() {
     operationAbortRef.current?.abort();
   }
 
-  // 通过受保护的管理列表接口加载可继续追加的现有社区题库；只使用公开摘要字段，
-  // 不读取题目/答案。服务端按“规范集合、公开、未被人工改动、manifest 当前版本”
-  // 追加（见 worker/gameService.ts），这里过滤后再按精确标题去重。
+  // 通过受保护的管理列表接口加载可继续追加的现有社区题库；只使用摘要字段，
+  // 不读取题目/答案。目标按题库 ID 提交，已人工编辑结构的公开社区题库也保留。
   async function loadAppendableQuestionSets(key: string) {
     const normalizedKey = key.trim();
     if (!normalizedKey) {
@@ -703,6 +702,9 @@ export default function CommunityUploadPage() {
     const normalizedTitle = selectedExistingSetId
       ? selectedExistingSet?.title ?? ""
       : newTitle.trim();
+    // 只有用户在下拉框明确选择现有题库时才绑定目标 ID。新建模式继续使用旧版
+    // 同标题规范集合语义，避免异步列表刷新改变一次投稿的幂等目标。
+    const targetQuestionSetId = selectedExistingSet?.id;
     const normalizedNickname = uploaderNickname.trim();
     const normalizedUploadKey = uploadKey.trim();
     if (!normalizedUploadKey) return setError("请输入上传密钥。");
@@ -725,6 +727,7 @@ export default function CommunityUploadPage() {
     const playerId = getLocalSession().playerId;
     const submissionSignature = JSON.stringify({
       title: normalizedTitle.replace(/[\r\n]+/g, " "),
+      targetQuestionSetId: targetQuestionSetId ?? null,
       description: description.trim() || null,
       playerId,
       nickname: normalizedNickname.replace(/[\r\n]+/g, " "),
@@ -788,6 +791,7 @@ export default function CommunityUploadPage() {
       const result = await createUploadedCommunityQuestionSet({
         submissionId,
         title: normalizedTitle,
+        ...(targetQuestionSetId ? { targetQuestionSetId } : {}),
         description: description.trim() || undefined,
         playerId,
         nickname: normalizedNickname,
@@ -919,10 +923,10 @@ export default function CommunityUploadPage() {
                       <>
                         <option value="">＋ 新建题库（自定义标题）</option>
                         {existingSetOptions.length > 0 ? (
-                          <optgroup label="追加到现有题库（精确标题）">
+                          <optgroup label="追加到现有题库">
                             {existingSetOptions.map((option) => (
                               <option key={option.id} value={option.id}>
-                                {option.title}（已有 {option.imageCount} 题）
+                                {option.title}（已有 {option.imageCount} 题{option.isStructureEdited ? " · 已人工编辑，可追加" : ""}）
                               </option>
                             ))}
                           </optgroup>
@@ -956,15 +960,17 @@ export default function CommunityUploadPage() {
                     />
                     {existingSetsStatus === "ready" && matchedExistingSet ? (
                       <p className="text-xs leading-5 text-amber-700">
-                        标题与现有题库「{matchedExistingSet.title}」完全相同，本次提交会按顺序追加到该题库（当前 {matchedExistingSet.imageCount} 题）；如需独立新题库，请更换标题。
+                        {matchedExistingSet.isCanonicalCollection
+                          ? `标题与规范题库「${matchedExistingSet.title}」完全相同，本次会按旧版同标题规则追加（当前 ${matchedExistingSet.imageCount} 题）；如需独立新题库，请更换标题。`
+                          : `已有同标题题库「${matchedExistingSet.title}」（当前 ${matchedExistingSet.imageCount} 题）。它已人工编辑或脱离规范集合；如要继续追加，请直接从上方下拉框选择该题库。`}
                       </p>
                     ) : (
-                      <p className="text-xs leading-5 text-slate-500">新建独立题库；若标题与现有社区截图题库完全相同，本次图片会按顺序追加到该题库（整套不再受累计 30 题限制，单次投稿最多 {COMMUNITY_SCREENSHOT_MAX_QUESTIONS} 张）。</p>
+                      <p className="text-xs leading-5 text-slate-500">新建独立题库；若标题与规范社区题库完全相同，仍按旧版同标题规则追加。要追加已人工编辑的题库，请直接从上方下拉框选择（单次最多 {COMMUNITY_SCREENSHOT_MAX_QUESTIONS} 张）。</p>
                     )}
                   </>
                 ) : selectedExistingSet ? (
                   <p className="rounded-md bg-sky-50 px-3 py-2 text-xs leading-5 text-slate-700">
-                    已选择「{selectedExistingSet.title}」：本次提交的截图会按顺序追加到该公开社区题库（当前 {selectedExistingSet.imageCount} 题），提交标题使用题库的精确标题。
+                    已选择「{selectedExistingSet.title}」：本次提交会按题库 ID 追加到该公开社区题库（当前 {selectedExistingSet.imageCount} 题）{selectedExistingSet.isStructureEdited ? "；该题库虽已人工增删或调序，仍可继续追加" : ""}。
                   </p>
                 ) : null}
                 {existingSetsStatus === "loading" ? (
@@ -975,7 +981,7 @@ export default function CommunityUploadPage() {
                     <button className="underline disabled:opacity-50" disabled={!canVerifyKey} type="button" onClick={() => void loadAppendableQuestionSets(uploadKey)}>重试</button>
                   </p>
                 ) : existingSetsStatus === "ready" && existingSetOptions.length === 0 ? (
-                  <p className="text-xs text-slate-500">当前没有可继续追加的现有社区题库（需公开且未被人工改动）。</p>
+                  <p className="text-xs text-slate-500">当前没有可继续追加的公开社区题库。</p>
                 ) : uploadKey.trim() === "" && existingSetsStatus === "idle" ? (
                   <p className="text-xs text-slate-500">填写上传密钥后，可加载并选择可继续追加的现有社区题库。</p>
                 ) : null}

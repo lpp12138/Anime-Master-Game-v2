@@ -39,22 +39,22 @@ function summary(overrides: Partial<AdminQuestionSetSummary>): AdminQuestionSetS
   };
 }
 
-test("only canonical public unedited v1 collections are appendable", () => {
+test("public manifest community sets remain appendable after structural edits or canonical detachment", () => {
   assert.equal(isAppendableCommunityQuestionSet(summary({})), true);
-  // 整套题库不再受累计 30 题限制：已有 30 题甚至更多题时仍可继续追加
+  assert.equal(isAppendableCommunityQuestionSet(summary({ isStructureEdited: true, isCanonicalCollection: false })), true);
+  // 整套题库不受累计 30 题限制。
   assert.equal(isAppendableCommunityQuestionSet(summary({ imageCount: 30 })), true);
   assert.equal(isAppendableCommunityQuestionSet(summary({ imageCount: 47 })), true);
 });
 
-test("non-appendable sets are rejected", () => {
+test("only missing community history, private sets, incompatible manifests, and invalid counts are rejected", () => {
   const rejections: Array<Partial<AdminQuestionSetSummary>> = [
-    { isCanonicalCollection: false }, // 非社区规范集合（房间新建/未认领/已解绑）
-    { isPublic: false }, // 未公开
-    { isStructureEdited: true }, // 已被管理员人工改动
-    { manifestVersion: null }, // legacy 无 manifest
+    { submissionCount: 0 },
+    { isPublic: false },
+    { manifestVersion: null },
     { manifestVersion: 0 },
     { manifestVersion: 2 },
-    { imageCount: -1 }, // 计数异常
+    { imageCount: -1 },
     { imageCount: Number.NaN },
   ];
   for (const overrides of rejections) {
@@ -62,50 +62,41 @@ test("non-appendable sets are rejected", () => {
   }
 });
 
-test("options keep server order, trim titles, and dedupe exact duplicate titles", () => {
+test("options keep server order and same-title IDs instead of hiding edited collections", () => {
   const items = [
     summary({ id: "newest", title: " 较新题库 ", imageCount: 3, updatedAt: "2026-03-01T00:00:00.000Z" }),
     summary({ id: "duplicate-1", title: "重复标题", imageCount: 8, updatedAt: "2026-02-01T00:00:00.000Z" }),
-    summary({ id: "duplicate-2", title: "重复标题", imageCount: 12, updatedAt: "2026-01-01T00:00:00.000Z" }),
-    summary({ id: "full", title: "已满题库", imageCount: 30 }), // 已满 30 题仍可继续追加
-    summary({ id: "edited", title: "已编辑题库", imageCount: 5, isStructureEdited: true }),
+    summary({ id: "duplicate-2", title: "重复标题", imageCount: 12, isCanonicalCollection: false, updatedAt: "2026-01-01T00:00:00.000Z" }),
+    summary({ id: "full", title: "已满题库", imageCount: 30 }),
+    summary({ id: "edited", title: "已编辑题库", imageCount: 5, isCanonicalCollection: false, isStructureEdited: true }),
     summary({ id: "blank", title: "   " }),
-    summary({ id: "room-made", title: "房间题库", isCanonicalCollection: false }),
+    summary({ id: "room-made", title: "房间题库", isCanonicalCollection: false, submissionCount: 0 }),
   ];
   const options = toAppendableQuestionSetOptions(items);
-  assert.deepEqual(options.map((option) => option.id), ["newest", "duplicate-1", "full"]);
+  assert.deepEqual(options.map((option) => option.id), ["newest", "duplicate-1", "duplicate-2", "full", "edited"]);
   assert.equal(options[0].title, "较新题库");
-  assert.equal(options[0].imageCount, 3);
-  assert.equal(options[0].updatedAt, "2026-03-01T00:00:00.000Z");
-  // 重复标题只保留服务端顺序中的第一个
-  assert.equal(options[1].title, "重复标题");
-  assert.equal(options[1].imageCount, 8);
-  // 已满 30 题的题库仍然列出，imageCount 保持原值
-  assert.equal(options[2].id, "full");
-  assert.equal(options[2].imageCount, 30);
+  assert.equal(options[2].isCanonicalCollection, false);
+  assert.equal(options[4].isStructureEdited, true);
 });
 
-test("exact-title lookup is whitespace-exact and returns null when absent", () => {
+test("exact-title lookup prefers the canonical ID and otherwise keeps exact matching", () => {
   const options = toAppendableQuestionSetOptions([
-    summary({ id: "a", title: "AIR", imageCount: 4 }),
-    summary({ id: "b", title: "AIR 剧场版", imageCount: 7 }),
+    summary({ id: "detached", title: "AIR", isCanonicalCollection: false, isStructureEdited: true }),
+    summary({ id: "canonical", title: "AIR" }),
+    summary({ id: "movie", title: "AIR 剧场版" }),
   ]);
-  assert.equal(findAppendableQuestionSetByTitle(options, "AIR")?.id, "a");
-  assert.equal(findAppendableQuestionSetByTitle(options, "  AIR  ")?.id, "a");
-  // 服务端提交标题同样会 trim，因此查询两侧空白不参与匹配；大小写与内部空白保持精确
-  assert.equal(findAppendableQuestionSetByTitle(options, "AIR ")?.id, "a");
+  assert.equal(findAppendableQuestionSetByTitle(options, "AIR")?.id, "canonical");
+  assert.equal(findAppendableQuestionSetByTitle(options, "  AIR  ")?.id, "canonical");
   assert.equal(findAppendableQuestionSetByTitle(options, "air"), null);
-  assert.equal(findAppendableQuestionSetByTitle(options, " AIR ")?.id, "a");
-  assert.equal(findAppendableQuestionSetByTitle(options, "AIR 剧场版")?.id, "b");
-  assert.equal(findAppendableQuestionSetByTitle(options, "AIR 剧场版 ")?.id, "b");
+  assert.equal(findAppendableQuestionSetByTitle(options, "AIR 剧场版")?.id, "movie");
   assert.equal(findAppendableQuestionSetByTitle(options, ""), null);
-  assert.equal(findAppendableQuestionSetByTitle(options, "   "), null);
   assert.equal(findAppendableQuestionSetByTitle([], "AIR"), null);
 });
 
 test("default selection prefers 猜猜群题库, then the first existing set, then new", () => {
   const options = toAppendableQuestionSetOptions([
     summary({ id: "first", title: "其他题库" }),
+    summary({ id: "guess-detached", title: "猜猜群题库", isCanonicalCollection: false, isStructureEdited: true }),
     summary({ id: "guess-group", title: "猜猜群题库" }),
   ]);
   assert.equal(getDefaultAppendableQuestionSetId(options, "猜猜群题库"), "guess-group");

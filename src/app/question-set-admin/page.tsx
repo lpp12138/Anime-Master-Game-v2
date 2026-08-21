@@ -670,7 +670,7 @@ export default function QuestionSetAdminPage() {
                       )}
                       {detail.isStructureEdited && (
                         <div className="mt-4 rounded-lg border border-violet-200 bg-violet-50 px-4 py-3 text-sm leading-6 text-violet-900">
-                          此题库曾执行新增、删除或调序，已与“同标题自动追加”规范集合分离，以保护历史投稿范围；它仍可正常公开和游玩。
+                          此题库曾执行新增、删除或调序，因此不再仅凭同标题自动命中；它仍可正常公开、游玩，并可在截图上传页按题库 ID 选择后继续追加。
                         </div>
                       )}
 

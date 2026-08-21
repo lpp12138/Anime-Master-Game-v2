@@ -2781,6 +2781,16 @@ async function handleCommunityQuestionSetCreate(request: Request, env: Env, cach
   if (!/^[a-zA-Z0-9_-]{16,160}$/.test(submissionId)) {
     return json({ error: "投稿标识无效，请刷新页面后重试。" }, { status: 400 }, request, env);
   }
+  const rawTargetQuestionSetId = payload.targetQuestionSetId;
+  if (
+    rawTargetQuestionSetId !== undefined
+    && (typeof rawTargetQuestionSetId !== "string" || !/^[a-zA-Z0-9_-]{1,160}$/.test(rawTargetQuestionSetId.trim()))
+  ) {
+    return json({ error: "要追加的题库标识无效，请刷新列表后重试。" }, { status: 400 }, request, env);
+  }
+  const targetQuestionSetId = typeof rawTargetQuestionSetId === "string"
+    ? rawTargetQuestionSetId.trim()
+    : undefined;
 
   const prefix = getR2ImagePrefix(env);
   const requiredKeyPrefix = [prefix, "community"].filter(Boolean).join("/") + "/";
@@ -2831,6 +2841,7 @@ async function handleCommunityQuestionSetCreate(request: Request, env: Env, cach
   const submissionFingerprint = await sha256Hex(JSON.stringify({
     version: 1,
     title: title.replace(/[\r\n]+/g, " ").trim(),
+    ...(targetQuestionSetId ? { targetQuestionSetId } : {}),
     description: description?.trim() || null,
     playerId: playerId.trim(),
     nickname: nickname.replace(/[\r\n]+/g, " ").trim(),
@@ -2921,6 +2932,7 @@ async function handleCommunityQuestionSetCreate(request: Request, env: Env, cach
       playerId,
       nickname,
       title,
+      targetQuestionSetId,
       description,
       questions: canonicalQuestions.map((question) => ({
         imageUrl: getR2PublicUrl(request, env, question.r2Key),
@@ -2933,6 +2945,9 @@ async function handleCommunityQuestionSetCreate(request: Request, env: Env, cach
     }));
   } catch (error) {
     if (error instanceof gameService.HomepageCommunityQuestionSetConflictError) {
+      return json({ error: error.message }, { status: 409 }, request, env);
+    }
+    if (error instanceof gameService.HomepageCommunityQuestionSetAppendTargetError) {
       return json({ error: error.message }, { status: 409 }, request, env);
     }
     if (error instanceof gameService.HomepageCommunityQuestionSetDuplicateImageError) {

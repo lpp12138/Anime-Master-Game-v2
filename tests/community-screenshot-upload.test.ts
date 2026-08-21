@@ -761,6 +761,103 @@ test("same-title homepage submissions append atomically to one ordered question 
   assert.equal(submissionCount.count, 2);
 });
 
+test("an explicitly selected structurally edited community set can continue appending by ID", async () => {
+  const { db, env } = createTestEnv();
+  const uploadBodies = [
+    [ONE_PIXEL_PNG, "image/png"],
+    [ONE_PIXEL_WEBP, "image/webp"],
+    [imageVariant(ONE_PIXEL_PNG, 7), "image/png"],
+  ] as const;
+  const uploaded: Array<{ key: string }> = [];
+  for (const [bytes, contentType] of uploadBodies) {
+    const response = await worker.fetch(uploadRequest(bytes, UPLOAD_SECRET, contentType), env);
+    assert.equal(response.status, 200, await response.clone().text());
+    uploaded.push(await response.json() as { key: string });
+  }
+
+  const firstResponse = await worker.fetch(finalizeRequest({
+    submissionId: "edited-append-first-submission",
+    title: "人工编辑后继续追加",
+    playerId: "edited-append-player",
+    nickname: "编辑后上传者",
+    questions: [{ r2Key: uploaded[0].key, labelText: "第一题" }],
+  }), env);
+  assert.equal(firstResponse.status, 200, await firstResponse.clone().text());
+  const created = await firstResponse.json() as { id: string };
+  const secondResponse = await worker.fetch(finalizeRequest({
+    submissionId: "edited-append-second-submission",
+    title: "人工编辑后继续追加",
+    playerId: "edited-append-player",
+    nickname: "编辑后上传者",
+    questions: [{ r2Key: uploaded[1].key, labelText: "第二题" }],
+  }), env);
+  assert.equal(secondResponse.status, 200, await secondResponse.clone().text());
+  assert.equal((await secondResponse.json() as { id: string }).id, created.id);
+
+  const detailResponse = await worker.fetch(questionSetAdminRequest(`/api/admin/question-sets/${created.id}`), env);
+  const detail = await detailResponse.json() as {
+    updatedAt: string;
+    questions: Array<{ id: string; answerText: string }>;
+  };
+  const secondQuestion = detail.questions.find((question) => question.answerText === "第二题")!;
+  const deleteResponse = await worker.fetch(questionSetAdminRequest(
+    `/api/admin/question-sets/${created.id}/questions/${secondQuestion.id}`,
+    {
+      method: "DELETE",
+      body: { confirmQuestionId: secondQuestion.id, expectedUpdatedAt: detail.updatedAt },
+    },
+  ), env);
+  assert.equal(deleteResponse.status, 200, await deleteResponse.clone().text());
+  const detached = db.sqlite.prepare(`SELECT image_count,community_collection_title,community_structure_edited
+    FROM question_sets WHERE id=?`).get(created.id) as Record<string, unknown>;
+  assert.deepEqual({ ...detached }, {
+    image_count: 1,
+    community_collection_title: null,
+    community_structure_edited: 1,
+  });
+
+  // 当前题数回到 1，而历史第二次投稿的 start_order_index 也是 1。0035 移除
+  // 过时的范围唯一限制后，新投稿可按明确题库 ID 正常追加到当前末尾。
+  const thirdPayload = {
+    submissionId: "edited-append-third-submission",
+    title: "人工编辑后继续追加",
+    targetQuestionSetId: created.id,
+    playerId: "edited-append-player",
+    nickname: "编辑后上传者",
+    questions: [{ r2Key: uploaded[2].key, labelText: "第三题" }],
+  };
+  const appendedResponse = await worker.fetch(finalizeRequest(thirdPayload), env);
+  assert.equal(appendedResponse.status, 200, await appendedResponse.clone().text());
+  const appended = await appendedResponse.json() as { id: string; imageCount: number; appended: boolean };
+  assert.deepEqual(appended, {
+    id: created.id,
+    title: "人工编辑后继续追加",
+    imageCount: 2,
+    appended: true,
+    addedImageCount: 1,
+  });
+  const retryResponse = await worker.fetch(finalizeRequest(thirdPayload), env);
+  assert.equal(retryResponse.status, 200);
+  assert.deepEqual(await retryResponse.json(), appended);
+
+  const stored = db.sqlite.prepare("SELECT * FROM question_sets WHERE id=?").get(created.id) as Record<string, unknown>;
+  assert.equal(stored.community_structure_edited, 1);
+  assert.equal(stored.community_collection_title, null);
+  assert.deepEqual(decodeQuestionSetManifest(stored)?.map((question) => [question.order_index, question.label_text]), [
+    [0, "第一题"],
+    [1, "第三题"],
+  ]);
+  const ranges = db.sqlite.prepare(`SELECT start_order_index,added_image_count
+    FROM community_question_set_submissions WHERE question_set_id=? ORDER BY created_at,submission_id`)
+    .all(created.id) as Array<{ start_order_index: number; added_image_count: number }>;
+  assert.deepEqual(ranges.map((row) => ({ ...row })), [
+    { start_order_index: 0, added_image_count: 1 },
+    { start_order_index: 1, added_image_count: 1 },
+    { start_order_index: 1, added_image_count: 1 },
+  ]);
+  assert.equal(db.sqlite.prepare("SELECT COUNT(*) count FROM question_sets WHERE title='人工编辑后继续追加'").get().count, 1);
+});
+
 test("same-title append retries a lost manifest revision CAS without duplicating rows", async () => {
   const { db, env } = createTestEnv();
   const firstUpload = await worker.fetch(uploadRequest(ONE_PIXEL_PNG), env);
@@ -1057,6 +1154,14 @@ test("question-set finalization enforces count, label, and request-body limits",
     questions: [{ r2Key: uploaded.key, labelText: "   " }],
   }), env);
   assert.equal(blankLabel.status, 400);
+
+  const invalidTarget = await worker.fetch(finalizeRequest({
+    ...base,
+    targetQuestionSetId: null,
+    questions: [{ r2Key: uploaded.key, labelText: "答案" }],
+  }), env);
+  assert.equal(invalidTarget.status, 400);
+  assert.match(JSON.stringify(await invalidTarget.json()), /题库标识无效/);
 
   const unrelatedCharacter = await worker.fetch(finalizeRequest({
     ...base,
@@ -2767,6 +2872,98 @@ test("D1 0034 adds a nullable, validated, globally unique image MD5 index", () =
     () => sqlite.prepare("UPDATE question_image_index SET image_md5='ABC' WHERE question_id='md5-migration-two'").run(),
     /CHECK constraint failed/,
   );
+});
+
+test("D1 0035 allows historical submission start ranges to repeat after structural edits", () => {
+  const sqlite = new DatabaseSync(":memory:");
+  applyMigrations(sqlite, "0034");
+  sqlite.prepare(`INSERT INTO question_sets
+    (id,title,created_by_player_id,is_public,image_count,created_at,updated_at)
+    VALUES (?,?,?,?,?,?,?)`).run(
+    "edited-range-set",
+    "编辑后范围题库",
+    "range-owner",
+    1,
+    1,
+    "2026-08-21T00:00:00.000Z",
+    "2026-08-21T00:00:00.000Z",
+  );
+  const insert = sqlite.prepare(`INSERT INTO community_question_set_submissions
+    (submission_id,submission_fingerprint,question_set_id,start_order_index,added_image_count,created_at)
+    VALUES (?,?,?,?,?,?)`);
+  insert.run("edited-range-first-submission", "1".repeat(64), "edited-range-set", 0, 1, "2026-08-21T00:00:00.000Z");
+  insert.run("edited-range-old-second", "2".repeat(64), "edited-range-set", 1, 1, "2026-08-21T00:01:00.000Z");
+  assert.throws(
+    () => insert.run("edited-range-before-migration", "3".repeat(64), "edited-range-set", 1, 1, "2026-08-21T00:02:00.000Z"),
+    /UNIQUE constraint failed/,
+  );
+
+  const migration = readFileSync(resolve(
+    import.meta.dirname,
+    "..",
+    "d1",
+    "migrations",
+    "0035_allow_structurally_edited_appends.sql",
+  ), "utf8");
+  sqlite.exec("BEGIN IMMEDIATE");
+  try {
+    sqlite.exec(migration);
+    throw new Error("injected migration failure");
+  } catch {
+    sqlite.exec("ROLLBACK");
+  }
+  assert.throws(
+    () => insert.run("edited-range-after-rollback", "4".repeat(64), "edited-range-set", 1, 1, "2026-08-21T00:03:00.000Z"),
+    /UNIQUE constraint failed/,
+  );
+
+  sqlite.exec(migration);
+  sqlite.prepare(`INSERT INTO community_question_set_submissions
+    (submission_id,submission_fingerprint,question_set_id,start_order_index,added_image_count,created_at)
+    VALUES (?,?,?,?,?,?)`).run(
+    "edited-range-new-append",
+    "5".repeat(64),
+    "edited-range-set",
+    1,
+    1,
+    "2026-08-21T00:04:00.000Z",
+  );
+  const starts = sqlite.prepare(`SELECT start_order_index FROM community_question_set_submissions
+    WHERE question_set_id='edited-range-set' ORDER BY created_at`).all() as Array<{ start_order_index: number }>;
+  assert.deepEqual(starts.map((row) => row.start_order_index), [0, 1, 1]);
+  assert.throws(
+    () => sqlite.prepare(`INSERT INTO community_question_set_submissions
+      (submission_id,submission_fingerprint,question_set_id,start_order_index,added_image_count,created_at)
+      VALUES (?,?,?,?,?,?)`).run(
+      "edited-range-new-append",
+      "6".repeat(64),
+      "edited-range-set",
+      2,
+      1,
+      "2026-08-21T00:05:00.000Z",
+    ),
+    /UNIQUE constraint failed/,
+  );
+  assert.throws(
+    () => sqlite.prepare(`INSERT INTO community_question_set_submissions
+      (submission_id,submission_fingerprint,question_set_id,start_order_index,added_image_count,created_at)
+      VALUES (?,?,?,?,?,?)`).run(
+      "edited-range-too-many",
+      "7".repeat(64),
+      "edited-range-set",
+      2,
+      31,
+      "2026-08-21T00:06:00.000Z",
+    ),
+    /CHECK constraint failed/,
+  );
+  const rangeIndex = sqlite.prepare(`SELECT "unique" AS is_unique FROM pragma_index_list('community_question_set_submissions')
+    WHERE name='community_question_set_submissions_set_idx'`).get() as { is_unique: number };
+  assert.equal(rangeIndex.is_unique, 0);
+
+  // Rebuild migration remains repeatable in isolated rollback/recovery tooling.
+  sqlite.exec(migration);
+  assert.equal(sqlite.prepare("SELECT COUNT(*) count FROM community_question_set_submissions").get().count, 3);
 });
 
 test("old manifests without is_r18 decode as false and invalid markers fail closed", () => {
