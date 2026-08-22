@@ -108,6 +108,10 @@ export type Room = {
   teamAssignments?: Partial<Record<string, TeamBattleTeam>>;
   /** 房间级“包含 R18 题目”开关；默认 false，关闭时服务端抽题必须排除 R18 题目。 */
   includeR18?: boolean;
+  /** 房间级“翻格解锁 Tag 提示”开关；默认 false（关闭）。开启后每翻出 tagHintBlockStep 格解锁当前图片的 1 个属性 Tag。 */
+  tagHintsEnabled?: boolean;
+  /** 每翻出多少格解锁一个 Tag 提示；1-15，默认 5。 */
+  tagHintBlockStep?: number;
   createdAt: number | string;
   updatedAt?: string;
 };
@@ -144,6 +148,10 @@ export type DbRoom = {
   lobby_team_assignments?: unknown;
   /** 房间级“包含 R18 题目”开关的持久列；0/1 或布尔，旧房间默认 false。 */
   lobby_include_r18?: number | boolean | null;
+  /** 房间级“翻格解锁 Tag 提示”开关的持久列；0/1 或布尔，旧房间默认 false。 */
+  lobby_tag_hints_enabled?: number | boolean | null;
+  /** 每翻出多少格解锁一个 Tag 提示的持久列；1-15，旧房间默认 5。 */
+  lobby_tag_hint_block_step?: number | null;
   runtime_generation?: number | null;
   room_state_version?: number | null;
   room_state_revision?: number | null;
@@ -270,6 +278,8 @@ export type Question = {
   createdAt: string;
   /** 社区图库中本题图片的上传者昵称（出题人）；非社区题库或未知历史投稿为 null。 */
   uploaderNickname?: string | null;
+  /** 本题图片的 Bangumi 属性 Tag 名称（按热度降序，最多 20 条）；非社区题库或未知为 []。 */
+  genreTags?: string[];
 };
 
 export type QuestionUrlImportInput = {

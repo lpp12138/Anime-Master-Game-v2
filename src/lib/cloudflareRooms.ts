@@ -240,6 +240,10 @@ export const updateRoomGameSettings = (params: {
   questionCount?: number | null;
   /** 房间级“包含 R18 题目”开关；默认关闭，关闭时服务端抽题排除 R18 题目。 */
   includeR18?: boolean;
+  /** 房间级“翻格解锁 Tag 提示”开关；默认关闭。 */
+  tagHintsEnabled?: boolean;
+  /** 每翻出多少格解锁一个 Tag 提示（1-15）；默认 5。 */
+  tagHintBlockStep?: number;
 }) => rpc<Room>("updateRoomGameSettings", params);
 
 export const updateRoomNotice = (params: { roomId: string; hostPlayerId: string; notice: string }) =>

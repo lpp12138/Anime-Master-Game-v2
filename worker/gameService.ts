@@ -358,6 +358,8 @@ function toRoom(room: DbRoom, players: DbPlayer[] = getRoomStatePlayers(room)): 
     teamAssignmentMode: normalizeTeamAssignmentMode(room.lobby_team_assignment_mode),
     teamAssignments: sanitizeTeamAssignments(room, players),
     includeR18: isDbTruthy(room.lobby_include_r18),
+    tagHintsEnabled: isDbTruthy(room.lobby_tag_hints_enabled),
+    tagHintBlockStep: normalizeTagHintBlockStep(room.lobby_tag_hint_block_step),
     createdAt: room.created_at,
     updatedAt: room.updated_at,
   };
@@ -366,6 +368,7 @@ function toRoom(room: DbRoom, players: DbPlayer[] = getRoomStatePlayers(room)): 
 function toQuestion(
   question: DbQuestion,
   uploaderByQuestionId?: ReadonlyMap<string, string | null> | null,
+  genreByQuestionId?: ReadonlyMap<string, string[]> | null,
 ): Question {
   return {
     id: question.id,
@@ -380,6 +383,7 @@ function toQuestion(
     labelUpdatedAt: question.label_updated_at ?? null,
     createdAt: question.created_at,
     uploaderNickname: uploaderByQuestionId?.get(question.id) ?? null,
+    genreTags: genreByQuestionId?.get(question.id) ?? [],
   };
 }
 
@@ -387,6 +391,7 @@ function toQuestionSet(
   questionSet: DbQuestionSet,
   questions: DbQuestion[] = [],
   uploaderByQuestionId?: ReadonlyMap<string, string | null> | null,
+  genreByQuestionId?: ReadonlyMap<string, string[]> | null,
 ): QuestionSet {
   const questionUrlsText = questions
     .slice()
@@ -410,7 +415,7 @@ function toQuestionSet(
     playCount: questionSet.play_count ?? 0,
     createdAt: questionSet.created_at,
     updatedAt: questionSet.updated_at,
-    questions: questions.map((question) => toQuestion(question, uploaderByQuestionId)),
+    questions: questions.map((question) => toQuestion(question, uploaderByQuestionId, genreByQuestionId)),
   };
 }
 
@@ -418,9 +423,10 @@ function toGameQuestionSet(
   questionSet: DbQuestionSet,
   questions: DbQuestion[],
   uploaderByQuestionId?: ReadonlyMap<string, string | null> | null,
+  genreByQuestionId?: ReadonlyMap<string, string[]> | null,
 ) {
   return {
-    ...toQuestionSet(questionSet, questions, uploaderByQuestionId),
+    ...toQuestionSet(questionSet, questions, uploaderByQuestionId, genreByQuestionId),
     imageUrlsText: questions.map((question) => question.image_url).join("\n"),
   };
 }
@@ -467,6 +473,51 @@ async function getCommunityQuestionUploaderNicknames(
     if (nickname) uploaders.set(question.id, nickname);
   }
   return uploaders;
+}
+
+/**
+ * 每张图片的 Bangumi 属性 Tag 名称（按热度降序，最多 20 条），来自
+ * question_image_index 的 anime_genre_tags_json；非社区题库或旧夹具没有
+ * 对应行时返回空数组。仅供低频的游戏载荷构建使用。
+ */
+async function getCommunityQuestionGenreTags(
+  questionSetId: string,
+): Promise<Map<string, string[]>> {
+  assertD1Env();
+  try {
+    const result = await d1
+      .from("question_image_index")
+      .select("question_id,anime_genre_tags_json")
+      .eq("question_set_id", questionSetId);
+    if (result.error) throw new Error(result.error.message);
+    const genreByQuestionId = new Map<string, string[]>();
+    for (const row of result.data ?? []) {
+      genreByQuestionId.set(row.question_id, parseGenreTagNames(row.anime_genre_tags_json));
+    }
+    return genreByQuestionId;
+  } catch (error) {
+    // 旧测试夹具/旧部署没有该表或列时优雅降级：不显示 Tag 提示。
+    if (error instanceof Error && /no such table|no such column/i.test(error.message)) {
+      return new Map<string, string[]>();
+    }
+    throw error;
+  }
+}
+
+function parseGenreTagNames(value: unknown): string[] {
+  let parsed: unknown = value;
+  if (typeof value === "string") {
+    try {
+      parsed = JSON.parse(value);
+    } catch {
+      return [];
+    }
+  }
+  if (!Array.isArray(parsed)) return [];
+  return parsed
+    .map((item) => (item && typeof item === "object" && typeof (item as { name?: unknown }).name === "string" ? (item as { name: string }).name : ""))
+    .filter(Boolean)
+    .slice(0, 20);
 }
 
 async function getPlayerNickname(playerId: string, roomId?: string) {
@@ -1901,6 +1952,11 @@ function getSelectableTeamBattleBlocks(session: Pick<GameSession, "revealedBlock
 
 function isDbTruthy(value: unknown) {
   return value === true || value === 1;
+}
+
+/** 房间 Tag 提示步长：1-15 的整数，历史/异常值回退到默认 5。 */
+function normalizeTagHintBlockStep(value: unknown) {
+  return Number.isInteger(value) && Number(value) >= 1 && Number(value) <= 15 ? Number(value) : 5;
 }
 
 export type QuestionImportItem = {
@@ -3618,6 +3674,10 @@ export async function updateRoomGameSettings(params: {
   questionCount?: number | null;
   /** 房间级“包含 R18 题目”开关；省略时保持当前值。关闭时服务端按它排除候选题。 */
   includeR18?: boolean;
+  /** 房间级“翻格解锁 Tag 提示”开关；省略时保持当前值。 */
+  tagHintsEnabled?: boolean;
+  /** 每翻出多少格解锁一个 Tag 提示（1-15）；省略时保持当前值。 */
+  tagHintBlockStep?: number;
 }) {
   assertD1Env();
 
@@ -3676,6 +3736,20 @@ export async function updateRoomGameSettings(params: {
       throw new Error("“包含 R18 题目”开关必须是布尔值（true 或 false）。");
     }
     includeR18 = params.includeR18;
+  }
+  // tagHintsEnabled 只接受 boolean；tagHintBlockStep 必须是 1-15 的整数。
+  let tagHintsEnabled = isDbTruthy(currentRoom.lobby_tag_hints_enabled);
+  if (params.tagHintsEnabled !== undefined) {
+    if (typeof params.tagHintsEnabled !== "boolean") {
+      throw new Error("“翻格解锁 Tag 提示”开关必须是布尔值（true 或 false）。");
+    }
+    tagHintsEnabled = params.tagHintsEnabled;
+  }
+  const tagHintBlockStep = params.tagHintBlockStep === undefined
+    ? normalizeTagHintBlockStep(currentRoom.lobby_tag_hint_block_step)
+    : normalizeTagHintBlockStep(params.tagHintBlockStep);
+  if (params.tagHintBlockStep !== undefined && tagHintBlockStep !== params.tagHintBlockStep) {
+    throw new Error("Tag 提示解锁步长必须是 1-15 的整数。");
   }
   const includeR18Changed = includeR18 !== isDbTruthy(currentRoom.lobby_include_r18);
   let preparedQuestionCount = normalizeQuestionCount(currentRoom.prepared_question_count);
@@ -3736,6 +3810,8 @@ export async function updateRoomGameSettings(params: {
     lobby_question_count: questionCount,
     lobby_team_assignment_mode: teamAssignmentMode,
     lobby_include_r18: includeR18 ? 1 : 0,
+    lobby_tag_hints_enabled: tagHintsEnabled ? 1 : 0,
+    lobby_tag_hint_block_step: tagHintBlockStep,
     // 已准备题库时始终按最新开关重写可用题数（0 可用时写 NULL），
     // 未准备题库时保持原样，避免覆盖其他阶段的清理语义。
     ...(typeof currentRoom.prepared_question_set_id === "string"
@@ -3895,9 +3971,14 @@ export async function startGameWithQuestionSet(params: {
               currentQuestionSet,
               currentQuestionsResult.questions,
               currentQuestionsResult.uploaderByQuestionId,
+              currentQuestionsResult.genreByQuestionId,
             ),
             questions: currentQuestionsResult.questions.map(
-              (question) => toQuestion(question, currentQuestionsResult.uploaderByQuestionId),
+              (question) => toQuestion(
+                question,
+                currentQuestionsResult.uploaderByQuestionId,
+                currentQuestionsResult.genreByQuestionId,
+              ),
             ),
             questionSetManifestVersion: currentQuestionSet.manifest_version ?? null,
           },
@@ -4191,7 +4272,11 @@ export async function startGameWithQuestionSet(params: {
 
   const vnextQuestionResult = params.authorityVersion === 2
     ? await getDbQuestionsForGameSession(gameSession, questionSet)
-    : { questions: [] as DbQuestion[], uploaderByQuestionId: new Map<string, string | null>() };
+    : {
+        questions: [] as DbQuestion[],
+        uploaderByQuestionId: new Map<string, string | null>(),
+        genreByQuestionId: new Map<string, string[]>(),
+      };
   return {
     gameSession: hydratedGameSession,
     room: toRoom(updatedRoom),
@@ -4199,9 +4284,18 @@ export async function startGameWithQuestionSet(params: {
       ? {
           __authorityVNextBootstrap: {
             players: players.map(toPlayer),
-            questionSet: toGameQuestionSet(questionSet, vnextQuestionResult.questions, vnextQuestionResult.uploaderByQuestionId),
+            questionSet: toGameQuestionSet(
+              questionSet,
+              vnextQuestionResult.questions,
+              vnextQuestionResult.uploaderByQuestionId,
+              vnextQuestionResult.genreByQuestionId,
+            ),
             questions: vnextQuestionResult.questions.map(
-              (question) => toQuestion(question, vnextQuestionResult.uploaderByQuestionId),
+              (question) => toQuestion(
+                question,
+                vnextQuestionResult.uploaderByQuestionId,
+                vnextQuestionResult.genreByQuestionId,
+              ),
             ),
             questionSetManifestVersion: questionSet.manifest_version ?? null,
           },
@@ -4356,9 +4450,10 @@ async function getDbQuestionsForGameSession(gameSession: DbGameSession, question
 
   const allQuestions = await getDbQuestionsForQuestionSet(resolvedQuestionSet);
   const uploaderByQuestionId = await getCommunityQuestionUploaderNicknames(resolvedQuestionSet.id, allQuestions);
+  const genreByQuestionId = await getCommunityQuestionGenreTags(resolvedQuestionSet.id);
   const selectedQuestionIds = normalizeSelectedQuestionIds(gameSession.selected_question_ids);
   if (selectedQuestionIds.length === 0) {
-    return { questions: allQuestions, uploaderByQuestionId };
+    return { questions: allQuestions, uploaderByQuestionId, genreByQuestionId };
   }
   const questionById = new Map(allQuestions.map((question) => [question.id, question]));
   const questions = selectedQuestionIds.map((questionId, orderIndex) => {
@@ -4366,7 +4461,7 @@ async function getDbQuestionsForGameSession(gameSession: DbGameSession, question
     if (!question) throw new Error("本局抽题快照引用了不存在的题目。");
     return { ...question, order_index: orderIndex };
   });
-  return { questions, uploaderByQuestionId };
+  return { questions, uploaderByQuestionId, genreByQuestionId };
 }
 
 async function getDbGameSessionById(gameSessionId: string) {
@@ -4398,8 +4493,8 @@ export async function getQuestionsByQuestionSetId(questionSetId: string) {
 }
 
 async function getQuestionsForGameSession(gameSession: DbGameSession) {
-  const { questions, uploaderByQuestionId } = await getDbQuestionsForGameSession(gameSession);
-  return questions.map((question) => toQuestion(question, uploaderByQuestionId));
+  const { questions, uploaderByQuestionId, genreByQuestionId } = await getDbQuestionsForGameSession(gameSession);
+  return questions.map((question) => toQuestion(question, uploaderByQuestionId, genreByQuestionId));
 }
 
 async function getQuestionSetForGameSession(gameSession: DbGameSession) {
@@ -4410,8 +4505,8 @@ async function getQuestionSetForGameSession(gameSession: DbGameSession) {
     .maybeSingle<DbQuestionSet>();
   if (error) throw new Error(error.message);
   if (!questionSet) return null;
-  const { questions, uploaderByQuestionId } = await getDbQuestionsForGameSession(gameSession, questionSet);
-  return toGameQuestionSet(questionSet, questions, uploaderByQuestionId);
+  const { questions, uploaderByQuestionId, genreByQuestionId } = await getDbQuestionsForGameSession(gameSession, questionSet);
+  return toGameQuestionSet(questionSet, questions, uploaderByQuestionId, genreByQuestionId);
 }
 
 export async function confirmRevealBlocks(params: {

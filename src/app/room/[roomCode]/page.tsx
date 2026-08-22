@@ -86,6 +86,10 @@ type GameSettings = {
   questionCount: number | null;
   /** 房间级“包含 R18 题目”开关；默认关闭。 */
   includeR18: boolean;
+  /** 房间级“翻格解锁 Tag 提示”开关；默认关闭。 */
+  tagHintsEnabled: boolean;
+  /** 每翻出多少格解锁一个 Tag 提示（1-15）；默认 5。 */
+  tagHintBlockStep: number;
 };
 
 const defaultGameSettings: GameSettings = {
@@ -103,6 +107,8 @@ const defaultGameSettings: GameSettings = {
   teamAssignmentMode: "MANUAL",
   questionCount: null,
   includeR18: false,
+  tagHintsEnabled: false,
+  tagHintBlockStep: 5,
 };
 
 function createStartRequestId() {
@@ -202,6 +208,14 @@ function normalizeGameSettings(settings: Partial<GameSettings>): GameSettings {
         ? settings.questionCount
         : null,
     includeR18: settings.includeR18 === true,
+    tagHintsEnabled: settings.tagHintsEnabled === true,
+    tagHintBlockStep:
+      typeof settings.tagHintBlockStep === "number" &&
+      Number.isInteger(settings.tagHintBlockStep) &&
+      settings.tagHintBlockStep >= 1 &&
+      settings.tagHintBlockStep <= 15
+        ? settings.tagHintBlockStep
+        : 5,
   };
 }
 
@@ -221,6 +235,8 @@ function getRoomGameSettings(room: Room | null | undefined): GameSettings {
     teamAssignmentMode: room?.teamAssignmentMode,
     questionCount: room?.questionCount,
     includeR18: room?.includeR18 === true,
+    tagHintsEnabled: room?.tagHintsEnabled === true,
+    tagHintBlockStep: room?.tagHintBlockStep,
   });
 }
 
@@ -240,7 +256,9 @@ function areGameSettingsEqual(left: GameSettings, right: GameSettings) {
     left.spectatorCapacity === right.spectatorCapacity &&
     left.teamAssignmentMode === right.teamAssignmentMode &&
     left.questionCount === right.questionCount &&
-    left.includeR18 === right.includeR18
+    left.includeR18 === right.includeR18 &&
+    left.tagHintsEnabled === right.tagHintsEnabled &&
+    left.tagHintBlockStep === right.tagHintBlockStep
   );
 }
 
@@ -1099,6 +1117,42 @@ function GameSettingsPanel({
               </label>
               <p className="min-w-0 text-xs leading-5 text-[var(--muted)]">
                 默认关闭；关闭时本局不抽取标记为 R18 的题目，由服务端按开关过滤，可用题数会相应减少。
+              </p>
+            </div>
+
+            <div className="mt-4 flex flex-wrap items-center justify-between gap-x-4 gap-y-2">
+              <label className="flex min-w-0 cursor-pointer items-center gap-2">
+                <input
+                  aria-label="翻格解锁 Tag 提示"
+                  checked={settings.tagHintsEnabled}
+                  className="h-4 w-4 shrink-0 accent-violet-600"
+                  disabled={!canEdit}
+                  type="checkbox"
+                  onChange={(event) =>
+                    onChange({ ...settings, tagHintsEnabled: event.target.checked })
+                  }
+                />
+                <span className="text-sm font-semibold text-slate-900">翻格解锁 Tag 提示</span>
+              </label>
+              <label className="flex min-w-0 items-center gap-2">
+                <span className="text-xs font-semibold text-slate-700">每</span>
+                <select
+                  aria-label="Tag 提示解锁步长"
+                  className="h-8 rounded-md border border-[var(--line)] bg-white px-2 text-sm"
+                  disabled={!canEdit || !settings.tagHintsEnabled}
+                  value={settings.tagHintBlockStep}
+                  onChange={(event) =>
+                    onChange({ ...settings, tagHintBlockStep: Number(event.target.value) })
+                  }
+                >
+                  {[1, 2, 3, 4, 5, 6, 8, 10, 15].map((step) => (
+                    <option key={step} value={step}>{step} 格</option>
+                  ))}
+                </select>
+                <span className="text-xs font-semibold text-slate-700">解锁 1 个 Tag</span>
+              </label>
+              <p className="min-w-0 w-full text-xs leading-5 text-[var(--muted)]">
+                默认关闭；开启后，游戏中每翻出指定格数会解锁当前图片的 1 个作品属性 Tag（异世界、年份等，来自 Bangumi），显示在图片下方、聊天框上方；未解锁的 Tag 以问号隐藏。
               </p>
             </div>
 
@@ -2846,6 +2900,8 @@ export default function RoomPage({ initialRoomCode = "" }: { initialRoomCode?: s
         teamAssignmentMode: normalizedSettings.teamAssignmentMode,
         questionCount: normalizedSettings.questionCount,
         includeR18: normalizedSettings.includeR18,
+        tagHintsEnabled: normalizedSettings.tagHintsEnabled,
+        tagHintBlockStep: normalizedSettings.tagHintBlockStep,
       });
 
       if (settingsUpdateSeqRef.current === updateSeq) {

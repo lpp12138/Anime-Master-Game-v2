@@ -152,11 +152,33 @@ test("Bangumi subject detail is canonicalized, carries subjectType, and allows t
   const fetcher = async (input: RequestInfo | URL) => {
     calls += 1;
     assert.equal(String(input), "https://api.bgm.tv/v0/subjects/160209");
-    return new Response(JSON.stringify({ id: 160209, type: 2, name: "君の名は。", name_cn: "你的名字。" }));
+    return new Response(JSON.stringify({
+      id: 160209,
+      type: 2,
+      name: "君の名は。",
+      name_cn: "你的名字。",
+      date: "2016-08-26",
+      tags: [
+        { name: "恋爱", count: 120 },
+        { name: "催泪", count: 60 },
+        { name: "恋爱", count: 99 },
+        { name: "", count: 1 },
+      ],
+    }));
   };
 
   const subject = await getBangumiAnimeSubject(cache, 160209, fetcher as typeof fetch);
-  assert.deepEqual(subject, { id: 160209, name: "君の名は。", nameCn: "你的名字。", subjectType: 2 });
+  assert.deepEqual(subject, {
+    id: 160209,
+    name: "君の名は。",
+    nameCn: "你的名字。",
+    subjectType: 2,
+    date: "2016-08-26",
+    genreTags: [
+      { name: "恋爱", count: 120 },
+      { name: "催泪", count: 60 },
+    ],
+  });
   assert.deepEqual(await getBangumiAnimeSubject(cache, 160209, async () => {
     throw new Error("cache miss");
   }), subject);
@@ -167,12 +189,16 @@ test("Bangumi subject detail is canonicalized, carries subjectType, and allows t
     type: 4,
     name: "Steins;Gate 游戏",
     name_cn: "命运石之门（游戏）",
+    date: "2009-10-15",
+    tags: [{ name: "悬疑", count: 8 }],
   }))) as typeof fetch);
   assert.deepEqual(gameSubject, {
     id: 114514,
     name: "Steins;Gate 游戏",
     nameCn: "命运石之门（游戏）",
     subjectType: 4,
+    date: "2009-10-15",
+    genreTags: [{ name: "悬疑", count: 8 }],
   });
 
   await assert.rejects(

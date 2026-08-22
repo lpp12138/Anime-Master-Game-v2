@@ -38,6 +38,7 @@ npm run build
 | 逐题 R18 标记的导入校验（`is_r18`/`isR18` 只接受 boolean、拒绝 null/冲突）、manifest/legacy/图片索引保存与保留、完整性报告 R18 mismatch 或 `0032_question_is_r18.sql` 迁移 | `npm run test:community-screenshot-upload`、`npm run test:community-question-list`、`npm run test:question-set-creation-method`，并按下方 D1 migration 规则覆盖升级与失败不推进 |
 | 题库管理鉴权（含整库删除的独立删除密钥 403/503）、检索、详情答案、逐题增删改查/换图/调序、元数据更新、安全删除（含释放已准备房间、过期版本不清房间）、D1 引用保护或 R2 引用清理 | `npm run test:community-screenshot-upload`、`npm run test:r2-upload`、`npm run test:question-set-creation-method` |
 | 社区投稿上传者身份（finalize 创建/追加写入、`0036` 迁移回填首份投稿与 CHECK、游戏载荷按题目 ID 携带 `uploaderNickname`） | `npm run test:community-screenshot-upload`、`npm run test:question-set-creation-method`，并按下方 D1 migration 规则覆盖升级 |
+| 房间“翻格解锁 Tag 提示”开关与步长（`0038_room_tag_hints.sql` 默认关闭/步长 5、严格布尔与 1–15 整数校验、游戏载荷按题目 ID 携带 `genreTags`、Tag 栏在图片下方聊天框上方按翻格数解锁） | `npm run test:question-set-creation-method`、`npm run test:community-screenshot-upload`，并按下方 D1 migration 规则覆盖升级 |
 | Bangumi 属性标签与年份（官方 subject 详情去重有界写入、finalize/管理端持久化与复用、`0037_question_genre_tags.sql` CHECK、回填脚本幂等） | `npm run test:community-screenshot-upload`，并按下方 D1 migration 规则覆盖升级；回填脚本用 `--dry-run` 在状态副本上验证 |
 | Bangumi 动画/游戏代理、规范化、范围缓存或上游边界 | `npm run test:bangumi-api`、`npm run test:community-screenshot-upload` |
 | 首页 finalize 的 D1 batch/migration | 上述测试外，使用独立 `--persist-to` 状态在真实本地 Wrangler 中验证强制失败整批回滚、同投稿 ID 并发重试及不同投稿同标题并发追加 |

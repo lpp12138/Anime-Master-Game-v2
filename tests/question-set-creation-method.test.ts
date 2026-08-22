@@ -908,6 +908,21 @@ test("community sets beyond 30 questions prepare and start with the per-game 30 
       "large-set-submission-0000000001", "b".repeat(64), "large-community-set", 30, 10,
       "2026-02-01T00:01:00.000Z", "second-uploader", "第二位上传者",
     );
+    // 每题的属性 Tag 来自 question_image_index；补齐 40 行，验证游戏载荷携带。
+    const insertIndex = db.sqlite.prepare(`INSERT INTO question_image_index
+      (question_id,question_set_id,image_url,answer_text,order_index,created_at,anime_genre_tags_json)
+      VALUES (?,?,?,?,?,?,?)`);
+    for (let index = 0; index < questions.length; index += 1) {
+      insertIndex.run(
+        `large-set-question-${index}`,
+        "large-community-set",
+        `https://example.com/large-${index}.webp`,
+        `Answer ${index + 1}`,
+        index,
+        "2026-02-01T00:00:00.000Z",
+        JSON.stringify([{ name: `属性标签${index}`, count: 10 }]),
+      );
+    }
 
     const prepared = await prepareQuestionSetForStart({
       roomId: room.id!,
@@ -930,6 +945,11 @@ test("community sets beyond 30 questions prepare and start with the per-game 30 
     const firstQuestions = started.__authorityVNextBootstrap.questions;
     assert.equal(firstQuestions.length, 30);
     assert.equal(new Set(firstQuestions.map((question) => question.id)).size, 30);
+    // 每题按题目 ID 携带属性 Tag 名称（与随机抽题顺序无关）。
+    for (const question of firstQuestions) {
+      const expectedTag = `属性标签${question.id.replace("large-set-question-", "")}`;
+      assert.deepEqual(question.genreTags, [expectedTag]);
+    }
     // 每道题都按题目 ID 携带图库上传者昵称（与随机抽题后的顺序无关）。
     assert.ok(firstQuestions.every((question) => question.uploaderNickname));
     const expectedUploader = new Map(
@@ -1464,6 +1484,52 @@ test("updateRoomGameSettings rejects non-boolean includeR18 without partial writ
       includeR18: true,
     });
     assert.equal(toggled.includeR18, true);
+  });
+});
+
+test("updateRoomGameSettings validates tag hint settings without partial writes", async () => {
+  const db = new DatabaseAdapter();
+  applyMigrations(db.sqlite);
+  await runWithGameDatabase(db, async () => {
+    const room = await createRoom("tag-hint-host", "Tag Hint Host");
+    // tagHintsEnabled 是不可信 RPC 输入：非 boolean 必须明确拒绝。
+    for (const bad of [null, 1, 0, "true", "yes", {}, []]) {
+      await assert.rejects(
+        updateRoomGameSettings({
+          roomId: room.id!,
+          hostPlayerId: "tag-hint-host",
+          gameMode: "ROUND_REVEAL",
+          tagHintsEnabled: bad as unknown as boolean,
+        }),
+        /必须是布尔值/,
+      );
+    }
+    // 步长必须是 1-15 的整数。
+    for (const bad of [0, 16, 2.5, -1, "5", null]) {
+      await assert.rejects(
+        updateRoomGameSettings({
+          roomId: room.id!,
+          hostPlayerId: "tag-hint-host",
+          gameMode: "ROUND_REVEAL",
+          tagHintBlockStep: bad as unknown as number,
+        }),
+        /1-15 的整数/,
+      );
+    }
+    // 拒绝发生在任何写入之前：列保持默认值。
+    const row = db.sqlite.prepare("SELECT lobby_tag_hints_enabled,lobby_tag_hint_block_step FROM rooms WHERE id=?")
+      .get(room.id!) as { lobby_tag_hints_enabled: number; lobby_tag_hint_block_step: number };
+    assert.deepEqual({ ...row }, { lobby_tag_hints_enabled: 0, lobby_tag_hint_block_step: 5 });
+    // 合法设置可以持久化并读回。
+    const toggled = await updateRoomGameSettings({
+      roomId: room.id!,
+      hostPlayerId: "tag-hint-host",
+      gameMode: "ROUND_REVEAL",
+      tagHintsEnabled: true,
+      tagHintBlockStep: 3,
+    });
+    assert.equal(toggled.tagHintsEnabled, true);
+    assert.equal(toggled.tagHintBlockStep, 3);
   });
 });
 

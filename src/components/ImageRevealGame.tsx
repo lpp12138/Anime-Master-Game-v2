@@ -2684,6 +2684,18 @@ export function ImageRevealGame({
   // 以单独 label 显示在旁边。非社区题库或未知历史投稿时回退到裁判昵称。
   const currentUploaderName = currentQuestion?.uploaderNickname?.trim() || presenterName;
   const showRefereeLabel = Boolean(currentQuestion?.uploaderNickname?.trim());
+  // Tag 提示解锁：开启后每翻出 tagHintBlockStep 格解锁当前图片的 1 个属性 Tag；
+  // 未解锁的 Tag 以问号隐藏。显示在图片下方、聊天框上方。
+  const tagHintsEnabled = room.tagHintsEnabled === true;
+  const tagHintBlockStep = Number.isInteger(room.tagHintBlockStep)
+    && Number(room.tagHintBlockStep) >= 1
+    && Number(room.tagHintBlockStep) <= 15
+    ? Number(room.tagHintBlockStep)
+    : 5;
+  const currentQuestionGenreTags = currentQuestion?.genreTags ?? [];
+  const unlockedTagCount = tagHintsEnabled
+    ? Math.min(currentQuestionGenreTags.length, Math.floor((gameSession?.revealedBlocks.length ?? 0) / tagHintBlockStep))
+    : 0;
   const teamBattleScoreRows = useMemo(
     () =>
       teamBattleState
@@ -5321,6 +5333,28 @@ export function ImageRevealGame({
         <div className="min-w-0 lg:col-span-4">{imagePanel}</div>
         {actionPanel}
       </div>
+
+      {tagHintsEnabled && currentQuestionGenreTags.length > 0 ? (
+        <div className="mt-3 rounded-lg border border-violet-200 bg-violet-50/60 px-3 py-2">
+          <div className="flex flex-wrap items-center gap-1.5">
+            <span className="text-xs font-semibold text-violet-900">Tag 提示</span>
+            {currentQuestionGenreTags.map((tag, index) => (
+              <span
+                className={[
+                  "rounded px-1.5 py-0.5 text-xs font-semibold",
+                  index < unlockedTagCount ? "bg-violet-600 text-white" : "bg-slate-200 text-slate-400",
+                ].join(" ")}
+                key={tag}
+              >
+                {index < unlockedTagCount ? tag : "？？？"}
+              </span>
+            ))}
+            <span className="ml-auto text-[11px] font-semibold text-violet-700">
+              已解锁 {unlockedTagCount}/{currentQuestionGenreTags.length} · 每 {tagHintBlockStep} 格解锁 1 个
+            </span>
+          </div>
+        </div>
+      ) : null}
 
       <div className="grid items-center gap-3 lg:grid-cols-6">
         <div className="lg:col-span-1">

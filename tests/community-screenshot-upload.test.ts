@@ -3112,6 +3112,42 @@ test("D1 0034 adds a nullable, validated, globally unique image MD5 index", () =
   );
 });
 
+test("D1 0038 adds room tag hint settings with defaults and bounds", () => {
+  const sqlite = new DatabaseSync(":memory:");
+  applyMigrations(sqlite, "0037");
+  sqlite.prepare("INSERT INTO rooms (id,room_code,host_player_id) VALUES (?,?,?)")
+    .run("tag-hint-room", "TAG001", "tag-hint-host");
+
+  sqlite.exec(readFileSync(resolve(
+    import.meta.dirname, "..", "d1", "migrations", "0038_room_tag_hints.sql",
+  ), "utf8"));
+  const columns = new Set((sqlite.prepare("PRAGMA table_info(rooms)").all() as Array<{ name: string }>).map((column) => column.name));
+  assert.ok(columns.has("lobby_tag_hints_enabled"));
+  assert.ok(columns.has("lobby_tag_hint_block_step"));
+  // 历史房间默认关闭、步长 5。
+  const row = sqlite.prepare("SELECT lobby_tag_hints_enabled,lobby_tag_hint_block_step FROM rooms WHERE id='tag-hint-room'")
+    .get() as Record<string, unknown>;
+  assert.equal(row.lobby_tag_hints_enabled, 0);
+  assert.equal(row.lobby_tag_hint_block_step, 5);
+  // CHECK：开关只接受 0/1，步长必须是 1-15。
+  assert.throws(
+    () => sqlite.prepare("UPDATE rooms SET lobby_tag_hints_enabled=2 WHERE id='tag-hint-room'").run(),
+    /CHECK constraint failed/,
+  );
+  assert.throws(
+    () => sqlite.prepare("UPDATE rooms SET lobby_tag_hint_block_step=0 WHERE id='tag-hint-room'").run(),
+    /CHECK constraint failed/,
+  );
+  assert.throws(
+    () => sqlite.prepare("UPDATE rooms SET lobby_tag_hint_block_step=16 WHERE id='tag-hint-room'").run(),
+    /CHECK constraint failed/,
+  );
+  sqlite.prepare("UPDATE rooms SET lobby_tag_hints_enabled=1,lobby_tag_hint_block_step=3 WHERE id='tag-hint-room'").run();
+  const updated = sqlite.prepare("SELECT lobby_tag_hints_enabled,lobby_tag_hint_block_step FROM rooms WHERE id='tag-hint-room'")
+    .get() as Record<string, unknown>;
+  assert.deepEqual({ ...updated }, { lobby_tag_hints_enabled: 1, lobby_tag_hint_block_step: 3 });
+});
+
 test("D1 0037 adds bounded Bangumi genre tags and release year to the image index", () => {
   const sqlite = new DatabaseSync(":memory:");
   applyMigrations(sqlite, "0036");
