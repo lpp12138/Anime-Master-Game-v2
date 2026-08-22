@@ -1005,7 +1005,41 @@ export class RoomAuthorityVNext {
     }
     aggregate.buzzerAnswers = aggregate.buzzerAnswers.filter((item) => questionRoundKey(item.questionIndex, item.revealRound, item.playerId) !== key || item.status !== "pending");
     const delta: RealtimeDelta = { scope: "game", type: "answer_submitted", answer: clone(answer) };
+    // 全员选择“不猜”时自动进入下一轮（最后一轮则翻开全部格子），不需要裁判切换。
+    if (this.maybeAutoAdvanceAllForfeitRound()) {
+      const outcome = this.publicSessionOutcome(session, "phase-boundary", true);
+      outcome.data = clone(answer);
+      outcome.publicDeltas.unshift(this.publicAnswerProgress([answer], []));
+      outcome.presenterDeltas.push(delta);
+      outcome.answerViewerDeltas = [delta];
+      return outcome;
+    }
     return { data: clone(answer), provisional: true, publicDeltas: [this.publicAnswerProgress([answer], [])], presenterDeltas: [delta], answerViewerDeltas: [delta], playerDeltas: [] };
+  }
+
+  /**
+   * 当前轮所有可作答玩家都已使用机会且没有任何真实答案（全部是“不猜”）时
+   * 自动推进轮次：非最后一轮则轮次 +1，最后一轮则翻开全部格子进入复盘；
+   * 不需要裁判手动切换。团队对抗走投票回合流程，不适用。
+   */
+  private maybeAutoAdvanceAllForfeitRound(): boolean {
+    const aggregate = this.requireActive();
+    const session = aggregate.gameSession!;
+    if (session.gameMode === "TEAM_BATTLE") return false;
+    const currentEligiblePlayerIds = this.currentRoundEligiblePlayerIds(aggregate);
+    if (currentEligiblePlayerIds.length === 0) return false;
+    const roundAnswers = aggregate.answers.filter(
+      (answer) => answer.questionIndex === session.currentQuestionIndex
+        && answer.revealRound === session.currentRevealRound,
+    );
+    if (roundAnswers.some((answer) => answer.answerText !== FORFEIT_ANSWER_TEXT)) return false;
+    const answeredPlayerIds = new Set(roundAnswers.map((answer) => answer.playerId));
+    if (!currentEligiblePlayerIds.every((playerId) => answeredPlayerIds.has(playerId))) return false;
+    if (session.currentRevealRound < session.maxRevealRounds) session.currentRevealRound += 1;
+    else session.revealedBlocks = ALL_REVEALED_BLOCKS;
+    session.roundStartedAt = null;
+    aggregate.deadline = null;
+    return true;
   }
 
   private cancelForfeit(action: VNextPendingMutation): VNextMutationOutcome {
@@ -1179,6 +1213,8 @@ export class RoomAuthorityVNext {
     if (!aggregate.deadline || action.serverReceivedAtMs < aggregate.deadline.runAtMs) return this.publicSessionOutcome(session);
     const addedForfeits = this.addMissingForfeits(action);
     aggregate.deadline = null;
+    // 截止后全员都是“不猜”（没有任何真实答案）时自动进入下一轮，不需要裁判操作。
+    this.maybeAutoAdvanceAllForfeitRound();
     const outcome = this.publicSessionOutcome(session, "deadline", true);
     if (addedForfeits.length) outcome.publicDeltas.push(this.publicAnswerProgress(addedForfeits, []));
     return outcome;

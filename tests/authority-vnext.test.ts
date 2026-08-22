@@ -1052,7 +1052,8 @@ test("every committed mutation duplicate preserves its public top-level RPC cont
 });
 
 test("committed answer duplicates recover edited and forfeited entity ids and archived-safe shapes", async () => {
-  const { state, authority } = createAuthority(1, fakeD1, 2);
+  // 保留第二名玩家 p1 未作答，避免“全员不猜”自动推进轮次影响取消放弃的恢复场景。
+  const { state, authority } = createAuthority(2, fakeD1, 2);
   const host = socketFor(state, "host");
   const player = socketFor(state, "p0");
   const now = Date.now();
@@ -1410,6 +1411,68 @@ test("RANKED final-round forfeit settles immediately after another player scored
   assert.equal(authority.getAggregate()?.gameSession?.revealedBlocks.length, 45);
   assert.equal(authority.getAggregate()?.gameSession?.roundStartedAt, null);
   assert.equal(authority.getAggregate()?.answers.some((answer) => answer.revealRound === 3 && answer.playerId === "p0"), false);
+});
+
+test("all-forfeit round auto-advances without presenter action", () => {
+  const { state, authority } = createAuthority(2);
+  const host = socketFor(state, "host");
+  const p0 = socketFor(state, "p0");
+  const p1 = socketFor(state, "p1");
+  const now = Date.now();
+  authority.handleMutation(host, envelope("host", 1, "confirmRevealBlocks", { presenterPlayerId: "host", selectedBlocks: [1] }), now);
+  // 只有一名玩家选择“不猜”：不自动推进，等待其他人作答或裁判操作。
+  authority.handleMutation(p0, envelope("p0", 1, "submitForfeitAnswer", { playerId: "p0" }), now + 10);
+  let session = authority.getAggregate()!.gameSession!;
+  assert.equal(session.currentRevealRound, 1);
+  assert.ok(session.roundStartedAt);
+  // 全员都选择“不猜”：自动进入下一轮，不需要裁判切换。
+  const outcome = authority.handleMutation(p1, envelope("p1", 1, "submitForfeitAnswer", { playerId: "p1" }), now + 11);
+  session = authority.getAggregate()!.gameSession!;
+  assert.equal(session.currentRevealRound, 2);
+  assert.equal(session.roundStartedAt, null);
+  assert.ok(outcome.publicDeltas.some((delta) => delta.type === "game_session_updated"));
+  // 第 2 轮（非最后一轮）全员放弃：自动进入第 3 轮。
+  authority.handleMutation(host, envelope("host", 2, "confirmRevealBlocks", { presenterPlayerId: "host", selectedBlocks: [2] }), now + 20);
+  authority.handleMutation(p0, envelope("p0", 2, "submitForfeitAnswer", { playerId: "p0" }), now + 21);
+  authority.handleMutation(p1, envelope("p1", 2, "submitForfeitAnswer", { playerId: "p1" }), now + 22);
+  session = authority.getAggregate()!.gameSession!;
+  assert.equal(session.currentRevealRound, 3);
+  assert.equal(session.roundStartedAt, null);
+  // 最后一轮（第 3 轮）全员放弃：自动翻开全部格子进入复盘。
+  authority.handleMutation(host, envelope("host", 3, "confirmRevealBlocks", { presenterPlayerId: "host", selectedBlocks: [3] }), now + 30);
+  authority.handleMutation(p0, envelope("p0", 3, "submitForfeitAnswer", { playerId: "p0" }), now + 31);
+  authority.handleMutation(p1, envelope("p1", 3, "submitForfeitAnswer", { playerId: "p1" }), now + 32);
+  session = authority.getAggregate()!.gameSession!;
+  assert.equal(session.currentRevealRound, 3);
+  assert.equal(session.revealedBlocks.length, 45);
+  assert.equal(session.roundStartedAt, null);
+});
+
+test("all-forfeit auto-advance waits for real answers and deadline", async () => {
+  const { state, authority } = createAuthority(2);
+  const host = socketFor(state, "host");
+  const p0 = socketFor(state, "p0");
+  const p1 = socketFor(state, "p1");
+  const now = Date.now();
+  authority.handleMutation(host, envelope("host", 1, "confirmRevealBlocks", { presenterPlayerId: "host", selectedBlocks: [1] }), now);
+  // 有人作答、有人放弃：仍有答案需要裁判判定，不自动推进。
+  authority.handleMutation(p0, envelope("p0", 1, "submitAnswer", { playerId: "p0", answerText: "真实答案" }), now + 10);
+  authority.handleMutation(p1, envelope("p1", 1, "submitForfeitAnswer", { playerId: "p1" }), now + 11);
+  assert.equal(authority.getAggregate()!.gameSession!.currentRevealRound, 1);
+  assert.ok(authority.getAggregate()!.gameSession!.roundStartedAt);
+
+  // 另一个房间：没有任何人作答，截止时间把所有未作答玩家视为“不猜”，
+  // 且没有真实答案，自动进入下一轮，不需要裁判操作。
+  const { state: state2, authority: authority2 } = createAuthority(2);
+  const host2 = socketFor(state2, "host");
+  const now2 = Date.now();
+  authority2.handleMutation(host2, envelope("host", 1, "confirmRevealBlocks", { presenterPlayerId: "host", selectedBlocks: [1] }), now2);
+  const deadline2 = authority2.getDeadline();
+  assert.ok(deadline2);
+  const executed2 = await authority2.executeDueDeadline(deadline2!.runAtMs + 1);
+  assert.equal(authority2.getAggregate()!.gameSession!.currentRevealRound, 2);
+  assert.equal(authority2.getAggregate()!.gameSession!.roundStartedAt, null);
+  assert.ok(executed2.outcome.publicDeltas.some((delta) => delta.type === "game_session_updated"));
 });
 
 test("RANKED scores use stable correct order across rounds and fully recompute after rejudgement", () => {
@@ -3329,16 +3392,29 @@ test("aborting a rejected initializing start removes only the matching persisted
 test("ROUND_REVEAL deadline locks submissions but still allows presenter grading", async () => {
   const { state, authority } = createAuthority(1);
   const host = socketFor(state, "host");
+  const p0 = socketFor(state, "p0");
   const now = Date.now();
   authority.handleMutation(host, envelope("host", 1, "confirmRevealBlocks", { presenterPlayerId: "host", selectedBlocks: [1] }), now);
   await authority.forceCheckpoint("phase-boundary");
   const deadline = authority.getDeadline();
   assert.ok(deadline);
+  // 有真实答案时，截止后保留答案等待裁判判定，轮次保持可判分（不会自动推进）。
+  authority.handleMutation(p0, envelope("p0", 1, "submitAnswer", { playerId: "p0", answerText: "真实答案" }), now + 5);
   await authority.executeDueDeadline(deadline!.runAtMs);
-  assert.ok(authority.getAggregate()?.gameSession?.roundStartedAt, "expired round must remain gradeable");
-  const graded = authority.handleMutation(host, envelope("host", 2, "gradeAnswersAndAdvance", { presenterPlayerId: "host", correctPlayerIds: [] }), deadline!.runAtMs + 1);
+  assert.ok(authority.getAggregate()?.gameSession?.roundStartedAt, "expired round with real answers must remain gradeable");
+  const graded = authority.handleMutation(host, envelope("host", 2, "gradeAnswersAndAdvance", { presenterPlayerId: "host", correctPlayerIds: ["p0"] }), deadline!.runAtMs + 1);
   assert.equal(graded.error, undefined);
   assert.equal(graded.forceCheckpoint, "phase-boundary");
+  // 无人作答时，截止后全员视为“不猜”且没有真实答案：自动进入下一轮（见
+  // all-forfeit auto-advance waits for real answers and deadline）。
+  const { state: state2, authority: authority2 } = createAuthority(1);
+  const host2 = socketFor(state2, "host");
+  authority2.handleMutation(host2, envelope("host", 1, "confirmRevealBlocks", { presenterPlayerId: "host", selectedBlocks: [1] }), now + 100);
+  const deadline2 = authority2.getDeadline();
+  assert.ok(deadline2);
+  await authority2.executeDueDeadline(deadline2!.runAtMs);
+  assert.equal(authority2.getAggregate()?.gameSession?.currentRevealRound, 2);
+  assert.equal(authority2.getAggregate()?.gameSession?.roundStartedAt, null);
 });
 
 test("archive survives an in-flight checkpoint for the same boundary generation", async () => {
