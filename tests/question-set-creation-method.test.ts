@@ -84,7 +84,7 @@ function migrationFiles() {
   return readdirSync(migrationsDirectory).filter((name) => /^\d{4}_.+\.sql$/.test(name)).sort();
 }
 
-function applyMigrations(db: DatabaseSync, through = "0033") {
+function applyMigrations(db: DatabaseSync, through = "9999") {
   for (const name of migrationFiles()) {
     if (name.slice(0, 4) > through) break;
     db.exec(readFileSync(join(migrationsDirectory, name), "utf8"));
@@ -896,6 +896,18 @@ test("community sets beyond 30 questions prepare and start with the per-game 30 
         "2026-02-01T00:00:00.000Z",
         "2026-02-01T00:00:00.000Z",
       );
+    // 两段投稿：前 30 题由“首位上传者”上传，后 10 题由“第二位上传者”上传。
+    const insertSubmission = db.sqlite.prepare(`INSERT INTO community_question_set_submissions
+      (submission_id,submission_fingerprint,question_set_id,start_order_index,added_image_count,created_at,submitted_by_player_id,submitted_by_nickname)
+      VALUES (?,?,?,?,?,?,?,?)`);
+    insertSubmission.run(
+      "large-set-submission-0000000000", "a".repeat(64), "large-community-set", 0, 30,
+      "2026-02-01T00:00:00.000Z", "large-set-host", "首位上传者",
+    );
+    insertSubmission.run(
+      "large-set-submission-0000000001", "b".repeat(64), "large-community-set", 30, 10,
+      "2026-02-01T00:01:00.000Z", "second-uploader", "第二位上传者",
+    );
 
     const prepared = await prepareQuestionSetForStart({
       roomId: room.id!,
@@ -918,6 +930,14 @@ test("community sets beyond 30 questions prepare and start with the per-game 30 
     const firstQuestions = started.__authorityVNextBootstrap.questions;
     assert.equal(firstQuestions.length, 30);
     assert.equal(new Set(firstQuestions.map((question) => question.id)).size, 30);
+    // 每道题都按题目 ID 携带图库上传者昵称（与随机抽题后的顺序无关）。
+    assert.ok(firstQuestions.every((question) => question.uploaderNickname));
+    const expectedUploader = new Map(
+      questions.map((question, index) => [question.id, index < 30 ? "首位上传者" : "第二位上传者"]),
+    );
+    for (const question of firstQuestions) {
+      assert.equal(question.uploaderNickname, expectedUploader.get(question.id));
+    }
     const storedIds = JSON.parse(String(
       db.sqlite.prepare("SELECT selected_question_ids FROM game_sessions WHERE id='large-set-start-request'").get().selected_question_ids,
     )) as string[];

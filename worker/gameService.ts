@@ -362,7 +362,10 @@ function toRoom(room: DbRoom, players: DbPlayer[] = getRoomStatePlayers(room)): 
   };
 }
 
-function toQuestion(question: DbQuestion): Question {
+function toQuestion(
+  question: DbQuestion,
+  uploaderByQuestionId?: ReadonlyMap<string, string | null> | null,
+): Question {
   return {
     id: question.id,
     questionSetId: question.question_set_id,
@@ -375,10 +378,15 @@ function toQuestion(question: DbQuestion): Question {
     labelUpdatedByPlayerId: question.label_updated_by_player_id ?? null,
     labelUpdatedAt: question.label_updated_at ?? null,
     createdAt: question.created_at,
+    uploaderNickname: uploaderByQuestionId?.get(question.id) ?? null,
   };
 }
 
-function toQuestionSet(questionSet: DbQuestionSet, questions: DbQuestion[] = []): QuestionSet {
+function toQuestionSet(
+  questionSet: DbQuestionSet,
+  questions: DbQuestion[] = [],
+  uploaderByQuestionId?: ReadonlyMap<string, string | null> | null,
+): QuestionSet {
   const questionUrlsText = questions
     .slice()
     .sort((a, b) => a.order_index - b.order_index)
@@ -401,15 +409,63 @@ function toQuestionSet(questionSet: DbQuestionSet, questions: DbQuestion[] = [])
     playCount: questionSet.play_count ?? 0,
     createdAt: questionSet.created_at,
     updatedAt: questionSet.updated_at,
-    questions: questions.map(toQuestion),
+    questions: questions.map((question) => toQuestion(question, uploaderByQuestionId)),
   };
 }
 
-function toGameQuestionSet(questionSet: DbQuestionSet, questions: DbQuestion[]) {
+function toGameQuestionSet(
+  questionSet: DbQuestionSet,
+  questions: DbQuestion[],
+  uploaderByQuestionId?: ReadonlyMap<string, string | null> | null,
+) {
   return {
-    ...toQuestionSet(questionSet, questions),
+    ...toQuestionSet(questionSet, questions, uploaderByQuestionId),
     imageUrlsText: questions.map((question) => question.image_url).join("\n"),
   };
+}
+
+/**
+ * 社区题库每张图片的上传者（按题目 ID）。同一题目被多段历史投稿覆盖时取最近
+ * 一次投稿；非社区题库或未知历史投稿不包含该题目。仅供低频的游戏载荷构建
+ * （开局、重连、复盘、结算），不进入逐操作热路径。
+ */
+async function getCommunityQuestionUploaderNicknames(
+  questionSetId: string,
+  questions: readonly DbQuestion[],
+): Promise<Map<string, string | null>> {
+  assertD1Env();
+  let data: Array<{ start_order_index: number; added_image_count: number; submitted_by_nickname: string | null }> | null;
+  try {
+    const result = await d1
+      .from("community_question_set_submissions")
+      .select("start_order_index,added_image_count,submitted_by_nickname")
+      .eq("question_set_id", questionSetId)
+      .order("start_order_index", { ascending: true });
+    data = result.data;
+    if (result.error) throw new Error(result.error.message);
+  } catch (error) {
+    // 旧测试夹具/旧部署没有投稿表时优雅降级：不显示上传者。
+    if (error instanceof Error && /no such table: community_question_set_submissions/i.test(error.message)) {
+      return new Map<string, string | null>();
+    }
+    throw error;
+  }
+  // 顺序索引 -> 昵称：投稿范围按起点升序遍历，同一位置被多段历史投稿覆盖时
+  // 最后写入的是 start_order_index 最大的最近投稿。
+  const nicknameByOrderIndex = new Map<number, string | null>();
+  for (const row of data ?? []) {
+    const nickname = typeof row.submitted_by_nickname === "string" ? row.submitted_by_nickname.trim() : "";
+    if (!nickname) continue;
+    for (let index = row.start_order_index; index < row.start_order_index + row.added_image_count; index += 1) {
+      nicknameByOrderIndex.set(index, nickname);
+    }
+  }
+  const uploaders = new Map<string, string | null>();
+  for (const question of questions) {
+    const nickname = nicknameByOrderIndex.get(question.order_index);
+    if (nickname) uploaders.set(question.id, nickname);
+  }
+  return uploaders;
 }
 
 async function getPlayerNickname(playerId: string, roomId?: string) {
@@ -2686,7 +2742,7 @@ export async function createUploadedQuestionSet(params: {
       image_urls_text: null,
       manifest_version: QUESTION_SET_MANIFEST_VERSION,
       manifest_revision: 0,
-      manifest_json: encodeQuestionSetManifest(questions.map(toQuestion)),
+      manifest_json: encodeQuestionSetManifest(questions.map((question) => toQuestion(question))),
       created_at: createdAt,
       updated_at: createdAt,
     })
@@ -2738,6 +2794,8 @@ type CommunityQuestionSetSubmissionRow = {
   start_order_index: number;
   added_image_count: number;
   created_at: string;
+  submitted_by_player_id?: string | null;
+  submitted_by_nickname?: string | null;
 };
 
 export async function getHomepageCommunityQuestionSetBySubmissionId(submissionId: string) {
@@ -2910,6 +2968,7 @@ async function appendHomepageCommunityQuestions(params: {
   submissionId: string;
   submissionFingerprint: string;
   playerId: string;
+  nickname: string;
   questionItems: QuestionImportItem[];
   requireCanonicalCollection: boolean;
 }) {
@@ -2931,7 +2990,7 @@ async function appendHomepageCommunityQuestions(params: {
     createdAt,
   );
   const combinedQuestions = [...existingQuestions, ...appendedQuestions];
-  const nextManifest = encodeQuestionSetManifest(combinedQuestions.map(toQuestion));
+  const nextManifest = encodeQuestionSetManifest(combinedQuestions.map((question) => toQuestion(question)));
   const nextRevision = revision + 1;
   const nextImageCount = combinedQuestions.length;
   const guardQuery = `SELECT 1 FROM question_sets
@@ -2993,9 +3052,10 @@ async function appendHomepageCommunityQuestions(params: {
     {
       query: `INSERT INTO community_question_set_submissions (
           submission_id, submission_fingerprint, question_set_id,
-          start_order_index, added_image_count, created_at
+          start_order_index, added_image_count, created_at,
+          submitted_by_player_id, submitted_by_nickname
         )
-        SELECT ?, ?, ?, ?, ?, ?
+        SELECT ?, ?, ?, ?, ?, ?, ?, ?
         WHERE EXISTS (${guardQuery})
         RETURNING *`,
       bindings: [
@@ -3005,6 +3065,8 @@ async function appendHomepageCommunityQuestions(params: {
         startOrderIndex,
         appendedQuestions.length,
         createdAt,
+        params.playerId,
+        params.nickname,
         ...guardBindings,
       ],
     },
@@ -3105,6 +3167,7 @@ export async function createHomepageCommunityQuestionSet(params: {
         submissionId,
         submissionFingerprint,
         playerId,
+        nickname,
         questionItems,
         requireCanonicalCollection: !targetQuestionSetId,
       });
@@ -3128,7 +3191,7 @@ export async function createHomepageCommunityQuestionSet(params: {
       image_urls_text: null,
       manifest_version: QUESTION_SET_MANIFEST_VERSION,
       manifest_revision: 0,
-      manifest_json: encodeQuestionSetManifest(questions.map(toQuestion)),
+      manifest_json: encodeQuestionSetManifest(questions.map((question) => toQuestion(question))),
       community_submission_id: submissionId,
       community_submission_fingerprint: submissionFingerprint,
       community_collection_title: title,
@@ -3144,6 +3207,8 @@ export async function createHomepageCommunityQuestionSet(params: {
       start_order_index: 0,
       added_image_count: questions.length,
       created_at: createdAt,
+      submitted_by_player_id: playerId,
+      submitted_by_nickname: nickname,
     };
     const { data: insertedRows, error } = await d1.insertAtomically([
       { table: "question_sets", records: [questionSetRecord] },
@@ -3809,14 +3874,20 @@ export async function startGameWithQuestionSet(params: {
           .maybeSingle<DbQuestionSet>();
         if (currentQuestionSetError || !currentQuestionSet) throw new Error(currentQuestionSetError?.message ?? "题库不存在。");
         if (!currentDbGameSession) throw new Error("本局抽题快照不存在。");
-        const currentQuestions = await getDbQuestionsForGameSession(currentDbGameSession, currentQuestionSet);
+        const currentQuestionsResult = await getDbQuestionsForGameSession(currentDbGameSession, currentQuestionSet);
         return {
           gameSession: currentGameSession,
           room: toRoom(room, currentPlayers),
           __authorityVNextBootstrap: {
             players: currentPlayers.map(toPlayer),
-            questionSet: toGameQuestionSet(currentQuestionSet, currentQuestions),
-            questions: currentQuestions.map(toQuestion),
+            questionSet: toGameQuestionSet(
+              currentQuestionSet,
+              currentQuestionsResult.questions,
+              currentQuestionsResult.uploaderByQuestionId,
+            ),
+            questions: currentQuestionsResult.questions.map(
+              (question) => toQuestion(question, currentQuestionsResult.uploaderByQuestionId),
+            ),
             questionSetManifestVersion: currentQuestionSet.manifest_version ?? null,
           },
         };
@@ -4107,7 +4178,9 @@ export async function startGameWithQuestionSet(params: {
     throw new Error("开始游戏失败：房间状态已变化，请刷新后重试。");
   }
 
-  const vnextQuestions = params.authorityVersion === 2 ? await getDbQuestionsForGameSession(gameSession, questionSet) : [];
+  const vnextQuestionResult = params.authorityVersion === 2
+    ? await getDbQuestionsForGameSession(gameSession, questionSet)
+    : { questions: [] as DbQuestion[], uploaderByQuestionId: new Map<string, string | null>() };
   return {
     gameSession: hydratedGameSession,
     room: toRoom(updatedRoom),
@@ -4115,8 +4188,10 @@ export async function startGameWithQuestionSet(params: {
       ? {
           __authorityVNextBootstrap: {
             players: players.map(toPlayer),
-            questionSet: toGameQuestionSet(questionSet, vnextQuestions),
-            questions: vnextQuestions.map(toQuestion),
+            questionSet: toGameQuestionSet(questionSet, vnextQuestionResult.questions, vnextQuestionResult.uploaderByQuestionId),
+            questions: vnextQuestionResult.questions.map(
+              (question) => toQuestion(question, vnextQuestionResult.uploaderByQuestionId),
+            ),
             questionSetManifestVersion: questionSet.manifest_version ?? null,
           },
         }
@@ -4269,14 +4344,18 @@ async function getDbQuestionsForGameSession(gameSession: DbGameSession, question
   if (resolvedQuestionSet.id !== gameSession.question_set_id) throw new Error("本局抽题快照与题库不匹配。");
 
   const allQuestions = await getDbQuestionsForQuestionSet(resolvedQuestionSet);
+  const uploaderByQuestionId = await getCommunityQuestionUploaderNicknames(resolvedQuestionSet.id, allQuestions);
   const selectedQuestionIds = normalizeSelectedQuestionIds(gameSession.selected_question_ids);
-  if (selectedQuestionIds.length === 0) return allQuestions;
+  if (selectedQuestionIds.length === 0) {
+    return { questions: allQuestions, uploaderByQuestionId };
+  }
   const questionById = new Map(allQuestions.map((question) => [question.id, question]));
-  return selectedQuestionIds.map((questionId, orderIndex) => {
+  const questions = selectedQuestionIds.map((questionId, orderIndex) => {
     const question = questionById.get(questionId);
     if (!question) throw new Error("本局抽题快照引用了不存在的题目。");
     return { ...question, order_index: orderIndex };
   });
+  return { questions, uploaderByQuestionId };
 }
 
 async function getDbGameSessionById(gameSessionId: string) {
@@ -4304,11 +4383,12 @@ async function getDbQuestionsByQuestionSetId(questionSetId: string) {
 
 export async function getQuestionsByQuestionSetId(questionSetId: string) {
   const questions = await getDbQuestionsByQuestionSetId(questionSetId);
-  return questions.map(toQuestion);
+  return questions.map((question) => toQuestion(question));
 }
 
 async function getQuestionsForGameSession(gameSession: DbGameSession) {
-  return (await getDbQuestionsForGameSession(gameSession)).map(toQuestion);
+  const { questions, uploaderByQuestionId } = await getDbQuestionsForGameSession(gameSession);
+  return questions.map((question) => toQuestion(question, uploaderByQuestionId));
 }
 
 async function getQuestionSetForGameSession(gameSession: DbGameSession) {
@@ -4319,8 +4399,8 @@ async function getQuestionSetForGameSession(gameSession: DbGameSession) {
     .maybeSingle<DbQuestionSet>();
   if (error) throw new Error(error.message);
   if (!questionSet) return null;
-  const questions = await getDbQuestionsForGameSession(gameSession, questionSet);
-  return toGameQuestionSet(questionSet, questions);
+  const { questions, uploaderByQuestionId } = await getDbQuestionsForGameSession(gameSession, questionSet);
+  return toGameQuestionSet(questionSet, questions, uploaderByQuestionId);
 }
 
 export async function confirmRevealBlocks(params: {
@@ -7562,7 +7642,7 @@ export async function updateQuestionLabel(params: {
     throw new Error("当前题库不存在，不能填写正确答案。");
   }
 
-  const question = (await getDbQuestionsForGameSession(currentGameSession, questionSet)).find(
+  const question = (await getDbQuestionsForGameSession(currentGameSession, questionSet)).questions.find(
     (item) => item.id === params.questionId && item.order_index === currentGameSession.current_question_index,
   );
   if (!question) {

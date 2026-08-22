@@ -743,14 +743,26 @@ test("same-title homepage submissions append atomically to one ordered question 
     { order_index: 1, answer_text: "第二题" },
   ]);
   const submissions = (db.sqlite.prepare(`
-    SELECT submission_id,start_order_index,added_image_count
+    SELECT submission_id,start_order_index,added_image_count,submitted_by_player_id,submitted_by_nickname
     FROM community_question_set_submissions
     WHERE question_set_id=?
     ORDER BY start_order_index
   `).all(created.id) as Array<Record<string, unknown>>).map((row) => ({ ...row }));
   assert.deepEqual(submissions, [
-    { submission_id: firstPayload.submissionId, start_order_index: 0, added_image_count: 1 },
-    { submission_id: secondPayload.submissionId, start_order_index: 1, added_image_count: 1 },
+    {
+      submission_id: firstPayload.submissionId,
+      start_order_index: 0,
+      added_image_count: 1,
+      submitted_by_player_id: "first-player",
+      submitted_by_nickname: "首位上传者",
+    },
+    {
+      submission_id: secondPayload.submissionId,
+      start_order_index: 1,
+      added_image_count: 1,
+      submitted_by_player_id: "second-player",
+      submitted_by_nickname: "第二位上传者",
+    },
   ]);
 
   const retryResponse = await worker.fetch(finalizeRequest(secondPayload), env);
@@ -3061,6 +3073,63 @@ test("D1 0034 adds a nullable, validated, globally unique image MD5 index", () =
     () => sqlite.prepare("UPDATE question_image_index SET image_md5='ABC' WHERE question_id='md5-migration-two'").run(),
     /CHECK constraint failed/,
   );
+});
+
+test("D1 0036 records community uploader identity and backfills first submissions", () => {
+  const sqlite = new DatabaseSync(":memory:", {});
+  applyMigrations(sqlite, "0035");
+  sqlite.prepare(`INSERT INTO question_sets
+    (id,title,created_by_player_id,created_by_nickname,is_public,image_count,created_at,updated_at)
+    VALUES (?,?,?,?,?,?,?,?)`).run(
+    "uploader-identity-set",
+    "上传者题库",
+    "creator-player-id",
+    "创建者昵称",
+    1,
+    3,
+    "2026-08-21T00:00:00.000Z",
+    "2026-08-21T00:00:00.000Z",
+  );
+  const insert = sqlite.prepare(`INSERT INTO community_question_set_submissions
+    (submission_id,submission_fingerprint,question_set_id,start_order_index,added_image_count,created_at)
+    VALUES (?,?,?,?,?,?)`);
+  insert.run("uploader-identity-first", "a".repeat(64), "uploader-identity-set", 0, 1, "2026-08-21T00:00:00.000Z");
+  insert.run("uploader-identity-second", "b".repeat(64), "uploader-identity-set", 1, 2, "2026-08-21T00:01:00.000Z");
+
+  sqlite.exec(readFileSync(resolve(
+    import.meta.dirname, "..", "d1", "migrations", "0036_question_uploader_identity.sql",
+  ), "utf8"));
+  const columns = new Set((sqlite.prepare("PRAGMA table_info(community_question_set_submissions)").all() as Array<{ name: string }>).map((column) => column.name));
+  assert.ok(columns.has("submitted_by_player_id"));
+  assert.ok(columns.has("submitted_by_nickname"));
+  const rows = sqlite.prepare(`
+    SELECT submission_id,submitted_by_player_id,submitted_by_nickname
+    FROM community_question_set_submissions ORDER BY start_order_index
+  `).all() as Array<Record<string, string | null>>;
+  // 第一份投稿回填题库创建者身份；后续历史投稿保持 NULL。
+  assert.deepEqual(rows.map((row) => ({ ...row })), [
+    { submission_id: "uploader-identity-first", submitted_by_player_id: "creator-player-id", submitted_by_nickname: "创建者昵称" },
+    { submission_id: "uploader-identity-second", submitted_by_player_id: null, submitted_by_nickname: null },
+  ]);
+  // 新投稿必须写入合法身份：空昵称、超长昵称、超长 player id 均被 CHECK 拒绝。
+  const insertWithIdentity = sqlite.prepare(`INSERT INTO community_question_set_submissions
+    (submission_id,submission_fingerprint,question_set_id,start_order_index,added_image_count,created_at,submitted_by_player_id,submitted_by_nickname)
+    VALUES (?,?,?,?,?,?,?,?)`);
+  assert.throws(
+    () => insertWithIdentity.run("uploader-identity-empty-nick", "c".repeat(64), "uploader-identity-set", 3, 1, "2026-08-21T00:02:00.000Z", "player", "  "),
+    /CHECK constraint failed/,
+  );
+  assert.throws(
+    () => insertWithIdentity.run("uploader-identity-long-nick", "d".repeat(64), "uploader-identity-set", 3, 1, "2026-08-21T00:02:00.000Z", "player", "x".repeat(21)),
+    /CHECK constraint failed/,
+  );
+  assert.throws(
+    () => insertWithIdentity.run("uploader-identity-long-player", "e".repeat(64), "uploader-identity-set", 3, 1, "2026-08-21T00:02:00.000Z", "p".repeat(129), "合法昵称"),
+    /CHECK constraint failed/,
+  );
+  // 合法身份可以写入。
+  insertWithIdentity.run("uploader-identity-new", "f".repeat(64), "uploader-identity-set", 3, 1, "2026-08-21T00:02:00.000Z", "new-player-id", "新投稿者");
+  assert.equal(sqlite.prepare("SELECT submitted_by_nickname FROM community_question_set_submissions WHERE submission_id='uploader-identity-new'").get().submitted_by_nickname, "新投稿者");
 });
 
 test("D1 0035 allows historical submission start ranges to repeat after structural edits", () => {

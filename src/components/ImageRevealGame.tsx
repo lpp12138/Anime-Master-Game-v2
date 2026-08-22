@@ -2680,6 +2680,10 @@ export function ImageRevealGame({
     () => room.players.find((player) => player.id === room.currentPresenterPlayerId)?.nickname ?? "未选择",
     [room.currentPresenterPlayerId, room.players],
   );
+  // 猜题界面：出题人显示当前图片在社区图库中的上传者；裁判（本局出题人玩家）
+  // 以单独 label 显示在旁边。非社区题库或未知历史投稿时回退到裁判昵称。
+  const currentUploaderName = currentQuestion?.uploaderNickname?.trim() || presenterName;
+  const showRefereeLabel = Boolean(currentQuestion?.uploaderNickname?.trim());
   const teamBattleScoreRows = useMemo(
     () =>
       teamBattleState
@@ -4228,8 +4232,15 @@ export function ImageRevealGame({
     >
       <div className="mb-3 grid grid-cols-[auto_minmax(0,1fr)_auto] items-center gap-2">
         <p className="text-sm font-semibold text-slate-900">积分榜</p>
-        <span className="min-w-0 max-w-full justify-self-end truncate rounded bg-slate-100 px-2 py-1 text-xs font-semibold text-slate-600" title={`出题人：${presenterName}`}>
-          出题人：{presenterName}
+        <span className="flex min-w-0 max-w-full items-center gap-1.5 justify-self-end">
+          <span className="min-w-0 truncate rounded bg-slate-100 px-2 py-1 text-xs font-semibold text-slate-600" title={`出题人（图库上传者）：${currentUploaderName}`}>
+            出题人：{currentUploaderName}
+          </span>
+          {showRefereeLabel ? (
+            <span className="shrink-0 rounded bg-slate-900 px-2 py-1 text-xs font-semibold text-white" title={`裁判：${presenterName}`}>
+              裁判：{presenterName}
+            </span>
+          ) : null}
         </span>
         {!isTeamBattleMode ? (
           <button

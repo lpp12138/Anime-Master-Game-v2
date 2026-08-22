@@ -262,6 +262,8 @@ export type Question = {
   labelUpdatedByPlayerId?: string | null;
   labelUpdatedAt?: string | null;
   createdAt: string;
+  /** 社区图库中本题图片的上传者昵称（出题人）；非社区题库或未知历史投稿为 null。 */
+  uploaderNickname?: string | null;
 };
 
 export type QuestionUrlImportInput = {
