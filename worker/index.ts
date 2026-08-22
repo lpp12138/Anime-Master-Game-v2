@@ -48,6 +48,7 @@ import {
   getBangumiAnimeSubject,
   getBangumiSubjectCharacters,
   isBangumiSubjectScope,
+  releaseYearFromBangumiDate,
   searchBangumiAnime,
 } from "./bangumiApi";
 
@@ -55,6 +56,7 @@ import type {
   Answer,
   BangumiAnimeTag,
   BangumiCharacterTag,
+  BangumiGenreTag,
   BuzzerAnswer,
   GameBootstrapSnapshot,
   GameResultSnapshot,
@@ -2309,6 +2311,8 @@ async function getAdminQuestionWriteInput(
   // names still cannot bypass upstream verification.
   let canonicalAnimeTags: BangumiAnimeTag[] | undefined;
   let canonicalCharacterTags: BangumiCharacterTag[] | undefined;
+  let canonicalGenreTags: BangumiGenreTag[] | undefined;
+  let canonicalReleaseYear: number | null | undefined;
   if (tags) {
     const current = options.loadCurrentTags ? await options.loadCurrentTags() : null;
     const unchanged = current != null
@@ -2332,6 +2336,8 @@ async function getAdminQuestionWriteInput(
       }
       canonicalAnimeTags = canonical.animeTags;
       canonicalCharacterTags = canonical.characterTags;
+      canonicalGenreTags = canonical.animeGenreTags;
+      canonicalReleaseYear = canonical.animeReleaseYear;
     }
   }
 
@@ -2339,6 +2345,9 @@ async function getAdminQuestionWriteInput(
     ...(answerText === undefined ? {} : { answerText }),
     ...(canonicalAnimeTags === undefined ? {} : { animeTags: canonicalAnimeTags }),
     ...(canonicalCharacterTags === undefined ? {} : { characterTags: canonicalCharacterTags }),
+    ...(canonicalGenreTags === undefined
+      ? {}
+      : { animeGenreTags: canonicalGenreTags, animeReleaseYear: canonicalReleaseYear ?? null }),
     ...(imageUrl ? { imageUrl } : {}),
     ...(imageMd5 ? { imageMd5 } : {}),
     ...(submittedR18 === undefined ? {} : { isR18: submittedR18 as boolean }),
@@ -2733,14 +2742,22 @@ type SubmittedCommunityQuestion = {
   characterTags: BangumiCharacterTag[];
   /** 仅由服务端从已验证 R2 对象 ETag 填入。 */
   imageMd5?: string;
+  /** 仅由服务端从官方 subject 详情规范化得到。 */
+  animeGenreTags?: BangumiGenreTag[];
+  animeReleaseYear?: number | null;
 };
 
-async function canonicalizeSubmittedBangumiTags<T extends Pick<SubmittedCommunityQuestion, "animeTags" | "characterTags">>(
+type CanonicalizableCommunityQuestion = Pick<SubmittedCommunityQuestion, "animeTags" | "characterTags">
+  & Partial<Pick<SubmittedCommunityQuestion, "animeGenreTags" | "animeReleaseYear">>;
+
+async function canonicalizeSubmittedBangumiTags<T extends CanonicalizableCommunityQuestion>(
   cache: Cache,
   questions: T[],
-): Promise<T[]> {
+): Promise<Array<T & { animeGenreTags: BangumiGenreTag[]; animeReleaseYear: number | null }>> {
   const subjectIds = [...new Set(questions.flatMap((question) => question.animeTags.map((tag) => tag.id)))];
-  if (subjectIds.length === 0) return questions;
+  if (subjectIds.length === 0) {
+    return questions.map((question) => ({ ...question, animeGenreTags: [], animeReleaseYear: null }));
+  }
 
   const subjects = new Map(await mapWithConcurrency(subjectIds, 4, async (subjectId) => {
     const subject = await getBangumiAnimeSubject(cache, subjectId);
@@ -2756,7 +2773,9 @@ async function canonicalizeSubmittedBangumiTags<T extends Pick<SubmittedCommunit
 
   return questions.map((question) => {
     const submittedAnime = question.animeTags[0];
-    if (!submittedAnime) return question;
+    if (!submittedAnime) {
+      return { ...question, animeGenreTags: [], animeReleaseYear: null };
+    }
     const anime = subjects.get(submittedAnime.id);
     if (!anime) throw new BangumiApiError("所选 Bangumi 作品不存在。", 400);
     const cast = casts.get(anime.id);
@@ -2777,6 +2796,8 @@ async function canonicalizeSubmittedBangumiTags<T extends Pick<SubmittedCommunit
       ...question,
       animeTags: [{ id: anime.id, name: anime.name, nameCn: anime.nameCn, subjectType: anime.subjectType }],
       characterTags,
+      animeGenreTags: anime.genreTags,
+      animeReleaseYear: releaseYearFromBangumiDate(anime.date),
     };
   });
 }
@@ -2968,6 +2989,8 @@ async function handleCommunityQuestionSetCreate(request: Request, env: Env, cach
         imageMd5: question.imageMd5,
         animeTags: question.animeTags,
         characterTags: question.characterTags,
+        animeGenreTags: question.animeGenreTags,
+        animeReleaseYear: question.animeReleaseYear,
       })),
     }));
   } catch (error) {

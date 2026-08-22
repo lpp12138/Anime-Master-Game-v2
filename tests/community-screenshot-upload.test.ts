@@ -97,10 +97,29 @@ globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
     return new Response(JSON.stringify({ data }));
   }
   if (url === "https://api.bgm.tv/v0/subjects/2") {
-    return new Response(JSON.stringify({ id: 2, type: 2, name: "AIR", name_cn: "青空" }));
+    return new Response(JSON.stringify({
+      id: 2,
+      type: 2,
+      name: "AIR",
+      name_cn: "青空",
+      date: "2005-01-06",
+      tags: [
+        { name: "催泪", count: 10 },
+        { name: "治愈", count: 5 },
+        { name: "催泪", count: 9 },
+        { name: "", count: 1 },
+      ],
+    }));
   }
   if (url === "https://api.bgm.tv/v0/subjects/104999") {
-    return new Response(JSON.stringify({ id: 104999, type: 4, name: "AIR 游戏", name_cn: "青空（游戏）" }));
+    return new Response(JSON.stringify({
+      id: 104999,
+      type: 4,
+      name: "AIR 游戏",
+      name_cn: "青空（游戏）",
+      date: "2001-06-20",
+      tags: [{ name: "游戏改", count: 3 }],
+    }));
   }
   if (url === "https://api.bgm.tv/v0/subjects/2/characters") {
     return new Response(JSON.stringify([{
@@ -486,6 +505,11 @@ test("Bangumi game subjects are canonicalized with subjectType 4 and their own o
   assert.deepEqual(JSON.parse(indexed.character_tags_json as string), [
     { id: 5001, subjectId: 104999, name: "游戏角色", nameCn: null, relation: "主角" },
   ]);
+  // 官方 subject 详情中的属性标签（去重、有界）与首播年份一并持久化。
+  assert.deepEqual(JSON.parse(indexed.anime_genre_tags_json as string), [
+    { name: "游戏改", count: 3 },
+  ]);
+  assert.equal(indexed.anime_release_year, 2001);
 
   // 游戏条目不接受来自其他 subject 的角色。使用另一张图片，避免先被全局 MD5 去重拦截。
   const wrongCastUploadResponse = await worker.fetch(
@@ -1571,6 +1595,14 @@ test("question-set admin supports manifest question image CRUD, replacement, and
   const addedQuestion = detail.questions.find((question) => question.answerText === "新增第三题")!;
   assert.deepEqual(addedQuestion.animeTags, [{ id: 2, name: "AIR", nameCn: "青空", subjectType: 2 }]);
   assert.deepEqual(addedQuestion.characterTags, [{ id: 3, subjectId: 2, name: "神尾観鈴", nameCn: null, relation: "主角" }]);
+  // 规范化时同步写入官方 subject 详情的属性标签与首播年份。
+  const addedIndexed = db.sqlite.prepare("SELECT anime_genre_tags_json,anime_release_year FROM question_image_index WHERE question_id=?")
+    .get(addedQuestion.id) as { anime_genre_tags_json: string; anime_release_year: number | null };
+  assert.deepEqual(JSON.parse(addedIndexed.anime_genre_tags_json), [
+    { name: "催泪", count: 10 },
+    { name: "治愈", count: 5 },
+  ]);
+  assert.equal(addedIndexed.anime_release_year, 2005);
 
   const staleUpdate = await worker.fetch(questionSetAdminRequest(
     `/api/admin/question-sets/${created.id}/questions/${firstQuestionId}`,
@@ -1648,6 +1680,11 @@ test("question-set admin supports manifest question image CRUD, replacement, and
   mutation = await moveResponse.json() as typeof mutation;
   detail = mutation.questionSet;
   assert.deepEqual(detail.questions.map((question) => question.id), [replacedQuestion.id, firstQuestionId, secondQuestionId]);
+  // 纯调序复用现有属性标签与年份（此前换图 PATCH 已显式清空标签，因此保持为空）。
+  const reorderedIndexed = db.sqlite.prepare("SELECT anime_genre_tags_json,anime_release_year FROM question_image_index WHERE question_id=?")
+    .get(replacedQuestion.id) as { anime_genre_tags_json: string; anime_release_year: number | null };
+  assert.deepEqual(JSON.parse(reorderedIndexed.anime_genre_tags_json), []);
+  assert.equal(reorderedIndexed.anime_release_year, null);
 
   const deleteResponse = await worker.fetch(questionSetAdminRequest(
     `/api/admin/question-sets/${created.id}/questions/${secondQuestionId}`,
@@ -3073,6 +3110,69 @@ test("D1 0034 adds a nullable, validated, globally unique image MD5 index", () =
     () => sqlite.prepare("UPDATE question_image_index SET image_md5='ABC' WHERE question_id='md5-migration-two'").run(),
     /CHECK constraint failed/,
   );
+});
+
+test("D1 0037 adds bounded Bangumi genre tags and release year to the image index", () => {
+  const sqlite = new DatabaseSync(":memory:");
+  applyMigrations(sqlite, "0036");
+  sqlite.prepare(`INSERT INTO question_sets
+    (id,title,created_by_player_id,is_public,image_count,created_at,updated_at)
+    VALUES (?,?,?,?,?,?,?)`).run(
+    "genre-tag-set",
+    "属性标签题库",
+    "genre-owner",
+    1,
+    1,
+    "2026-01-01T00:00:00.000Z",
+    "2026-01-01T00:00:00.000Z",
+  );
+  sqlite.prepare(`INSERT INTO question_image_index
+    (question_id,question_set_id,image_url,answer_text,order_index,created_at)
+    VALUES (?,?,?,?,?,?)`).run(
+    "genre-tag-question",
+    "genre-tag-set",
+    "https://example.com/a.webp",
+    "答案",
+    0,
+    "2026-01-01T00:00:00.000Z",
+  );
+
+  sqlite.exec(readFileSync(resolve(
+    import.meta.dirname, "..", "d1", "migrations", "0037_question_genre_tags.sql",
+  ), "utf8"));
+  const columns = new Set((sqlite.prepare("PRAGMA table_info(question_image_index)").all() as Array<{ name: string }>).map((column) => column.name));
+  assert.ok(columns.has("anime_genre_tags_json"));
+  assert.ok(columns.has("anime_release_year"));
+  const row = sqlite.prepare("SELECT anime_genre_tags_json,anime_release_year FROM question_image_index WHERE question_id='genre-tag-question'").get() as Record<string, unknown>;
+  assert.equal(row.anime_genre_tags_json, "[]");
+  assert.equal(row.anime_release_year, null);
+
+  // 超过 20 条的属性标签数组被 CHECK 拒绝；年份限制在 1950-2100。
+  const tooManyTags = Array.from({ length: 21 }, (_, index) => ({ name: `标签${index}`, count: 1 }));
+  assert.throws(
+    () => sqlite.prepare("UPDATE question_image_index SET anime_genre_tags_json=? WHERE question_id='genre-tag-question'")
+      .run(JSON.stringify(tooManyTags)),
+    /CHECK constraint failed/,
+  );
+  assert.throws(
+    () => sqlite.prepare("UPDATE question_image_index SET anime_release_year=? WHERE question_id='genre-tag-question'")
+      .run(1949),
+    /CHECK constraint failed/,
+  );
+  assert.throws(
+    () => sqlite.prepare("UPDATE question_image_index SET anime_release_year=? WHERE question_id='genre-tag-question'")
+      .run(2101),
+    /CHECK constraint failed/,
+  );
+  sqlite.prepare(`UPDATE question_image_index
+    SET anime_genre_tags_json=?,anime_release_year=? WHERE question_id='genre-tag-question'`)
+    .run(JSON.stringify([{ name: "异世界", count: 8 }, { name: "恋爱", count: 3 }]), 2005);
+  const updated = sqlite.prepare("SELECT anime_genre_tags_json,anime_release_year FROM question_image_index WHERE question_id='genre-tag-question'").get() as Record<string, unknown>;
+  assert.deepEqual(JSON.parse(updated.anime_genre_tags_json as string), [
+    { name: "异世界", count: 8 },
+    { name: "恋爱", count: 3 },
+  ]);
+  assert.equal(updated.anime_release_year, 2005);
 });
 
 test("D1 0036 records community uploader identity and backfills first submissions", () => {

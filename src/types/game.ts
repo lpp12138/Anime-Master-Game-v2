@@ -249,6 +249,12 @@ export type BangumiCharacterTag = {
   relation: string | null;
 };
 
+/** Bangumi 用户属性标签（异世界、恋爱等），仅服务端从官方 subject 详情获取。 */
+export type BangumiGenreTag = {
+  name: string;
+  count: number;
+};
+
 export type Question = {
   id: string;
   questionSetId: string;

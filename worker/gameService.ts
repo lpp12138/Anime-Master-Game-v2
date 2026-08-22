@@ -25,6 +25,7 @@ import type {
   Answer,
   BangumiAnimeTag,
   BangumiCharacterTag,
+  BangumiGenreTag,
   BuzzerAnswer,
   CommunityQuestionSetPage,
   CommunityQuestionSetSort,
@@ -1910,6 +1911,9 @@ export type QuestionImportItem = {
   isR18?: boolean;
   /** 服务端从单段 R2 对象 ETag 验证得到；仅社区题库索引会持久化。 */
   imageMd5?: string;
+  /** 服务端从官方 Bangumi subject 详情规范化得到；仅社区题库索引会持久化。 */
+  animeGenreTags?: BangumiGenreTag[];
+  animeReleaseYear?: number | null;
 };
 
 const COMMUNITY_IMAGE_MD5_PATTERN = /^[0-9a-f]{32}$/;
@@ -1961,6 +1965,8 @@ function normalizeQuestionImportItems(items: QuestionImportItem[]) {
       animeTags: tags.animeTags,
       characterTags: tags.characterTags,
       ...(imageMd5 === undefined ? {} : { imageMd5 }),
+      ...(item.animeGenreTags === undefined ? {} : { animeGenreTags: item.animeGenreTags }),
+      ...(item.animeReleaseYear === undefined ? {} : { animeReleaseYear: item.animeReleaseYear }),
     });
   }
 
@@ -2958,6 +2964,8 @@ function buildHomepageImageIndexRows(questions: DbQuestion[], questionItems: Que
     anime_subject_id: questionItems[index].animeTags?.[0]?.id ?? null,
     anime_tags_json: questionItems[index].animeTags ?? [],
     character_tags_json: questionItems[index].characterTags ?? [],
+    anime_genre_tags_json: questionItems[index].animeGenreTags ?? [],
+    anime_release_year: questionItems[index].animeReleaseYear ?? null,
     created_at: createdAt,
   }));
 }
@@ -3029,9 +3037,10 @@ async function appendHomepageCommunityQuestions(params: {
     ...imageIndexRows.map((row) => ({
       query: `INSERT INTO question_image_index (
           question_id, question_set_id, image_url, answer_text, order_index,
-          anime_subject_id, anime_tags_json, character_tags_json, created_at, is_r18, image_md5
+          anime_subject_id, anime_tags_json, character_tags_json, created_at, is_r18, image_md5,
+          anime_genre_tags_json, anime_release_year
         )
-        SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+        SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
         WHERE EXISTS (${guardQuery})
         RETURNING *`,
       bindings: [
@@ -3046,6 +3055,8 @@ async function appendHomepageCommunityQuestions(params: {
         row.created_at,
         row.is_r18,
         row.image_md5,
+        JSON.stringify(row.anime_genre_tags_json),
+        row.anime_release_year,
         ...guardBindings,
       ],
     })),

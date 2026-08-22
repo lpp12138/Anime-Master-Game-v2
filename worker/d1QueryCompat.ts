@@ -27,6 +27,7 @@ const JSON_COLUMNS = new Set([
   "lobby_round_scores",
   "anime_tags_json",
   "character_tags_json",
+  "anime_genre_tags_json",
 ]);
 const BOOLEAN_COLUMNS = new Set(["is_host", "is_public", "is_r18"]);
 const UPDATED_AT_TABLES = new Set(["rooms", "question_sets", "question_set_ratings"]);

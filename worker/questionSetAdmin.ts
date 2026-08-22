@@ -2,6 +2,7 @@ import { normalizeBangumiQuestionTags } from "../src/lib/bangumiTags";
 import type {
   BangumiAnimeTag,
   BangumiCharacterTag,
+  BangumiGenreTag,
   DbQuestion,
   DbQuestionSet,
   QuestionSetCreationMethod,
@@ -51,6 +52,8 @@ type AdminQuestionIndexDbRow = {
   anime_subject_id: number | null;
   anime_tags_json: string;
   character_tags_json: string;
+  anime_genre_tags_json: string;
+  anime_release_year: number | null;
   created_at: string;
 };
 
@@ -280,7 +283,8 @@ async function getLegacyQuestions(db: D1Database, questionSetId: string) {
 async function getIndexedQuestions(db: D1Database, questionSetId: string) {
   const result = await db.prepare(`
     SELECT question_id, question_set_id, image_url, answer_text, order_index, is_r18, image_md5,
-           anime_subject_id, anime_tags_json, character_tags_json, created_at
+           anime_subject_id, anime_tags_json, character_tags_json,
+           anime_genre_tags_json, anime_release_year, created_at
     FROM question_image_index
     WHERE question_set_id = ?
     ORDER BY order_index ASC, question_id ASC
@@ -512,6 +516,9 @@ export async function updateAdminQuestionSet(db: D1Database, questionSetId: stri
 type AdminQuestionTags = {
   animeTags: BangumiAnimeTag[];
   characterTags: BangumiCharacterTag[];
+  /** 仅服务端从官方 subject 详情规范化得到；客户端不提交。 */
+  animeGenreTags?: BangumiGenreTag[];
+  animeReleaseYear?: number | null;
 };
 
 // answerText/animeTags/characterTags/imageUrl are optional for PATCH: an
@@ -561,9 +568,32 @@ function normalizeAdminImageUrl(value: string) {
   return imageUrl;
 }
 
-function normalizeAdminQuestionTags(input: Pick<AdminQuestionWriteInput, "animeTags" | "characterTags">) {
+function normalizeAdminQuestionTags(input: Pick<AdminQuestionWriteInput, "animeTags" | "characterTags" | "animeGenreTags" | "animeReleaseYear">) {
   try {
-    return normalizeBangumiQuestionTags(input.animeTags ?? [], input.characterTags ?? []);
+    const normalized = normalizeBangumiQuestionTags(input.animeTags ?? [], input.characterTags ?? []);
+    const genreTags = input.animeGenreTags ?? [];
+    if (!Array.isArray(genreTags) || genreTags.length > 20) {
+      throw new Error("作品属性标签数量无效。");
+    }
+    for (const tag of genreTags) {
+      if (
+        !tag || typeof tag !== "object" || Array.isArray(tag)
+        || typeof tag.name !== "string" || !tag.name.trim() || tag.name.trim().length > 40
+        || !Number.isInteger(tag.count) || tag.count < 0 || tag.count > 2147483647
+      ) {
+        throw new Error("作品属性标签格式无效。");
+      }
+    }
+    const releaseYear = input.animeReleaseYear ?? null;
+    if (releaseYear !== null && (!Number.isInteger(releaseYear) || releaseYear < 1950 || releaseYear > 2100)) {
+      throw new Error("作品年份无效。");
+    }
+    return {
+      animeTags: normalized.animeTags,
+      characterTags: normalized.characterTags,
+      animeGenreTags: genreTags.map((tag) => ({ name: tag.name.trim(), count: tag.count })),
+      animeReleaseYear: releaseYear,
+    };
   } catch (error) {
     throw new QuestionSetAdminError(error instanceof Error ? error.message : "Bangumi 标签无效。", 400);
   }
@@ -668,14 +698,21 @@ function buildAdminQuestionIndexStatements(
       : indexed?.anime_subject_id ?? null;
     const animeTagsJson = override ? JSON.stringify(override.animeTags) : indexed?.anime_tags_json ?? "[]";
     const characterTagsJson = override ? JSON.stringify(override.characterTags) : indexed?.character_tags_json ?? "[]";
+    const animeGenreTagsJson = override
+      ? JSON.stringify(override.animeGenreTags ?? [])
+      : indexed?.anime_genre_tags_json ?? "[]";
+    const animeReleaseYear = override
+      ? override.animeReleaseYear ?? null
+      : indexed?.anime_release_year ?? null;
     const imageMd5 = imageMd5Overrides.has(question.id)
       ? imageMd5Overrides.get(question.id) ?? null
       : indexed?.image_md5 ?? null;
     statements.push(db.prepare(`INSERT INTO question_image_index (
         question_id,question_set_id,image_url,answer_text,order_index,
-        anime_subject_id,anime_tags_json,character_tags_json,created_at,is_r18,image_md5
+        anime_subject_id,anime_tags_json,character_tags_json,created_at,is_r18,image_md5,
+        anime_genre_tags_json,anime_release_year
       )
-      SELECT ?,?,?,?,?,?,?,?,?,?,?
+      SELECT ?,?,?,?,?,?,?,?,?,?,?,?,?
       WHERE EXISTS (${guard})`)
       .bind(
         question.id,
@@ -689,6 +726,8 @@ function buildAdminQuestionIndexStatements(
         indexed?.created_at ?? question.created_at,
         isDbTruthy(question.is_r18) ? 1 : 0,
         imageMd5,
+        animeGenreTagsJson,
+        animeReleaseYear,
         questionSetId,
         updatedAt,
       ));

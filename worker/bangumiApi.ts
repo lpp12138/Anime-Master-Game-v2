@@ -1,4 +1,9 @@
-import type { BangumiAnimeTag, BangumiSubjectScope, BangumiSubjectType } from "../src/types/game";
+import type {
+  BangumiAnimeTag,
+  BangumiGenreTag,
+  BangumiSubjectScope,
+  BangumiSubjectType,
+} from "../src/types/game";
 import { normalizeBangumiSearchText } from "../src/lib/bangumiTags";
 
 const BANGUMI_API_BASE_URL = "https://api.bgm.tv";
@@ -11,9 +16,10 @@ const BANGUMI_SUBJECT_CACHE_SECONDS = 30 * 24 * 60 * 60;
 const BANGUMI_CHARACTER_LIST_CACHE_SECONDS = 7 * 24 * 60 * 60;
 const BANGUMI_SEARCH_LIMIT = 12;
 const BANGUMI_CHARACTER_LIST_LIMIT = 1_200;
-// v2 separates animation/game search payloads and adds subjectType to cached
-// search/detail records. Do not reuse v1 entries whose shape lacks that field.
-const BANGUMI_CACHE_VERSION = "v2";
+// v3 separates animation/game search payloads and adds subjectType to cached
+// search/detail records plus genre tags and release date to subject details.
+// Do not reuse entries whose shape lacks those fields.
+const BANGUMI_CACHE_VERSION = "v3";
 const CACHE_ORIGIN = "https://bangumi-cache.anime-master-game.invalid";
 
 export const BANGUMI_SEARCH_QUERY_MIN_LENGTH = 2;
@@ -37,7 +43,20 @@ export type BangumiAnimeSearchResult = BangumiAnimeTag & {
 
 export type BangumiAnimeSubject = BangumiAnimeTag & {
   subjectType: BangumiSubjectType;
+  /** 官方 subject 详情的用户属性标签（异世界、恋爱等），去重且有界。 */
+  genreTags: BangumiGenreTag[];
+  /** 官方首播/发行日期（YYYY-MM-DD），缺失时为 null。 */
+  date: string | null;
 };
+
+/** 单条用户属性标签的数量上限（名称去重后保留前 N 条）。 */
+export const BANGUMI_GENRE_TAG_MAX_COUNT = 20;
+
+export function releaseYearFromBangumiDate(value: string | null): number | null {
+  if (!value) return null;
+  const year = Number(value.slice(0, 4));
+  return Number.isInteger(year) && year >= 1950 && year <= 2100 ? year : null;
+}
 
 export type BangumiSubjectCharacter = {
   id: number;
@@ -291,6 +310,22 @@ function normalizeSubjectCharacter(value: unknown): BangumiSubjectCharacter | nu
   };
 }
 
+function normalizeGenreTags(value: unknown): BangumiGenreTag[] {
+  if (!Array.isArray(value)) return [];
+  const seen = new Set<string>();
+  const tags: BangumiGenreTag[] = [];
+  for (const item of value) {
+    const record = asRecord(item);
+    const name = cleanString(record?.name, 40);
+    if (!record || !name || seen.has(name)) continue;
+    seen.add(name);
+    const count = positiveInteger(record.count);
+    tags.push({ name, count: count ?? 0 });
+    if (tags.length >= BANGUMI_GENRE_TAG_MAX_COUNT) break;
+  }
+  return tags;
+}
+
 export async function getBangumiAnimeSubject(
   cache: Cache,
   subjectIdValue: number,
@@ -320,6 +355,8 @@ export async function getBangumiAnimeSubject(
         name,
         nameCn: cleanString(record.name_cn, 120),
         subjectType: type as BangumiSubjectType,
+        genreTags: normalizeGenreTags(record.tags),
+        date: cleanString(record.date, 20),
       };
     },
   );

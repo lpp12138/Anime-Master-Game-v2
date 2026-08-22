@@ -1,6 +1,6 @@
 "use client";
 
-import type { BangumiAnimeTag, BangumiCharacterTag } from "../types/game";
+import type { BangumiAnimeTag, BangumiCharacterTag, BangumiGenreTag } from "../types/game";
 
 export type AdminQuestionSetSummary = {
   id: string;
@@ -209,6 +209,9 @@ export type AdminQuestionWriteInput = {
   /** 仅 PATCH 可省略；省略时服务端复用已规范化的现有标签。 */
   animeTags?: BangumiAnimeTag[];
   characterTags?: BangumiCharacterTag[];
+  /** 仅服务端规范化后回填；客户端不提交。 */
+  animeGenreTags?: BangumiGenreTag[];
+  animeReleaseYear?: number | null;
   /** 成人内容标记；省略时服务端复用现有值（新增默认 false）。 */
   isR18?: boolean;
   expectedUpdatedAt: string;
